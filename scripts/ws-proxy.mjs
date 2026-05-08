@@ -7,18 +7,20 @@
  *
  * Why this exists:
  *   Some browsers / extensions / private-network policies refuse to open a
- *   plain ws:// connection from http://localhost:3000 directly to a
- *   private-range IP, even when the TCP path is provably reachable. Routing
+ *   plain ws:// connection from http://localhost:3000 to a private-range IP
+ *   like 10.211.55.3, even when the TCP path is provably reachable (verified
+ *   via `nc` and a manual `curl` Upgrade handshake — both succeed). Routing
  *   the connection through localhost:8766 makes browser→target a same-origin-
- *   ish localhost-to-localhost call, which sidesteps those browser policies.
+ *   ish localhost-to-localhost call, which sidesteps every browser policy
+ *   that's been blocking us.
  *
  * Usage:
- *   npm run ws-proxy                                # uses LIVEBRIDGE_WS_URL
- *   node scripts/ws-proxy.mjs ws://1.2.3.4:8765     # override target
- *   node scripts/ws-proxy.mjs ws://1.2.3.4:8765 9000 # override target + port
+ *   npm run ws-proxy                                  # uses defaults
+ *   node scripts/ws-proxy.mjs ws://10.211.55.3:8765   # override target
+ *   node scripts/ws-proxy.mjs ws://1.2.3.4:8765 9000  # override target + port
  *
- * Env (one of these must be set):
- *   LIVEBRIDGE_WS_URL — upstream target (e.g. ws://192.168.1.50:8765)
+ * Env overrides (used when argv not given):
+ *   LIVEBRIDGE_WS_URL — upstream target (default ws://10.211.55.3:8765)
  *   WS_PROXY_PORT     — local listen port (default 8766)
  *
  * Dependencies:
@@ -28,19 +30,8 @@
 
 import { WebSocketServer, WebSocket } from "ws";
 
-const TARGET = process.argv[2] || process.env.LIVEBRIDGE_WS_URL;
+const TARGET = process.argv[2] || process.env.LIVEBRIDGE_WS_URL || "ws://10.211.55.3:8765";
 const PORT = Number(process.argv[3] || process.env.WS_PROXY_PORT || 8766);
-
-if (!TARGET) {
-  console.error(
-    "[ws-proxy] LIVEBRIDGE_WS_URL is not set.\n" +
-    "  Set it in .env.local (or pass as argv[1]) to the ws:// URL of your\n" +
-    "  NinjaTrader machine running the LiveBridge AddOn — e.g.\n" +
-    "    NEXT_PUBLIC_LIVEBRIDGE_WS_URL=ws://192.168.1.50:8765\n" +
-    "    LIVEBRIDGE_WS_URL=ws://192.168.1.50:8765"
-  );
-  process.exit(1);
-}
 
 // Bind explicitly to 127.0.0.1 (not 0.0.0.0) so the proxy is unreachable from
 // the LAN — it's only meant for the local browser. This also makes the
