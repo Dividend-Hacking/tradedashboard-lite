@@ -5,40 +5,26 @@
  * session reviews and shows aggregate performance metrics.
  */
 
-import { createClient } from "@/lib/supabase/server";
-import { PracticeSession, ReplaySession } from "@/types/replay";
+import { getServerStore } from "@/lib/store/server";
 import Link from "next/link";
 
 export default async function PracticeHistoryPage() {
-  const supabase = await createClient();
+  const store = await getServerStore();
 
-  // Fetch practice sessions with their replay session info
-  const { data: practiceSessions, error: psError } = await supabase
-    .from("practice_sessions")
-    .select("*")
-    .order("created_at", { ascending: false });
-
-  if (psError) {
+  let sessions;
+  try {
+    sessions = await store.practice.listSessions();
+  } catch (err) {
     return (
       <div className="flex min-h-screen items-center justify-center">
-        <p className="text-accent-red">Failed to load history: {psError.message}</p>
+        <p className="text-accent-red">Failed to load history: {err instanceof Error ? err.message : String(err)}</p>
       </div>
     );
   }
 
-  // Fetch all replay sessions to join by ID
-  const { data: replaySessions } = await supabase
-    .from("replay_sessions")
-    .select("*");
-
-  const replayMap = new Map<number, ReplaySession>();
-  if (replaySessions) {
-    for (const rs of replaySessions as ReplaySession[]) {
-      replayMap.set(rs.id, rs);
-    }
-  }
-
-  const sessions = (practiceSessions as PracticeSession[]) ?? [];
+  // Fetch all replay sessions to join by ID.
+  const replaySessions = await store.replay.listSessions().catch(() => []);
+  const replayMap = new Map(replaySessions.map((rs) => [rs.id, rs]));
 
   // Aggregate stats
   const totalSessions = sessions.length;

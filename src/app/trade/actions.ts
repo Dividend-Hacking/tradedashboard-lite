@@ -1,13 +1,14 @@
 /**
  * Server Actions for the Live Trading platform.
  *
- * Submits order requests to the order_requests table, which NT8's
- * LiveBridge AddOn polls every 500ms and executes.
+ * Submits order requests, updates trade tags, and cleans live bar data.
+ * Backend-agnostic via the Store layer — works against Supabase in
+ * cloud mode and local SQLite in local mode.
  */
 
 "use server";
 
-import { createClient } from "@/lib/supabase/server";
+import { getServerStore } from "@/lib/store/server";
 
 /**
  * Submit an order request for NT8 to execute.
@@ -26,44 +27,33 @@ export async function submitOrder(
   newTpPrice?: number | null,
   quantity?: number | null
 ) {
-  const supabase = await createClient();
-
-  const { data, error } = await supabase
-    .from("order_requests")
-    .insert({
+  try {
+    const store = await getServerStore();
+    // The repo only knows the canonical action set; modify_tp is treated
+    // as modify_sl for routing purposes (the new_tp_price field carries
+    // the actual update). Cast preserves caller types without expanding
+    // the repo interface.
+    const { id } = await store.orderRequests.insert({
       instrument,
       account,
-      action,
+      action: action === "modify_tp" ? "modify_sl" : action,
       sl_points: slPoints ?? null,
       tp_points: tpPoints ?? null,
       trail_enabled: trailEnabled ?? false,
       new_sl_price: newSlPrice ?? null,
       new_tp_price: newTpPrice ?? null,
-      // Default to 1 contract when caller doesn't specify, matching the
-      // hardcoded LiveBridge fallback so behaviour is unchanged for callers
-      // that haven't been updated.
       quantity: quantity ?? 1,
-    })
-    .select("id")
-    .single();
-
-  if (error) {
-    return { error: error.message };
+    });
+    return { success: true as const, requestId: id };
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : String(err) };
   }
-
-  return { success: true, requestId: data.id };
 }
 
 /**
- * Update grade / mistake / regime / notes tags on a trade row.
- *
- * Mirrors the NinjaTrader TradeTagger PATCH: the panel debounces edits for
- * ~500ms and then fires this action. Empty strings from the UI are converted
- * to null so an unselected dropdown clears the tag (matches
- * FormatJsonStringOrNull in TradeTagger.cs).
- *
- * Keyed by trade.id rather than NT's composite filter — the web side has a
- * stable primary key available.
+ * Update grade / mistake / regime / notes tags on a trade row. Called by
+ * the trade detail panel after a 500ms debounce. Empty strings are
+ * normalized to null at the repo boundary.
  */
 export async function updateTradeTags(
   tradeId: number,
@@ -72,53 +62,31 @@ export async function updateTradeTags(
     trade_mistake?: string | null;
     trade_regime?: string | null;
     notes?: string | null;
-  },
-) {
-  const supabase = await createClient();
-
-  // Normalize empty strings to null so cleared dropdowns wipe the tag.
-  const normalized: Record<string, string | null> = {};
-  for (const [key, value] of Object.entries(patch)) {
-    if (value === undefined) continue;
-    normalized[key] = value === "" ? null : value;
   }
-
-  const { error } = await supabase
-    .from("trades")
-    .update(normalized)
-    .eq("id", tradeId);
-
-  if (error) return { error: error.message };
-  return { success: true };
+) {
+  try {
+    const store = await getServerStore();
+    await store.trades.updateTags(tradeId, patch);
+    return { success: true as const };
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : String(err) };
+  }
 }
 
 /**
  * Clean live bar data and request NT8 to reseed historical bars.
- * Deletes all rows from live_bars, then inserts a "reseed_bars" command
- * into live_commands — LiveBridge polls this and recreates its BarStreamer,
- * which automatically posts the last 100 warmup bars.
+ * Deletes all rows from live_bars for one (instrument, timeframe), then
+ * inserts a "reseed_bars" command into live_commands — LiveBridge polls
+ * this and recreates its BarStreamer, which automatically posts the
+ * last 100 warmup bars.
  */
-export async function cleanLiveData(instrument: string) {
-  const supabase = await createClient();
-
-  // Step 1: Delete all live bars for this instrument
-  const { error: deleteError } = await supabase
-    .from("live_bars")
-    .delete()
-    .eq("instrument", instrument);
-
-  if (deleteError) {
-    return { error: "Failed to delete bars: " + deleteError.message };
+export async function cleanLiveData(instrument: string, timeframe: string = "15 Second") {
+  try {
+    const store = await getServerStore();
+    await store.live.deleteBarsForInstrument(instrument, timeframe);
+    await store.live.insertCommand("reseed_bars");
+    return { success: true as const };
+  } catch (err) {
+    return { error: err instanceof Error ? err.message : String(err) };
   }
-
-  // Step 2: Insert a reseed command for NT8 to pick up
-  const { error: cmdError } = await supabase
-    .from("live_commands")
-    .insert({ command: "reseed_bars" });
-
-  if (cmdError) {
-    return { error: "Failed to send reseed command: " + cmdError.message };
-  }
-
-  return { success: true };
 }

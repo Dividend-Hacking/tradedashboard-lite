@@ -21,7 +21,7 @@ import {
   createSection,
   deleteSection,
   renameSection,
-} from "@/lib/sections-actions";
+} from "@/app/zones/sections-actions";
 
 interface ManageSectionsPanelProps {
   sections: ZoneSection[];

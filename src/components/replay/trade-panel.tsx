@@ -14,7 +14,7 @@ import { ReplayBar } from "@/types/replay";
 import { ZoneSection } from "@/types/trade-zone";
 import { PracticeTradingState, PracticePosition } from "@/lib/utils/practice-trading";
 import { ZonePracticeState, PracticeZone, getActiveZonePnl, getZoneEffectivePoints, isZoneVisuallyCompleted } from "@/lib/utils/zone-practice";
-import { createSection } from "@/lib/sections-actions";
+import { createSection } from "@/app/zones/sections-actions";
 
 // ─── Mode type ──────────────────────────────────────────────────────────────
 
