@@ -100,7 +100,15 @@ import {
  *  Other identifiers are styled as "variableName". `var` joins this set
  *  so a `var <name> = <RHS>` line reads as a binding declaration at a
  *  glance. */
-const ROOT_NAMES = new Set(["strategy", "params", "rules", "filters", "filter", "var"]);
+const ROOT_NAMES = new Set([
+  "strategy", "params", "rules", "filters", "filter", "var",
+  // Strategy DSL additions: `let X = ...`, `signal.long.if = ...`,
+  // `signal.short.if = ...`. The tokenizer recognizes the keyword via the
+  // first segment of the identifier — `signal` matches as a root keyword,
+  // and the dotted continuation `.long.if` parses through the `.`/ident
+  // rules below.
+  "let", "signal",
+]);
 
 /** Inline keywords for the if-then-else expression. These can appear
  *  anywhere on the value side of a line (`= if cond then a else b`),
@@ -634,6 +642,43 @@ function buildCard(): HTMLElement {
   return root;
 }
 
+/** Append a worked-examples block to a tooltip when the entry carries
+ *  any. Mirrors the /script-reference page's <ExamplesBlock /> visual
+ *  style — same amber code chips and italic gray "→ scenario" lines —
+ *  so a user hovering in the editor sees the same shape they'd see
+ *  reading the docs page. No-op when `examples` is empty / undefined. */
+function appendExamplesBlock(
+  root: HTMLElement,
+  examples?: { snippet: string; scenario: string }[]
+): void {
+  if (!examples || examples.length === 0) return;
+  const wrap = document.createElement("div");
+  wrap.className = "mt-2 pt-1.5 border-t border-card-border/40";
+
+  const label = document.createElement("div");
+  label.className =
+    "text-[10px] uppercase tracking-wider text-muted-foreground/70 mb-1";
+  label.textContent = "Examples";
+  wrap.appendChild(label);
+
+  for (const ex of examples) {
+    const row = document.createElement("div");
+    row.className = "mb-1";
+    const code = document.createElement("code");
+    code.className =
+      "block font-mono text-[10px] text-amber-300/90 bg-background/60 border border-card-border/60 rounded px-1.5 py-0.5 break-all";
+    code.textContent = ex.snippet;
+    row.appendChild(code);
+    const scenario = document.createElement("p");
+    scenario.className =
+      "text-[10px] text-muted-foreground/80 italic mt-0.5 ml-1";
+    scenario.textContent = `→ ${ex.scenario}`;
+    row.appendChild(scenario);
+    wrap.appendChild(row);
+  }
+  root.appendChild(wrap);
+}
+
 /** Build a tooltip for an EXPR_SYMBOLS / SUMMARY_SYMBOLS / EXPR_OPERATORS
  *  entry. Layout mirrors the schema tooltip's header strip so users see
  *  the same shape everywhere — name (mono cyan), kind tag, context tag,
@@ -671,6 +716,8 @@ function buildSymbolDom(symbol: ExprSymbol): HTMLElement {
   desc.className = "text-[11px] text-foreground/90 leading-relaxed";
   desc.textContent = symbol.description;
   root.appendChild(desc);
+
+  appendExamplesBlock(root, symbol.examples);
 
   return root;
 }
@@ -826,6 +873,9 @@ function buildTooltipDom(entry: ScriptSchemaEntry): HTMLElement {
   }
 
   root.appendChild(meta);
+
+  appendExamplesBlock(root, entry.examples);
+
   return root;
 }
 

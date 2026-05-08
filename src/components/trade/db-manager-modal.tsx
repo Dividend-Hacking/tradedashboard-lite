@@ -10,7 +10,8 @@
 
 import { useState } from "react";
 import { cleanLiveData } from "@/app/trade/actions";
-import { createClient } from "@/lib/supabase/client";
+import { getClientStore } from "@/lib/store";
+import { useMode } from "@/components/mode-provider";
 import { TradeTimerSettings } from "@/types/live";
 
 /**
@@ -108,6 +109,7 @@ export default function DbManagerModal({
   showPreviewSlTp,
   onTogglePreviewSlTp,
 }: DbManagerModalProps) {
+  const mode = useMode();
   const [loading, setLoading] = useState(false);
   const [status, setStatus] = useState<"idle" | "success" | "error">("idle");
   const [errorMsg, setErrorMsg] = useState("");
@@ -119,23 +121,21 @@ export default function DbManagerModal({
   const [discoverState, setDiscoverState] = useState<"idle" | "scanning" | "error">("idle");
   const [discoverMsg, setDiscoverMsg] = useState("");
 
-  /** Fetch published candidates from Supabase, race WS probes, set winner. */
+  /** Fetch published candidates from the active backend, race WS probes,
+   *  set winner. NT8's LiveBridge publishes its bound IPv4 candidates to
+   *  the livebridge_endpoint singleton row on startup; we read that row
+   *  through the Store layer so the same flow works in cloud and local
+   *  modes. The local-mode shape is identical because LiveBridge POSTs
+   *  to /api/nt8/livebridge_endpoint with the same JSON it sends Supabase. */
   async function handleDiscover() {
     setDiscoverState("scanning");
     setDiscoverMsg("");
     try {
-      const supabase = createClient();
-      const { data, error } = await supabase
-        .from("livebridge_endpoint")
-        .select("candidates")
-        .eq("id", "default")
-        .maybeSingle();
-      if (error) {
-        setDiscoverState("error");
-        setDiscoverMsg("Supabase error: " + error.message);
-        return;
-      }
-      const supaCandidates = (data?.candidates as string[] | undefined) ?? [];
+      const store = getClientStore(mode);
+      const row = await store.livebridgeEndpoint.fetch();
+      const supaCandidates: string[] = Array.isArray(row?.candidates)
+        ? (row?.candidates as unknown as string[])
+        : [];
       // When loaded from localhost (dev), prepend the local ws-proxy URL
       // (scripts/ws-proxy.mjs, started via `npm run ws-proxy`). The proxy
       // sidesteps browser private-network / extension blocks that prevent
@@ -174,7 +174,10 @@ export default function DbManagerModal({
     setStatus("idle");
     setErrorMsg("");
 
-    const result = await cleanLiveData(instrument);
+    // Live trader currently only consumes 15-second bars; pin the
+    // timeframe so the new repo signature is satisfied and behavior
+    // matches the legacy "delete all bars for this instrument" call.
+    const result = await cleanLiveData(instrument, "15 Second");
 
     if (result.error) {
       setStatus("error");
@@ -251,7 +254,7 @@ export default function DbManagerModal({
                   type="text"
                   value={wsUrl}
                   onChange={(e) => onWsUrlChange(e.target.value)}
-                  placeholder="ws://192.168.1.50:8765"
+                  placeholder="ws://10.211.55.3:8765"
                   className="flex-1 bg-background border border-card-border rounded px-2 py-1.5
                              text-xs text-foreground font-mono focus:outline-none focus:border-muted"
                 />

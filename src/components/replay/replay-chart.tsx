@@ -37,6 +37,8 @@ import DrawingToolbar from "@/components/charts/drawing-toolbar";
 import DrawingOverlay from "@/components/charts/drawing-overlay";
 import IndicatorPanel from "@/components/charts/indicator-panel";
 import ChartOverlayToggles from "./chart-overlay-toggles";
+import VolumeProfileOverlay from "./volume-profile-overlay";
+import type { VolumeProfile } from "@/lib/utils/volume-profile";
 import type { IndicatorConfig } from "@/types/indicators";
 
 /**
@@ -99,6 +101,18 @@ interface ReplayChartProps {
    *  active/completed practice-zone overlays above. Empty / undefined →
    *  the analyze layer is skipped entirely. */
   analyzeOverlays?: AnalyzeOverlay[];
+  /** Optional volume profile to render as a left-edge histogram. The
+   *  overlay polls `series.priceToCoordinate()` on every animation
+   *  frame so the bars stay glued to the price scale across pan/zoom.
+   *  Pass `null` (or omit) to hide the layer entirely. Computation
+   *  happens upstream — typically the tick viewer reduces parsed
+   *  ticks via `computeVolumeProfile` and feeds the result here. */
+  volumeProfile?: VolumeProfile | null;
+  /** Render bid/ask side as stacked sub-bars within each level. Has
+   *  no effect when the underlying ticks lack side attribution
+   *  (Kinetick quote-stream gotcha — most ticks are unattributed and
+   *  the level falls back to a single neutral bar). Defaults to true. */
+  volumeProfileSplitBidAsk?: boolean;
 }
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -129,6 +143,8 @@ export default function ReplayChart({
   showTradeOverlays = true,
   onOverlayChange,
   analyzeOverlays,
+  volumeProfile,
+  volumeProfileSplitBidAsk = true,
 }: ReplayChartProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
@@ -229,6 +245,14 @@ export default function ReplayChart({
 
   // ─── Bar Updates (append new bars incrementally) ────────────────────────
 
+  /** Last rendered bar's `bar_time` — used to detect when the incoming bars
+   *  are a continuation of what's already on the chart (practice mode
+   *  revealing one more bar) vs. a wholesale different set (tick viewer
+   *  switching timeframe → completely new bucket boundaries). Without this
+   *  signal, calling `series.update()` with timestamps that don't extend
+   *  the existing oldest bar throws "Cannot update oldest data". */
+  const lastBarTimeRef = useRef<string | null>(null);
+
   useEffect(() => {
     const series = seriesRef.current;
     if (!series) return;
@@ -236,23 +260,34 @@ export default function ReplayChart({
     const prevCount = renderedCountRef.current;
     const newCount = visibleBars.length;
 
-    if (newCount < prevCount) {
-      // User stepped backward or jumped — full reset of series data
+    // Continuation check: do the incoming bars start where the previous set
+    // left off? Yes if we haven't rendered anything yet (prevCount===0), or
+    // if the bar at the seam (prevCount-1) has the same timestamp as the
+    // last bar we rendered. Mismatch means we're looking at a different
+    // data set (e.g. timeframe swap) and must reset wholesale.
+    const isContinuation =
+      prevCount === 0 ||
+      (newCount >= prevCount &&
+        visibleBars[prevCount - 1]?.bar_time === lastBarTimeRef.current);
+
+    if (!isContinuation || newCount < prevCount) {
+      // Wholesale-different bars OR a backward step — replace everything.
       const candles = visibleBars.map(barToCandle);
       series.setData(candles);
-      renderedCountRef.current = newCount;
     } else if (newCount > prevCount) {
-      // New bars revealed — append only the new ones (O(1) per bar)
+      // Same data set, more bars revealed — incremental append (O(1) per bar).
       for (let i = prevCount; i < newCount; i++) {
         series.update(barToCandle(visibleBars[i]));
       }
-      renderedCountRef.current = newCount;
-
-      // Auto-scroll to latest bar
+      // Auto-scroll to latest bar so users see the newly revealed candle.
       if (chartRef.current) {
         chartRef.current.timeScale().scrollToRealTime();
       }
     }
+    // newCount === prevCount && isContinuation → identical data, no-op.
+
+    renderedCountRef.current = newCount;
+    lastBarTimeRef.current = newCount > 0 ? visibleBars[newCount - 1].bar_time : null;
   }, [visibleBars]);
 
   // ─── Trade Markers (entry/exit arrows and circles) ─────────────────────
@@ -732,6 +767,20 @@ export default function ReplayChart({
         width={drawings.containerSize.width}
         height={drawings.containerSize.height}
       />
+      {/* Volume profile — rendered after the drawing overlay so the
+          drawing tools' click targets sit on top, but before the
+          indicator/toggle chrome so the floating UI buttons remain on
+          top of the histogram. Skipped entirely when the parent isn't
+          providing profile data. */}
+      {volumeProfile && (
+        <VolumeProfileOverlay
+          profile={volumeProfile}
+          seriesRef={seriesRef}
+          width={drawings.containerSize.width}
+          height={drawings.containerSize.height}
+          splitBidAsk={volumeProfileSplitBidAsk}
+        />
+      )}
       {/* Indicator panel — only rendered when the parent wires a
           change handler (i.e. on the live practice trader, not on the
           historical session-detail view). */}

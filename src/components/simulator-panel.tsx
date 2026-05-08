@@ -10,7 +10,8 @@
 
 import { useState, useMemo, useEffect, useCallback, useRef } from "react";
 import { TradeZone, TradeZoneBar, ZoneSection } from "@/types/trade-zone";
-import { createClient } from "@/lib/supabase/client";
+import { getClientStore } from "@/lib/store";
+import { useMode } from "@/components/mode-provider";
 import { parseRawTimestamp, formatDate } from "@/lib/utils/format";
 import {
   SimRules,
@@ -70,6 +71,8 @@ interface SimulatorPanelProps {
 }
 
 export function SimulatorPanel({ zones, sections }: SimulatorPanelProps) {
+  const mode = useMode();
+
   // ─── Bar data (fetched on mount) ───────────────────────────────────
   const [barsByZoneId, setBarsByZoneId] = useState<Map<number, TradeZoneBar[]> | null>(null);
   // Post-zone extension bars pulled from replay_bars (one fetch on mount, then
@@ -244,48 +247,13 @@ export function SimulatorPanel({ zones, sections }: SimulatorPanelProps) {
       }
 
       try {
-        const supabase = createClient();
+        const store = getClientStore(mode);
         const zoneIds = zones.map((z) => z.id);
 
-        // Paginate through all bars to bypass PostgREST's server-side
-        // max_rows limit (default 1000). A single .limit(10000) doesn't
-        // override the server cap, so we fetch in 1000-row pages instead.
-        const PAGE_SIZE = 1000;
-        let allBars: TradeZoneBar[] = [];
-        let offset = 0;
-        let hasMore = true;
-
-        while (hasMore) {
-          const { data, error: fetchError } = await supabase
-            .from("trade_zone_bars")
-            .select("*")
-            .in("zone_id", zoneIds)
-            .order("bar_index", { ascending: true })
-            .range(offset, offset + PAGE_SIZE - 1);
-
-          if (fetchError) {
-            setError(fetchError.message);
-            setLoading(false);
-            return;
-          }
-
-          const rows = (data as TradeZoneBar[]) ?? [];
-          allBars = allBars.concat(rows);
-          // If we got fewer rows than the page size, we've fetched everything
-          hasMore = rows.length === PAGE_SIZE;
-          offset += PAGE_SIZE;
-        }
-
-        // Group bars by zone_id into a Map
-        const map = new Map<number, TradeZoneBar[]>();
-        for (const bar of allBars) {
-          const existing = map.get(bar.zone_id);
-          if (existing) {
-            existing.push(bar);
-          } else {
-            map.set(bar.zone_id, [bar]);
-          }
-        }
+        // The store layer hides backend pagination — Supabase pages internally
+        // through PostgREST's 1000-row cap, SQLite returns everything in
+        // one query. Returns Map<zoneId, bars> so we don't need a second pass.
+        const map = await store.zones.listBarsForZones(zoneIds);
 
         setBarsByZoneId(map);
         setLoading(false);
@@ -329,7 +297,7 @@ export function SimulatorPanel({ zones, sections }: SimulatorPanelProps) {
     }
 
     fetchBars();
-  }, [zones]);
+  }, [zones, mode]);
 
   // ─── Effective bars: zone bars + optional post-zone extension bars ──
   // When the "Extend Bars" rule is on, we append the first N pre-fetched

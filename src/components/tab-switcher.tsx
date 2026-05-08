@@ -1,22 +1,26 @@
 /**
  * TabSwitcher Component (Client)
  *
- * Top-level navigation that switches between the Trades dashboard and the
- * Backtesting dashboard. Both dashboards are rendered but only the active
- * one is visible — this preserves each tab's internal state (filters, sort,
- * selections, fetched bars) when switching.
+ * Top-level navigation that switches between the Trades dashboard, the
+ * Trade Zones dashboard, and the Backtesting dashboard. All dashboards are
+ * rendered but only the active one is visible — this preserves each tab's
+ * internal state (filters, sort, selections, fetched bars) when switching.
  */
 
 "use client";
 
 import { useState } from "react";
 import { Trade } from "@/types/trade";
+import { TradeZone, ZoneSection } from "@/types/trade-zone";
 import { ReplaySession } from "@/types/replay";
 import { Dashboard } from "./dashboard";
+import { ZoneDashboard } from "./zone-dashboard";
 import { BacktestDashboard } from "./backtest-dashboard";
 
 interface TabSwitcherProps {
   trades: Trade[];
+  zones: TradeZone[];
+  sections: ZoneSection[];
   /** All replay_sessions (downloaded days), passed straight to the
    *  BacktestDashboard's day picker. */
   replaySessions: ReplaySession[];
@@ -24,13 +28,14 @@ interface TabSwitcherProps {
 
 const TABS = [
   { id: "trades", label: "Trades" },
+  { id: "zones", label: "Trade Zones" },
   { id: "backtest", label: "Backtesting" },
 ] as const;
 
 type TabId = (typeof TABS)[number]["id"];
 
-export function TabSwitcher({ trades, replaySessions }: TabSwitcherProps) {
-  const [activeTab, setActiveTab] = useState<TabId>("trades");
+export function TabSwitcher({ trades, zones, sections, replaySessions }: TabSwitcherProps) {
+  const [activeTab, setActiveTab] = useState<TabId>("zones");
 
   return (
     <div className="min-h-screen p-4 md:p-8">
@@ -57,6 +62,9 @@ export function TabSwitcher({ trades, replaySessions }: TabSwitcherProps) {
       {/* Tab content — use display:none to preserve state when switching */}
       <div style={{ display: activeTab === "trades" ? "block" : "none" }}>
         <Dashboard trades={trades} />
+      </div>
+      <div style={{ display: activeTab === "zones" ? "block" : "none" }}>
+        <ZoneDashboard zones={zones} sections={sections} />
       </div>
       <div style={{ display: activeTab === "backtest" ? "block" : "none" }}>
         <BacktestDashboard sessions={replaySessions} />

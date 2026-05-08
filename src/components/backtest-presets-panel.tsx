@@ -38,6 +38,15 @@ interface BacktestPresetsPanelProps {
   onUpdate: (preset: BacktestPreset) => void;
   /** Called when the user confirms DELETE on a selected preset. */
   onDelete: (preset: BacktestPreset) => void;
+  /** Live DSL script text from the editor — overrides `selected.script`
+   *  when the user clicks TO NT8. Without this, the API receives only
+   *  what was last saved (or nothing for older presets) and silently
+   *  falls back to the legacy strategyId template, dropping the
+   *  script's `filters.X = Y` directives. Always pass the editor's
+   *  current value so the export reflects unsaved changes too. */
+  liveScript?: string;
+  /** Live param metadata, same rationale as liveScript. */
+  liveParamMeta?: BacktestPreset["paramMeta"];
 }
 
 export function BacktestPresetsPanel({
@@ -46,6 +55,8 @@ export function BacktestPresetsPanel({
   onSaveAs,
   onUpdate,
   onDelete,
+  liveScript,
+  liveParamMeta,
 }: BacktestPresetsPanelProps) {
   // Currently-selected preset id in the dropdown. "" = no selection (the
   // initial placeholder option). Kept here rather than in the parent
@@ -132,10 +143,19 @@ export function BacktestPresetsPanel({
     if (!selected) return;
     setConvertState("running");
     try {
+      // Always overlay the live editor script + paramMeta. Without this
+      // the API receives stale (or empty) `preset.script` and silently
+      // falls back to the legacy strategyId template, which drops every
+      // `filters.X = Y` directive — see plan round 4.
+      const presetForExport: BacktestPreset = {
+        ...selected,
+        script: liveScript && liveScript.length > 0 ? liveScript : selected.script,
+        paramMeta: liveParamMeta ?? selected.paramMeta,
+      };
       const resp = await fetch("/api/convert-to-nt8", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ preset: selected, deploy: true }),
+        body: JSON.stringify({ preset: presetForExport, deploy: true }),
       });
       const json = await resp.json();
       if (!resp.ok || !json.success) {

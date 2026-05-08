@@ -12,7 +12,8 @@
  */
 
 import { useState, useEffect, useCallback, useRef } from "react";
-import { createClient } from "@/lib/supabase/client";
+import { getClientStore } from "@/lib/store";
+import { useMode } from "@/components/mode-provider";
 import { LiveBar, LiveState, TradeTimerSettings } from "@/types/live";
 import { Trade } from "@/types/trade";
 import { submitOrder } from "@/app/trade/actions";
@@ -24,8 +25,10 @@ import {
 import LiveChart from "./live-chart";
 import LiveTradePanel from "./live-trade-panel";
 import LiveTaggerPanel from "./live-tagger-panel";
+import AutoTraderPanel from "./auto-trader-panel";
 import DbManagerModal from "./db-manager-modal";
 import type { IndicatorConfig } from "@/types/indicators";
+import { useAutoTrader } from "@/hooks/use-auto-trader";
 
 interface LiveTraderProps {
   initialBars: LiveBar[];
@@ -49,6 +52,7 @@ export default function LiveTrader({
   initialTrades,
   initialPreferences,
 }: LiveTraderProps) {
+  const mode = useMode();
   const [bars, setBars] = useState<LiveBar[]>(initialBars);
   const [allStates, setAllStates] = useState<LiveState[]>(initialStates);
   const [lastPrice, setLastPrice] = useState<number | null>(initialPrice);
@@ -64,9 +68,11 @@ export default function LiveTrader({
   const [trades, setTrades] = useState<Trade[]>(initialTrades);
   const [showTrades, setShowTrades] = useState(true);
   // Right sidebar tab: "trade" = order-entry panel, "tagger" = grade/notes
-  // panel for the currently selected trade. Kept in session memory — defaults
-  // to "trade" each page load since order entry is the primary workflow.
-  const [rightPanelTab, setRightPanelTab] = useState<"trade" | "tagger">("trade");
+  // panel for the currently selected trade, "auto" = auto-trader panel
+  // (deploy a backtest preset to drive automated entries). Kept in session
+  // memory — defaults to "trade" each page load since order entry is the
+  // primary workflow.
+  const [rightPanelTab, setRightPanelTab] = useState<"trade" | "tagger" | "auto">("trade");
   // ─── Preview SL/TP lines toggle ───────────────────────────────────
   // When true, LiveChart renders dashed SL/TP preview lines (one pair for
   // Long entry, one pair for Short) while no position is open, so the
@@ -112,9 +118,11 @@ export default function LiveTrader({
   const [connectionMode, setConnectionMode] = useState<"supabase" | "websocket">("websocket");
   // wsUrl resolution order (lazy init runs once on mount):
   //   1. localStorage "liveTrader.wsUrl" — last value the user set via DbManagerModal,
-  //      so a working URL survives page reloads even if it changes between sessions.
+  //      so a working URL survives page reloads (matters when Parallels VM IPs shift
+  //      after a host network change).
   //   2. NEXT_PUBLIC_LIVEBRIDGE_WS_URL — per-machine default pinned in .env.local.
-  //   3. "" — empty when neither is set; the user opens DbManagerModal to enter one.
+  //   3. "ws://10.211.55.3:8765" — Parallels-default fallback so SSR + first-ever
+  //      load on a fresh browser still produce a sensible value.
   // window guard is required because LiveTrader is reached from a server component
   // path and would otherwise crash during SSR with "localStorage is not defined".
   const [wsUrl, setWsUrl] = useState<string>(() => {
@@ -122,7 +130,7 @@ export default function LiveTrader({
       const stored = window.localStorage.getItem("liveTrader.wsUrl");
       if (stored) return stored;
     }
-    return process.env.NEXT_PUBLIC_LIVEBRIDGE_WS_URL ?? "";
+    return process.env.NEXT_PUBLIC_LIVEBRIDGE_WS_URL ?? "ws://10.211.55.3:8765";
   });
 
   // Persist wsUrl edits (made via DbManagerModal) so the next page load reuses
@@ -269,23 +277,19 @@ export default function LiveTrader({
   // with proper OHLCV history. NT8 reseeds bars to the live_bars table
   // via the reseed_bars command, so we poll until bars appear.
   const fetchBarsFromSupabase = useCallback(async (inst: string) => {
-    const supabase = createClient();
-    // Poll a few times with a delay — NT8 needs time to reseed after a clean
+    const store = getClientStore(mode);
+    // Poll a few times with a delay — NT8 needs time to reseed after a clean.
+    // The store's listBarsForInstrument returns the latest N bars in
+    // ascending order, matching the original DESC + slice().reverse() pattern.
     for (let attempt = 0; attempt < 5; attempt++) {
       if (attempt > 0) await new Promise((r) => setTimeout(r, 1500));
-      // DESC + reverse so we grab the latest 1000 bars, not the oldest.
-      const { data } = await supabase
-        .from("live_bars")
-        .select("*")
-        .eq("instrument", inst)
-        .order("bar_time", { ascending: false })
-        .limit(1000);
+      const data = await store.live.listBarsForInstrument(inst, "15 Second", 1000);
       if (data && data.length > 0) {
-        setBars((data as LiveBar[]).slice().reverse());
+        setBars(data);
         return;
       }
     }
-  }, []);
+  }, [mode]);
 
   // ─── Refs for WS message validation ──────────────────────────────
   // WS onmessage closures capture stale state — refs always have the
@@ -306,137 +310,100 @@ export default function LiveTrader({
     // the SSR data is already loaded for that key.
     if (activeInstrument === instrument) return;
 
-    const supabase = createClient();
+    const store = getClientStore(mode);
     let cancelled = false;
 
     (async () => {
       const todayStart = new Date();
       todayStart.setUTCHours(0, 0, 0, 0);
 
-      const [barsRes, statesRes, tradesRes] = await Promise.all([
-        // DESC + reverse: see page.tsx note — ASC+limit loses new live bars.
-        supabase
-          .from("live_bars")
-          .select("*")
-          .eq("instrument", activeInstrument)
-          .order("bar_time", { ascending: false })
-          .limit(1000),
-        supabase
-          .from("live_state")
-          .select("*")
-          .eq("instrument", activeInstrument),
-        supabase
-          .from("trades")
-          .select("*")
-          .eq("instrument", activeInstrument)
-          .gte("entry_time", todayStart.toISOString())
-          .order("entry_time", { ascending: true }),
+      const [bars, states, trades] = await Promise.all([
+        store.live.listBarsForInstrument(activeInstrument, "15 Second", 1000),
+        store.live.listStatesForInstrument(activeInstrument),
+        store.trades.listForInstrumentSinceUtc(activeInstrument, todayStart.toISOString()),
       ]);
 
       if (cancelled) return;
-      if (barsRes.data) setBars((barsRes.data as LiveBar[]).slice().reverse());
-      if (statesRes.data) setAllStates(statesRes.data as LiveState[]);
-      if (tradesRes.data) setTrades(tradesRes.data as Trade[]);
+      setBars(bars);
+      setAllStates(states);
+      setTrades(trades);
     })();
 
     return () => { cancelled = true; };
-  }, [activeInstrument, instrument]);
+  }, [activeInstrument, instrument, mode]);
 
-  // ─── Supabase Realtime Subscriptions (active when mode === "supabase") ──
-
+  // ─── Realtime subscriptions (active when mode === "supabase") ──
+  //
+  // Cloud mode uses Supabase Realtime postgres_changes; local mode polls
+  // /api/local/realtime/{live-bars,live-ticker,live-state} every ~1.5s.
+  // The Store layer hides the difference behind subscribeBars / subscribeTicker
+  // / subscribeStates. Each returns an unsubscribe fn for useEffect cleanup.
+  //
+  // Connected indicator: cloud realtime fires a status callback on the
+  // underlying channel, but the Store interface doesn't expose that — we
+  // optimistically set true after subscribing. In WebSocket mode this
+  // effect is bypassed entirely (the WS effect drives `connected`).
   useEffect(() => {
     if (connectionMode === "websocket") return;
 
-    const supabase = createClient();
-
-    const channel = supabase
-      .channel("live-trading")
-      .on(
-        "postgres_changes",
-        { event: "*", schema: "public", table: "live_bars", filter: `instrument=eq.${activeInstrument}` },
-        (payload) => {
-          if (payload.eventType === "DELETE") return;
-          const bar = payload.new as LiveBar;
-          setBars((prev) => {
-            const idx = prev.findIndex((b) => b.bar_time === bar.bar_time);
-            if (idx >= 0) {
-              const updated = [...prev];
-              updated[idx] = bar;
-              return updated;
-            }
-            return [...prev, bar];
-          });
+    const store = getClientStore(mode);
+    const unsubBars = store.live.subscribeBars(activeInstrument, "15 Second", (bar) => {
+      setBars((prev) => {
+        const idx = prev.findIndex((b) => b.bar_time === bar.bar_time);
+        if (idx >= 0) {
+          const updated = [...prev];
+          updated[idx] = bar;
+          return updated;
         }
-      )
-      .on(
-        "postgres_changes",
-        { event: "*", schema: "public", table: "live_ticker", filter: `instrument=eq.${activeInstrument}` },
-        (payload) => {
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          setLastPrice((payload.new as any).last_price);
-        }
-      )
-      .on(
-        "postgres_changes",
-        { event: "*", schema: "public", table: "live_state", filter: `instrument=eq.${activeInstrument}` },
-        (payload) => {
-          const updated = payload.new as LiveState;
-          setAllStates((prev) => {
-            const idx = prev.findIndex(
-              (s) => s.instrument === updated.instrument && s.account === updated.account
-            );
-            if (idx >= 0) {
-              const copy = [...prev];
-              copy[idx] = updated;
-              return copy;
-            }
-            return [...prev, updated];
-          });
-        }
-      )
-      .subscribe((status) => {
-        setConnected(status === "SUBSCRIBED");
+        return [...prev, bar];
       });
+    });
+    const unsubTicker = store.live.subscribeTicker(activeInstrument, (ticker) => {
+      setLastPrice(ticker.last_price);
+    });
+    const unsubStates = store.live.subscribeStates(activeInstrument, (updated) => {
+      setAllStates((prev) => {
+        const idx = prev.findIndex(
+          (s) => s.instrument === updated.instrument && s.account === updated.account
+        );
+        if (idx >= 0) {
+          const copy = [...prev];
+          copy[idx] = updated;
+          return copy;
+        }
+        return [...prev, updated];
+      });
+    });
+    setConnected(true);
 
     return () => {
-      supabase.removeChannel(channel);
+      unsubBars();
+      unsubTicker();
+      unsubStates();
       setConnected(false);
     };
-  }, [activeInstrument, connectionMode]);
+  }, [activeInstrument, connectionMode, mode]);
 
-  // ─── Trades realtime — runs in BOTH modes ─────────────────────────
+  // ─── Trades realtime — runs in BOTH connection modes ───────────────
   // NT8's WebSocket protocol has no "trade" message type, so the frontend
   // would otherwise never learn about new trades in WS mode until the page
-  // is refreshed. Subscribe to the trades table directly regardless of
-  // connection mode. Filter by activeInstrument so switching instruments
-  // doesn't leak markers from the previous contract onto the chart.
+  // is refreshed. Subscribe to trades regardless of connection mode.
+  // Filter by activeInstrument so switching instruments doesn't leak
+  // markers from the previous contract onto the chart.
   useEffect(() => {
-    const supabase = createClient();
-    const channel = supabase
-      .channel("live-trades")
-      .on(
-        "postgres_changes",
-        { event: "*", schema: "public", table: "trades", filter: `instrument=eq.${activeInstrument}` },
-        (payload) => {
-          if (payload.eventType === "DELETE") return;
-          const trade = payload.new as Trade;
-          setTrades((prev) => {
-            const idx = prev.findIndex((t) => t.id === trade.id);
-            if (idx >= 0) {
-              const updated = [...prev];
-              updated[idx] = trade;
-              return updated;
-            }
-            return [...prev, trade];
-          });
+    const store = getClientStore(mode);
+    return store.trades.subscribeForInstrument(activeInstrument, (trade) => {
+      setTrades((prev) => {
+        const idx = prev.findIndex((t) => t.id === trade.id);
+        if (idx >= 0) {
+          const updated = [...prev];
+          updated[idx] = trade;
+          return updated;
         }
-      )
-      .subscribe();
-
-    return () => {
-      supabase.removeChannel(channel);
-    };
-  }, [activeInstrument]);
+        return [...prev, trade];
+      });
+    });
+  }, [activeInstrument, mode]);
 
   // ─── WebSocket Connection (active when mode === "websocket") ────────
 
@@ -864,6 +831,23 @@ export default function LiveTrader({
     }
   }, [activeInstrument, selectedAccount, connectionMode, sendWsOrder]);
 
+  // ─── Auto-Trader hook ─────────────────────────────────────────────
+  // Deploys a backtest preset against the live bar feed: signals + filters
+  // + SimRules exits all reuse the backtest pipeline. The hook owns its
+  // own state (armed/disarmed, daily counters, active entry, log) and
+  // dispatches orders through the same handlers the manual UI uses, so
+  // automated and manual trading share one execution path.
+  const autoTrader = useAutoTrader({
+    bars,
+    position: liveState,
+    lastPrice,
+    tickPriceRef: connectionMode === "websocket" ? tickPriceRef : undefined,
+    onBuyLong: handleBuyLong,
+    onSellShort: handleSellShort,
+    onClose: handleClose,
+    onModifySl: handleModifySl,
+  });
+
   // ─── Trade Timer expiration loop ──────────────────────────────────
   // While a countdown is active, polls every 250ms. When the deadline is hit:
   //   - if autoCloseOnZero is on AND a position is still open → close it
@@ -1163,6 +1147,19 @@ export default function LiveTrader({
               Trade
             </button>
             <button
+              onClick={() => setRightPanelTab("auto")}
+              className={`flex-1 px-2 py-1 text-xs rounded-md transition-colors ${
+                rightPanelTab === "auto"
+                  ? "bg-white/10 text-foreground"
+                  : "text-muted-foreground hover:bg-white/5"
+              } ${autoTrader.state.armed ? "ring-1 ring-accent-green/50" : ""}`}
+            >
+              Auto
+              {autoTrader.state.armed && (
+                <span className="ml-1 text-accent-green">●</span>
+              )}
+            </button>
+            <button
               onClick={() => setRightPanelTab("tagger")}
               className={`flex-1 px-2 py-1 text-xs rounded-md transition-colors ${
                 rightPanelTab === "tagger"
@@ -1190,6 +1187,12 @@ export default function LiveTrader({
                 initialPreferences={initialPreferences}
                 onSlPointsChange={setPreviewSlPoints}
                 onTpPointsChange={setPreviewTpPoints}
+              />
+            ) : rightPanelTab === "auto" ? (
+              <AutoTraderPanel
+                state={autoTrader.state}
+                onArm={autoTrader.arm}
+                onDisarm={autoTrader.disarm}
               />
             ) : (
               <LiveTaggerPanel trades={trades} />

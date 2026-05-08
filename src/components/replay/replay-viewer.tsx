@@ -21,7 +21,8 @@ import Link from "next/link";
 import { ReplayBar, ReplaySession } from "@/types/replay";
 import { ZoneSection } from "@/types/trade-zone";
 import { savePracticeSession, saveZone, saveReplayProgress } from "@/app/replay/actions";
-import { createClient } from "@/lib/supabase/client";
+import { getClientStore } from "@/lib/store";
+import { useMode } from "@/components/mode-provider";
 import {
   createReplayState,
   replayReducer,
@@ -79,6 +80,8 @@ export default function ReplayViewer({
   bars,
   sections: initialSections,
 }: ReplayViewerProps) {
+  const mode = useMode();
+
   // ─── Replay Engine State ────────────────────────────────────────────────
   const [replayState, dispatch] = useReducer(replayReducer, bars, createReplayState);
 
@@ -225,44 +228,27 @@ export default function ReplayViewer({
   const activeSectionIdRef = useRef(activeSectionId);
   activeSectionIdRef.current = activeSectionId;
 
-  // Realtime: mirror zone_sections INSERT/UPDATE/DELETE into local state so
-  // the picker reflects sections created/renamed/deleted elsewhere.
+  // Realtime: mirror zone_sections changes into local state so the picker
+  // reflects sections created/renamed/deleted elsewhere. Cloud taps Supabase
+  // Realtime; local polls every ~2s.
   useEffect(() => {
-    const supabase = createClient();
-    const channel = supabase
-      .channel("zone-sections-replay")
-      .on(
-        "postgres_changes",
-        { event: "*", schema: "public", table: "zone_sections" },
-        (payload) => {
-          if (payload.eventType === "INSERT") {
-            setSections((prev) =>
-              [...prev, payload.new as ZoneSection].sort((a, b) =>
-                a.name.localeCompare(b.name)
-              )
-            );
-          } else if (payload.eventType === "UPDATE") {
-            setSections((prev) =>
-              prev
-                .map((s) =>
-                  s.id === (payload.new as ZoneSection).id
-                    ? (payload.new as ZoneSection)
-                    : s
-                )
-                .sort((a, b) => a.name.localeCompare(b.name))
-            );
-          } else if (payload.eventType === "DELETE") {
-            setSections((prev) =>
-              prev.filter((s) => s.id !== (payload.old as ZoneSection).id)
-            );
-          }
+    const store = getClientStore(mode);
+    return store.zones.subscribeSections((row, kind) => {
+      if (kind === "delete") {
+        setSections((prev) => prev.filter((s) => s.id !== row.id));
+        return;
+      }
+      setSections((prev) => {
+        const idx = prev.findIndex((s) => s.id === row.id);
+        if (idx >= 0) {
+          const next = prev.slice();
+          next[idx] = row;
+          return next.sort((a, b) => a.name.localeCompare(b.name));
         }
-      )
-      .subscribe();
-    return () => {
-      supabase.removeChannel(channel);
-    };
-  }, []);
+        return [...prev, row].sort((a, b) => a.name.localeCompare(b.name));
+      });
+    });
+  }, [mode]);
 
   // Refs to avoid stale closures in the interval/keyboard callbacks
   const replayStateRef = useRef(replayState);

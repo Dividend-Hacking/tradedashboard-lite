@@ -22,7 +22,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { Trade, TradeBar } from "@/types/trade";
 import { updateTradeTags } from "@/app/trade/actions";
-import { createClient } from "@/lib/supabase/client";
+import { getClientStore } from "@/lib/store";
+import { useMode } from "@/components/mode-provider";
 import TradeBarsChart from "./trade-bars-chart";
 
 // Dropdown options — kept in sync with TradeTagger.cs:175–179 so web and
@@ -59,6 +60,8 @@ interface LiveTaggerPanelProps {
 type SaveStatus = "idle" | "saving" | "saved" | "error";
 
 export default function LiveTaggerPanel({ trades }: LiveTaggerPanelProps) {
+  const mode = useMode();
+
   // Which trade in `trades` is currently displayed. -1 when the list is empty.
   const [currentIndex, setCurrentIndex] = useState<number>(() =>
     trades.length > 0 ? trades.length - 1 : -1,
@@ -246,29 +249,25 @@ export default function LiveTaggerPanel({ trades }: LiveTaggerPanelProps) {
     setBarsError(null);
 
     (async () => {
-      const supabase = createClient();
-      const { data, error } = await supabase
-        .from("trade_bars")
-        .select(
-          "id, trade_id, bar_index, bar_time, bar_open, bar_high, bar_low, bar_close, bar_volume, is_entry_bar, is_exit_bar",
-        )
-        .eq("trade_id", tradeId)
-        .order("bar_index", { ascending: true });
-
-      if (cancelled) return;
-      if (error) {
-        setBarsError(error.message);
-        setBarsLoadingId((id) => (id === tradeId ? null : id));
-        return;
+      try {
+        const store = getClientStore(mode);
+        const data = await store.trades.listBarsForTrade(tradeId);
+        if (cancelled) return;
+        setBarsByTradeId((prev) => ({ ...prev, [tradeId]: data }));
+      } catch (err) {
+        if (cancelled) return;
+        setBarsError(err instanceof Error ? err.message : String(err));
+      } finally {
+        if (!cancelled) {
+          setBarsLoadingId((id) => (id === tradeId ? null : id));
+        }
       }
-      setBarsByTradeId((prev) => ({ ...prev, [tradeId]: (data as TradeBar[]) ?? [] }));
-      setBarsLoadingId((id) => (id === tradeId ? null : id));
     })();
 
     return () => {
       cancelled = true;
     };
-  }, [showBars, currentTrade, barsByTradeId]);
+  }, [showBars, currentTrade, barsByTradeId, mode]);
 
   // ─── Navigation handlers ─────────────────────────────────────────────
 

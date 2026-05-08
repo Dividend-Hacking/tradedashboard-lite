@@ -14,6 +14,43 @@ import {
   pickRandomDataDay,
   requestDateRangeExport,
 } from "@/app/replay/actions";
+import type { Granularity } from "@/types/replay";
+
+/**
+ * Available data fetch modes. Each option encodes both granularity (what kind
+ * of data NT8 will fetch) AND timeframe (the bar size for OHLCV modes; for
+ * tick modes timeframe is just a descriptive string used in the UI / session
+ * label). Encoding both into a single dropdown value keeps the UI from
+ * representing invalid combos like "5m + bid/ask split".
+ *
+ * Format: `${granularity}:${timeframe}`. Parsed at change-time via split(":").
+ */
+const MODE_OPTIONS: ReadonlyArray<{
+  value: string;
+  label: string;
+  group: string;
+  granularity: Granularity;
+  timeframe: string;
+}> = [
+  { value: "ohlcv:15 Second", label: "15s OHLCV", group: "OHLCV", granularity: "ohlcv", timeframe: "15 Second" },
+  { value: "ohlcv:1 Minute",  label: "1m OHLCV",  group: "OHLCV", granularity: "ohlcv", timeframe: "1 Minute" },
+  { value: "ohlcv:5 Minute",  label: "5m OHLCV",  group: "OHLCV", granularity: "ohlcv", timeframe: "5 Minute" },
+  { value: "ohlcv:15 Minute", label: "15m OHLCV", group: "OHLCV", granularity: "ohlcv", timeframe: "15 Minute" },
+  { value: "ohlcv_bidask:1 Second", label: "1s OHLCV + Bid/Ask Volume", group: "Bid/Ask split", granularity: "ohlcv_bidask", timeframe: "1 Second" },
+  { value: "tick:Tick",         label: "Tick (every trade)",     group: "Tick", granularity: "tick",         timeframe: "Tick" },
+  { value: "tick_bidask:Tick",  label: "Tick + Bid/Ask Side",    group: "Tick", granularity: "tick_bidask",  timeframe: "Tick" },
+];
+
+/** Default mode = the original behavior so existing users see no change. */
+const DEFAULT_MODE_VALUE = "ohlcv:15 Second";
+
+/** Resolve a mode value back to its (granularity, timeframe) parts. */
+function parseMode(value: string): { granularity: Granularity; timeframe: string } {
+  const found = MODE_OPTIONS.find((m) => m.value === value);
+  if (found) return { granularity: found.granularity, timeframe: found.timeframe };
+  // Fallback for any malformed value — shouldn't happen, but be safe.
+  return { granularity: "ohlcv", timeframe: "15 Second" };
+}
 
 /**
  * Get the correct futures contract suffix (MM-YY) for a given date.
@@ -78,7 +115,11 @@ export default function DataRequestForm() {
   const [isOpen, setIsOpen] = useState(false);
   const [mode, setMode] = useState<RequestMode>("single");
   const [instrument, setInstrument] = useState("NQ 03-26");
-  const [timeframe, setTimeframe] = useState("15 Second");
+  // `modeValue` encodes both granularity and timeframe — see MODE_OPTIONS.
+  // We split it on submit rather than tracking two pieces of state so
+  // invalid combinations (e.g. "5m + bid/ask") can't be represented.
+  const [modeValue, setModeValue] = useState<string>(DEFAULT_MODE_VALUE);
+  const { granularity, timeframe } = parseMode(modeValue);
   const [sessionDate, setSessionDate] = useState("");
   // Range-mode date inputs. Server recomputes the contract suffix per date,
   // so a range spanning a contract roll produces correct symbols per day.
@@ -105,7 +146,7 @@ export default function DataRequestForm() {
 
     setMessage(null);
     startTransition(async () => {
-      const result = await requestDataExport(instrument.trim(), timeframe, sessionDate);
+      const result = await requestDataExport(instrument.trim(), timeframe, sessionDate, granularity);
       if (result.error) {
         setMessage({ type: "error", text: result.error });
       } else {
@@ -138,25 +179,34 @@ export default function DataRequestForm() {
         instrument.trim(),
         timeframe,
         startDate,
-        endDate
+        endDate,
+        granularity
       );
       if ("error" in result) {
         setMessage({ type: "error", text: result.error });
         return;
       }
-      if (result.queued === 0) {
+      const requeued = result.requeued ?? 0;
+      const noDataSkipped = result.noData ?? 0;
+      if (result.queued === 0 && requeued === 0) {
         setMessage({
           type: "success",
-          text: `Nothing to do — ${result.alreadyHave} already downloaded, ${result.inFlight} in flight, rest are weekends/holidays`,
+          text: `Nothing to do — ${result.alreadyHave} already downloaded, ${result.inFlight} in flight, ${noDataSkipped} no-data, rest are weekends/holidays`,
         });
       } else {
         const skipParts: string[] = [];
         if (result.alreadyHave > 0) skipParts.push(`${result.alreadyHave} already downloaded`);
         if (result.inFlight > 0) skipParts.push(`${result.inFlight} in flight`);
+        if (noDataSkipped > 0) skipParts.push(`${noDataSkipped} known no-data`);
         const skipText = skipParts.length > 0 ? ` (skipped ${skipParts.join(", ")})` : "";
+        // Distinguish brand-new pending rows from previously-failed rows
+        // we just unstuck — gives the user confidence the gap-refill ran.
+        const requeuedText = requeued > 0
+          ? ` · ${requeued} previously-failed day${requeued === 1 ? "" : "s"} re-queued`
+          : "";
         setMessage({
           type: "success",
-          text: `Queued ${result.queued} day${result.queued === 1 ? "" : "s"}${skipText} — NinjaTrader will process them in turn`,
+          text: `Queued ${result.queued} day${result.queued === 1 ? "" : "s"}${requeuedText}${skipText} — NinjaTrader will process them in turn`,
         });
       }
     });
@@ -177,7 +227,7 @@ export default function DataRequestForm() {
 
     setMessage(null);
     startTransition(async () => {
-      const result = await pickRandomDataDay(base, timeframe);
+      const result = await pickRandomDataDay(base, timeframe, granularity);
       if ("error" in result) {
         setMessage({ type: "error", text: result.error });
       } else {
@@ -257,19 +307,32 @@ export default function DataRequestForm() {
           />
         </div>
 
-        {/* Timeframe */}
+        {/* Mode = granularity + timeframe in one selector. Grouped by category so
+            it's clear which options are bid/ask-aware vs tick-level. The value
+            stored is `granularity:timeframe`; see parseMode() above. */}
         <div>
-          <label className="text-xs text-muted-foreground mb-1 block">Timeframe</label>
+          <label className="text-xs text-muted-foreground mb-1 block">Mode</label>
           <select
-            value={timeframe}
-            onChange={(e) => setTimeframe(e.target.value)}
+            value={modeValue}
+            onChange={(e) => setModeValue(e.target.value)}
             className="w-full bg-background border border-card-border rounded px-2 py-1.5
                        text-sm text-foreground focus:outline-none focus:border-muted"
           >
-            <option value="15 Second">15 Second</option>
-            <option value="1 Minute">1 Minute</option>
-            <option value="5 Minute">5 Minute</option>
-            <option value="15 Minute">15 Minute</option>
+            <optgroup label="OHLCV (existing)">
+              {MODE_OPTIONS.filter((m) => m.group === "OHLCV").map((m) => (
+                <option key={m.value} value={m.value}>{m.label}</option>
+              ))}
+            </optgroup>
+            <optgroup label="Bid/Ask volume split">
+              {MODE_OPTIONS.filter((m) => m.group === "Bid/Ask split").map((m) => (
+                <option key={m.value} value={m.value}>{m.label}</option>
+              ))}
+            </optgroup>
+            <optgroup label="Tick (last ~6 months only)">
+              {MODE_OPTIONS.filter((m) => m.group === "Tick").map((m) => (
+                <option key={m.value} value={m.value}>{m.label}</option>
+              ))}
+            </optgroup>
           </select>
         </div>
 

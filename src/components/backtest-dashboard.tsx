@@ -55,7 +55,14 @@
 
 import { useState, useMemo, useEffect, useCallback, useRef } from "react";
 import { ReplaySession, ReplayBar } from "@/types/replay";
-import { createClient } from "@/lib/supabase/client";
+import { getClientStore } from "@/lib/store";
+import {
+  aggregateTicks,
+  aggregateTicksWithRanges,
+  type ParsedTicks,
+} from "@/lib/utils/tick-aggregation";
+import { fetchAndParseTicks } from "@/lib/utils/tick-blob-loader";
+import { useMode } from "@/components/mode-provider";
 import { formatDate, parseRawTimestamp } from "@/lib/utils/format";
 import {
   SimRules,
@@ -73,12 +80,14 @@ import {
   downloadNt8ComparableTradesCsv,
 } from "@/lib/utils/zone-detailed-export";
 import { ExportDetailedModal } from "./export-detailed-modal";
+import BacktestScriptChart from "./backtest-script-chart";
 import {
   STRATEGIES,
   StrategyDef,
   StrategyParamField,
   defaultParamsFor,
   runBacktestForSession,
+  applyBindingsToOverlay,
   type BacktestRunResult,
   type IndicatorConfig,
   DEFAULT_INDICATOR_CONFIG,
@@ -114,6 +123,14 @@ import { SimulatorTable } from "./simulator-table";
 import { SimulatorSegmentCharts } from "./simulator-segment-charts";
 import { SimulatorHeatmap } from "./simulator-heatmap";
 import { ZoneEquityCurve, ZoneEquityPoint } from "./charts/zone-equity-curve";
+import { MonteCarloCurve } from "./charts/monte-carlo-curve";
+import {
+  runMonteCarlo,
+  tradesPerDay,
+  horizonToTradeCount,
+  type MonteCarloHorizon,
+  type MonteCarloResult,
+} from "@/lib/utils/monte-carlo";
 import { CompositeTradeChart } from "./composite-trade-chart";
 import { CompositeBarsChart } from "./composite-bars-chart";
 import {
@@ -122,7 +139,18 @@ import {
 } from "@/lib/utils/composite-trade";
 import { BacktestPresetsPanel } from "./backtest-presets-panel";
 import { BacktestScriptEditor } from "./backtest-script-editor";
+import { BacktestScriptStrategyPanel } from "./backtest-script-strategy-panel";
+import {
+  parseStrategyScript,
+  buildLetBindings,
+  type Stmt as StrategyStmt,
+} from "@/lib/utils/strategy-evaluator";
+import {
+  BUILTIN_STRATEGY_TEMPLATES,
+  type StrategyTemplate,
+} from "@/lib/utils/built-in-strategies";
 import { ScriptOutputPanel } from "./script-output-panel";
+import { TerminalDrawer } from "./terminal-drawer";
 import {
   BacktestConfig,
   applyLoadStrategyRewrite,
@@ -141,6 +169,7 @@ import {
   precomputeIndicators,
   type Expr as ScriptExpr,
   type EntryEvalCtx,
+  type TickContext,
 } from "@/lib/utils/script-expr";
 import {
   deriveSeed,
@@ -182,7 +211,78 @@ interface BacktestDashboardProps {
   sessions: ReplaySession[];
 }
 
+/**
+ * Resolve the dashboard's per-eval `params.X` chain into a fully-flattened
+ * dict suitable for persistence (preset.params) and for sending to NT8 via
+ * /api/convert-to-nt8.
+ *
+ * Mirrors the resolution chain at backtest-dashboard.tsx:2819-2848 — the
+ * runtime's resolution. Callers (handleSavePreset / handleUpdatePreset)
+ * pass the four state slices and get back a Record<string, number> that
+ * has every params.X reference in the script resolved to a finite number.
+ *
+ * Without this, the dashboard runtime would silently fill in defaults
+ * each eval, but the saved preset would only carry the legacy `params`
+ * dict — missing every script-inferred default. The transpiler then sees
+ * a hole and emits `double.NaN`, which cascades through the strategy and
+ * kills signals (round-7 of the parity work surfaced this via the
+ * `Params resolved: 11/12. MISSING: minBodyRatio` diagnostic).
+ *
+ * Resolution order (highest priority first):
+ *   1. scriptParams[key]        — user's explicit sidebar input
+ *   2. scriptParamMeta[key].default — paramMeta default for this script
+ *   3. legacyParams[key]        — legacy strategy's params dict
+ *   4. cross-template paramMeta — search BUILTIN_STRATEGY_TEMPLATES for
+ *                                 any template that defines this key
+ *   5. 0 — last-resort fallback (matches the runtime's chain)
+ */
+function resolveParamsForPersistence(
+  scriptText: string,
+  scriptParams: Record<string, number>,
+  scriptParamMeta: Record<string, { default?: number } | undefined>,
+  legacyParams: Record<string, number>
+): Record<string, number> {
+  const resolved: Record<string, number> = { ...legacyParams };
+  if (!scriptText || scriptText.trim() === "") return resolved;
+  let parsedRefs: string[];
+  try {
+    parsedRefs = parseStrategyScript(scriptText).paramRefs;
+  } catch {
+    return resolved;
+  }
+  for (const ref of parsedRefs) {
+    const key = ref.replace(/^params\./, "");
+    if (Object.prototype.hasOwnProperty.call(scriptParams, key)) {
+      resolved[key] = scriptParams[key];
+      continue;
+    }
+    if (scriptParamMeta[key]?.default !== undefined) {
+      resolved[key] = scriptParamMeta[key]!.default!;
+      continue;
+    }
+    if (Object.prototype.hasOwnProperty.call(legacyParams, key)) {
+      // already in resolved via the spread, no-op
+      continue;
+    }
+    // Cross-template default search.
+    let crossDefault: number | undefined;
+    for (const t of BUILTIN_STRATEGY_TEMPLATES) {
+      const m = t.paramMeta[key];
+      if (m?.default !== undefined) {
+        crossDefault = m.default;
+        break;
+      }
+    }
+    resolved[key] = crossDefault ?? 0;
+  }
+  return resolved;
+}
+
 export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
+  // Active data backend (Cloud/Local). Renamed from `mode` because the
+  // file already uses a `mode` local for UI view-mode (ui vs script).
+  const backendMode = useMode();
+
   // ─── Day selection ────────────────────────────────────────────────
   // Multi-select of session ids. Empty by default so the user has to opt in
   // to running a backtest (no surprise bar fetches on tab open).
@@ -334,6 +434,23 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
   // current point value and net of commissions where applicable.
   const [displayMode, setDisplayMode] = useState<"points" | "dollars">("points");
 
+  // ── Monte Carlo state ──────────────────────────────────────────────
+  // When the user clicks a horizon button (1W/1M/1Y) we bootstrap
+  // 1000 simulations off the current trade results and stash the result
+  // here. Null means "no projection running" — the chart stays hidden.
+  // We deliberately store the result rather than recomputing on every
+  // render so the user sees a stable projection until they click again
+  // (the bootstrap is randomized; clicking 1M twice would otherwise show
+  // two visibly different curves).
+  const [monteCarloResult, setMonteCarloResult] =
+    useState<MonteCarloResult | null>(null);
+  // Tracks which simulation is mid-flight so we can disable the buttons
+  // and show a brief spinner. The bootstrap itself is fast (~30ms for
+  // 1Y), but rendering the resulting band is heavy enough that we want
+  // a one-frame "running" state to keep the click feeling responsive.
+  const [monteCarloRunning, setMonteCarloRunning] =
+    useState<MonteCarloHorizon | null>(null);
+
   // ─── Time-of-day filter ──────────────────────────────────────────
   // Same shape as the risk simulator's time filter — narrow synthetic
   // signals to those whose entry bar falls within [timeFrom, timeTo]
@@ -434,6 +551,16 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
   const [adxTrendMode, setAdxTrendMode] = useState<AdxTrendMode>("rising");
   const [adxTrendLookback, setAdxTrendLookback] = useState(5);
   const [adxTrendFlatThreshold, setAdxTrendFlatThreshold] = useState(1);
+
+  // ─── New filter: bid/ask delta imbalance ──────────────────────
+  // Gates trades on (ask − bid) / (ask + bid) at the entry bar — only
+  // meaningful for sessions whose source bars carry a bid/ask split
+  // (tick / tick_bidask after aggregation, or ohlcv_bidask). On plain
+  // OHLCV sessions ctx_delta_ratio is null and every trade is rejected
+  // when this filter is on; that's the deliberate fail-closed default.
+  const [deltaFilterEnabled, setDeltaFilterEnabled] = useState(false);
+  const [deltaMin, setDeltaMin] = useState(-1);
+  const [deltaMax, setDeltaMax] = useState(1);
 
   // ─── Indicator config bundle ─────────────────────────────────────
   // Aggregates every indicator-period knob the filters expose so the
@@ -593,6 +720,11 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
         lookback: adxTrendLookback,
         flatThreshold: adxTrendFlatThreshold,
       },
+      delta: {
+        enabled: deltaFilterEnabled,
+        min: deltaMin,
+        max: deltaMax,
+      },
     }),
     [
       timeFilterEnabled,
@@ -637,6 +769,9 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
       adxTrendMode,
       adxTrendLookback,
       adxTrendFlatThreshold,
+      deltaFilterEnabled,
+      deltaMin,
+      deltaMax,
     ]
   );
 
@@ -647,6 +782,27 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
    *  bumps force the uncontrolled numeric inputs in SimulatorControls
    *  and the strategy-param editor to remount and pick up the new values
    *  — same trick the optimizers use when they mutate state. */
+
+  // Refs that mirror the script editor state so the preset handlers
+  // (defined here, ABOVE the script useState declarations on line ~1229)
+  // can read the latest values without triggering the temporal dead
+  // zone. Two useEffects below the state declarations sync them whenever
+  // scriptText / scriptParamMeta change.
+  const scriptTextRef = useRef<string>("");
+  const scriptParamMetaRef = useRef<
+    Record<string, NonNullable<import("./backtest-script-strategy-panel").InferredParam["meta"]>>
+  >({});
+  // Round-7 addition: scriptParams holds the user's sidebar values for
+  // inferred params.X references. handleSavePreset / handleUpdatePreset
+  // need this to compute the resolved params dict (without it, presets
+  // get saved missing every script-inferred default → NaN in NT8).
+  const scriptParamsRef = useRef<Record<string, number>>({});
+  const setScriptTextRef = useRef<((text: string) => void) | null>(null);
+  const setScriptParamMetaRef = useRef<
+    | ((m: Record<string, NonNullable<import("./backtest-script-strategy-panel").InferredParam["meta"]>>) => void)
+    | null
+  >(null);
+
   const handleLoadPreset = useCallback((preset: BacktestPreset) => {
     const safe = normalizePresetForLoad(preset);
 
@@ -721,20 +877,58 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
     setAdxTrendLookback(safe.filters.adxTrend.lookback);
     setAdxTrendFlatThreshold(safe.filters.adxTrend.flatThreshold);
 
+    setDeltaFilterEnabled(safe.filters.delta.enabled);
+    setDeltaMin(safe.filters.delta.min);
+    setDeltaMax(safe.filters.delta.max);
+
+    // Round-4 fix: restore script + paramMeta. Older presets predate
+    // these fields — guard with explicit checks so loading them doesn't
+    // wipe the user's current editor state. New saves always write both.
+    // We call through refs because the actual setters live below in the
+    // file (script useState is declared after this handler) — the refs
+    // are populated by useEffects further down.
+    if (typeof safe.script === "string" && safe.script.length > 0) {
+      setScriptTextRef.current?.(safe.script);
+    }
+    if (safe.paramMeta && setScriptParamMetaRef.current) {
+      setScriptParamMetaRef.current(safe.paramMeta);
+    }
+
     showToast(`Loaded preset "${safe.name}"`);
   }, [showToast]);
 
   /** Persist a new preset under `name`. Re-reads from storage afterward
    *  so the dropdown reflects the freshly-saved entry without a manual
-   *  refresh. */
+   *  refresh.
+   *
+   *  Round-4 fix: also persist `script` and `paramMeta`. Without
+   *  `script`, /api/convert-to-nt8 silently falls back to the legacy
+   *  strategyId template (which has no `filters.X = Y` directives) and
+   *  NT8 produces wildly wrong trade counts. */
   const handleSavePreset = useCallback(
     (name: string) => {
+      // Round-7: resolve the full param chain (scriptParams + paramMeta
+      // defaults + cross-template defaults + 0-fallback) before saving,
+      // so the persisted preset.params is the same flattened dict the
+      // dashboard runtime resolves to per-eval. Without this, the
+      // transpiler later sees a hole and emits double.NaN, killing
+      // signals in NT8.
+      const resolvedParams = resolveParamsForPersistence(
+        scriptTextRef.current,
+        scriptParamsRef.current,
+        scriptParamMetaRef.current,
+        params,
+      );
       createPreset({
         name,
         strategyId,
-        params,
+        params: resolvedParams,
         rules,
         filters: currentFilters,
+        // Refs are populated by useEffects below — see scriptTextRef
+        // declaration above handleLoadPreset for the rationale.
+        script: scriptTextRef.current,
+        paramMeta: scriptParamMetaRef.current,
       });
       setPresets(loadPresets());
       showToast(`Saved preset "${name}"`);
@@ -746,11 +940,19 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
    *  preset keeps its id and createdAt; updatedAt advances. */
   const handleUpdatePreset = useCallback(
     (preset: BacktestPreset) => {
+      const resolvedParams = resolveParamsForPersistence(
+        scriptTextRef.current,
+        scriptParamsRef.current,
+        scriptParamMetaRef.current,
+        params,
+      );
       updatePresetInStorage(preset.id, {
         strategyId,
-        params,
+        params: resolvedParams,
         rules,
         filters: currentFilters,
+        script: scriptTextRef.current,
+        paramMeta: scriptParamMetaRef.current,
       });
       setPresets(loadPresets());
       showToast(`Updated preset "${preset.name}"`);
@@ -930,6 +1132,10 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
     setAdxTrendMode(safe.filters.adxTrend.mode);
     setAdxTrendLookback(safe.filters.adxTrend.lookback);
     setAdxTrendFlatThreshold(safe.filters.adxTrend.flatThreshold);
+
+    setDeltaFilterEnabled(safe.filters.delta.enabled);
+    setDeltaMin(safe.filters.delta.min);
+    setDeltaMax(safe.filters.delta.max);
   }, []);
 
   /** Snapshot every synced dashboard input. Memoized on its inputs so
@@ -1050,6 +1256,73 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
   // that consume the setters) so block-scoped TDZ rules stay happy.
   const [mode, setMode] = useState<"ui" | "script">("script");
 
+  // ── Script-mode "View" sub-toggle ──────────────────────────────────
+  // Within script mode the user picks between two views of the LEFT
+  // column:
+  //   - "ui"    — the existing click-through controls (presets, day
+  //               picker, results, stat cards). Default.
+  //   - "chart" — a TradingView lightweight-charts candlestick chart
+  //               of the stitched bars from every selected session,
+  //               with markers for both raw script signals AND the
+  //               filtered trades that survive all rules.
+  // The right rail (script editor + output panel) is unchanged in
+  // both views — chart mode lets the user iterate the script while
+  // watching signal/trade markers update side-by-side.
+  // Persisted to localStorage so the user's last view + layer choices
+  // stick across reloads (mirrors the SCRIPT_SPLIT_KEY pattern below).
+  const SCRIPT_VIEW_KEY = "tradedashboard.scriptView";
+  const SCRIPT_CHART_LAYERS_KEY = "tradedashboard.scriptChartLayers";
+  const [scriptViewMode, setScriptViewMode] = useState<"ui" | "chart">("ui");
+  const [showSignalsLayer, setShowSignalsLayer] = useState(true);
+  const [showTradesLayer, setShowTradesLayer] = useState(true);
+  // Hydrate from localStorage on mount. Wrapped in try/catch because
+  // both `getItem` and `JSON.parse` can throw when storage is disabled
+  // (private mode) or the persisted JSON is malformed from a previous
+  // version — we silently fall back to defaults rather than break the
+  // dashboard's render.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      const v = window.localStorage.getItem(SCRIPT_VIEW_KEY);
+      if (v === "ui" || v === "chart") setScriptViewMode(v);
+      const layersRaw = window.localStorage.getItem(SCRIPT_CHART_LAYERS_KEY);
+      if (layersRaw) {
+        const parsed = JSON.parse(layersRaw) as {
+          signals?: boolean;
+          trades?: boolean;
+        };
+        if (typeof parsed.signals === "boolean")
+          setShowSignalsLayer(parsed.signals);
+        if (typeof parsed.trades === "boolean")
+          setShowTradesLayer(parsed.trades);
+      }
+    } catch {
+      // Quota / disabled storage / parse failure — silent ignore.
+    }
+  }, []);
+  // Persist on change. Two effects (one per concern) so unrelated state
+  // changes don't cause redundant writes — toggling a layer doesn't
+  // re-write the view-mode key and vice versa.
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      window.localStorage.setItem(SCRIPT_VIEW_KEY, scriptViewMode);
+    } catch {
+      // Silent ignore.
+    }
+  }, [scriptViewMode]);
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    try {
+      window.localStorage.setItem(
+        SCRIPT_CHART_LAYERS_KEY,
+        JSON.stringify({ signals: showSignalsLayer, trades: showTradesLayer })
+      );
+    } catch {
+      // Silent ignore.
+    }
+  }, [showSignalsLayer, showTradesLayer]);
+
   // The script editor is fully controlled via this string. It is NOT
   // automatically kept in sync with UI-side state — the user has to click
   // "Apply" to push changes from script→UI, or "Sync from UI" to pull the
@@ -1081,6 +1354,39 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
   // object, but the outer memo still rebuilt its arrays), cascading
   // re-renders into the chart and trade table mid-typing.
   const [appliedScriptText, setAppliedScriptText] = useState<string>("");
+  // Per-key value overrides for inferred params.X references in the
+  // strategy DSL. The script-strategy panel renders one input per
+  // params.X reference and writes here. The run path overlays these on
+  // top of the dropdown's `params` dict before passing into
+  // evaluateStrategyScript via strategyOverride. Never read for legacy
+  // (dropdown-only) strategies.
+  const [scriptParams, setScriptParams] = useState<Record<string, number>>({});
+  // UI hints (default / min / max / step / type / label) for inferred
+  // params. Populated by the most-recently loaded template OR by the
+  // active preset's paramMeta. Empty when the user authors from
+  // scratch — inputs render with no min/max/step constraints in that
+  // case, matching their default values.
+  const [scriptParamMeta, setScriptParamMeta] = useState<
+    Record<string, NonNullable<import("./backtest-script-strategy-panel").InferredParam["meta"]>>
+  >({});
+
+  // Mirror script editor state into the refs declared earlier so the
+  // preset handlers (defined above the script useState) can read the
+  // latest values. Two separate effects so a re-render that only changes
+  // one doesn't trigger spurious updates on the other. Initial mount
+  // also runs both, populating the setter refs that handleLoadPreset
+  // uses to restore script + paramMeta from a loaded preset.
+  useEffect(() => {
+    scriptTextRef.current = scriptText;
+    setScriptTextRef.current = setScriptText;
+  }, [scriptText]);
+  useEffect(() => {
+    scriptParamMetaRef.current = scriptParamMeta;
+    setScriptParamMetaRef.current = setScriptParamMeta;
+  }, [scriptParamMeta]);
+  useEffect(() => {
+    scriptParamsRef.current = scriptParams;
+  }, [scriptParams]);
   // `scriptInitialized` flips true the first time the user enters Script
   // mode, so we know whether to seed the editor with the current state.
   // Initialized eagerly to `true` whenever a non-empty draft was hydrated
@@ -1429,6 +1735,11 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
           lookback: adxTrendLookback,
           flatThreshold: adxTrendFlatThreshold,
         },
+        delta: {
+          enabled: deltaFilterEnabled,
+          min: deltaMin,
+          max: deltaMax,
+        },
       },
     };
   }, [
@@ -1479,6 +1790,9 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
     adxTrendMode,
     adxTrendLookback,
     adxTrendFlatThreshold,
+    deltaFilterEnabled,
+    deltaMin,
+    deltaMax,
   ]);
 
   /** Pull the dashboard's current state into the editor. The user can
@@ -1722,8 +2036,80 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
       setParamsVersion((v) => v + 1);
     }
 
+    // Apply rules from the script with two new conventions:
+    //   1. EVERY *Enabled flag defaults to false on each Apply — the
+    //      script is the source of truth, and a flag the user didn't
+    //      mention should NOT silently inherit `true` from a previous
+    //      Apply or from DEFAULT_SIM_RULES' historical defaults.
+    //   2. Setting a value field (e.g. `rules.stopLossPoints = 10`)
+    //      auto-enables its sibling (`stopLossEnabled = true`) UNLESS
+    //      the user explicitly set the enabled flag on the script.
+    //      This makes "I want a stop at 10" expressible as one line
+    //      instead of two.
+    // Numerical-only fields (slAtrAdjust, scalingStartSize, etc.) are
+    // unaffected — they don't have a single boolean to flip.
     if (cfg.rules) {
-      setRules((prev) => ({ ...prev, ...cfg.rules }));
+      const VALUE_TO_ENABLED: Record<string, keyof SimRules> = {
+        stopLossPoints: "stopLossEnabled",
+        takeProfitPoints: "takeProfitEnabled",
+        trailingStopPoints: "trailingStopEnabled",
+        timedExitBars: "timedExitEnabled",
+        breakEvenTrigger: "breakEvenEnabled",
+        extensionBars: "extensionBarsEnabled",
+        dailyStopLossPoints: "dailyStopLossEnabled",
+        dailyTakeProfitPoints: "dailyTakeProfitEnabled",
+        maxTradesPerDay: "maxTradesPerDayEnabled",
+        maxLossesPerDay: "maxLossesPerDayEnabled",
+        cooldownBetweenTradesBars: "cooldownBetweenTradesEnabled",
+      };
+      const ALL_RULES_DISABLED: Partial<SimRules> = {
+        stopLossEnabled: false,
+        takeProfitEnabled: false,
+        trailingStopEnabled: false,
+        timedExitEnabled: false,
+        breakEvenEnabled: false,
+        extensionBarsEnabled: false,
+        dailyStopLossEnabled: false,
+        dailyTakeProfitEnabled: false,
+        maxTradesPerDayEnabled: false,
+        maxLossesPerDayEnabled: false,
+        cooldownBetweenTradesEnabled: false,
+        // scalingEnabled is intentionally omitted from auto-inference
+        // — it's a multi-field feature with no single "value" to key
+        // off. Reset to false here too so users have to opt-in via an
+        // explicit `rules.scalingEnabled = true`.
+        scalingEnabled: false,
+      };
+      const inferred: Partial<SimRules> = { ...ALL_RULES_DISABLED };
+      const cfgRules = cfg.rules as Record<string, unknown>;
+      for (const [valKey, enKey] of Object.entries(VALUE_TO_ENABLED)) {
+        if (valKey in cfgRules && !(enKey in cfgRules)) {
+          (inferred as Record<string, boolean>)[enKey as string] = true;
+        }
+      }
+      // Merge order: previous state → all-disabled → inferred enables
+      // from value-field presence → script's explicit overrides last.
+      setRules((prev) => ({ ...prev, ...inferred, ...cfg.rules }));
+      setRulesVersion((v) => v + 1);
+    } else {
+      // Script has no rules at all — still reset the *Enabled flags to
+      // false so a previously-applied script with `rules.stopLossPoints`
+      // doesn't leave its enable lit when the next script omits it.
+      setRules((prev) => ({
+        ...prev,
+        stopLossEnabled: false,
+        takeProfitEnabled: false,
+        trailingStopEnabled: false,
+        timedExitEnabled: false,
+        breakEvenEnabled: false,
+        extensionBarsEnabled: false,
+        dailyStopLossEnabled: false,
+        dailyTakeProfitEnabled: false,
+        maxTradesPerDayEnabled: false,
+        maxLossesPerDayEnabled: false,
+        cooldownBetweenTradesEnabled: false,
+        scalingEnabled: false,
+      }));
       setRulesVersion((v) => v + 1);
     }
 
@@ -1824,6 +2210,12 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
       if (a.lookback !== undefined) setAdxTrendLookback(a.lookback);
       if (a.flatThreshold !== undefined) setAdxTrendFlatThreshold(a.flatThreshold);
     }
+    if (cfg.filters?.delta) {
+      const d = cfg.filters.delta;
+      if (d.enabled !== undefined) setDeltaFilterEnabled(d.enabled);
+      if (d.min !== undefined) setDeltaMin(d.min);
+      if (d.max !== undefined) setDeltaMax(d.max);
+    }
 
     // Banner feedback. We count "applied lines" as anything that didn't
     // raise a hard error — warnings are still applied, so a row that
@@ -1848,6 +2240,26 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
       showToast(`Applied script · strategy → ${cfg.strategy}`);
     }
   }, [scriptText, strategyId, showToast]);
+
+  // ─── Auto-apply script on edit ───────────────────────────────────
+  // The editor is the single source of truth for the strategy. Whenever
+  // `scriptText` changes (load preset, type in editor, sync from disk,
+  // SSE echo, etc.), automatically run handleApplyScript so the runtime
+  // memos / strategyOverride track the editor verbatim. Eliminates the
+  // "I edited the script but the dashboard is running the previously-
+  // applied version" footgun.
+  //
+  // Debounced 250ms so a sustained typing burst doesn't hammer the
+  // parser. parseStrategyScript is called once when the user pauses.
+  // Skipping when scriptText is empty avoids running on first mount
+  // before the localStorage / Supabase / disk hydration completes.
+  useEffect(() => {
+    if (!scriptText) return;
+    const t = setTimeout(() => {
+      handleApplyScript();
+    }, 250);
+    return () => clearTimeout(t);
+  }, [scriptText, handleApplyScript]);
 
   /** Run handler — wraps handleApplyScript with a loading-state flip
    *  so the user sees visible feedback while the (synchronous)
@@ -1919,6 +2331,60 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
   useEffect(() => {
     loadingSessionIdsRef.current = loadingSessionIds;
   }, [loadingSessionIds]);
+
+  // ─── Tick aggregation state ──────────────────────────────────────
+  // For tick / tick_bidask sessions there is no replay_bars row to fetch —
+  // the gzipped CSV blob has to be downloaded, decompressed, parsed into
+  // typed arrays, and aggregated to bars at a user-chosen timeframe. The
+  // existing strategies, simulator, optimizer, and presets all consume
+  // ReplayBar[], so the synthesized bars slot in transparently once
+  // they're in `barsBySessionId`.
+  //
+  // Default 15s — preserves the original "15s OHLCV" feel of the
+  // backtester. Visible only when a tick session is selected.
+  const [aggregationTimeframeSec, setAggregationTimeframeSec] = useState(15);
+
+  // ParsedTicks (typed arrays) cached per session id. Survives timeframe
+  // changes so re-aggregating at a different period is a ~50ms walk
+  // instead of a multi-second blob download + parse. Kept in a ref since
+  // the typed arrays can be tens of MB — we don't want React capturing
+  // them in render closures or triggering renders just because they exist.
+  const ticksBySessionIdRef = useRef<Map<number, ParsedTicks>>(new Map());
+
+  // Per-bar tick ranges produced by aggregateTicksWithRanges, keyed by
+  // session id and re-built whenever bars are re-aggregated. Tick-driven
+  // DSL indicators (POC/VAH/VAL, vwap_tick, large_trade_count, etc.)
+  // need this to map zone bars back to their constituent ticks without
+  // re-walking the entire tick stream.
+  const tickRangesBySessionIdRef = useRef<Map<number, Int32Array>>(new Map());
+
+  // Tracks which `aggregationTimeframeSec` value each cached tick-derived
+  // bar set was synthesized at, so a timeframe change can invalidate
+  // stale entries without scanning the bars themselves. Stays in a ref
+  // (not state) because consumers only read it via fetchBarsForSession.
+  const barAggregationSecondsRef = useRef<Map<number, number>>(new Map());
+
+  // Same for the active aggregation timeframe — the fetcher reads it
+  // through a ref so the useCallback can keep stable identity.
+  const aggregationTimeframeSecRef = useRef(aggregationTimeframeSec);
+  useEffect(() => {
+    aggregationTimeframeSecRef.current = aggregationTimeframeSec;
+  }, [aggregationTimeframeSec]);
+
+  // Quick check used by the UI: are any selected sessions tick-derived?
+  // Drives whether the timeframe selector renders. Memoized so the chip
+  // grid + timeframe panel don't both re-walk the selection on every
+  // render.
+  const hasTickSession = useMemo(() => {
+    if (selectedSessionIds.size === 0) return false;
+    for (const id of selectedSessionIds) {
+      const s = sessions.find((x) => x.id === id);
+      if (s && (s.granularity === "tick" || s.granularity === "tick_bidask")) {
+        return true;
+      }
+    }
+    return false;
+  }, [selectedSessionIds, sessions]);
 
   // ─── Optimizer state (SL/TP/TSL grid search + ATR-Adjust) ────────
   // Mirrors the risk simulator's optimizer plumbing: a config modal opens
@@ -2055,10 +2521,18 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
   }, []);
 
   // ─── On-demand bar fetcher ────────────────────────────────────────
-  // Fetches one session's replay_bars in 1000-row pages (Supabase default
-  // PostgREST limit). Stores in the cache map. Skips work if already cached
-  // or already fetching. Errors surface via setFetchError so the user sees
-  // the cause without the page crashing.
+  // Branches on session granularity:
+  //   - 'ohlcv' / 'ohlcv_bidask' → fetch replay_bars rows from the store
+  //     (Supabase pages through the 1000-row PostgREST cap; local SQLite
+  //     returns the full session in one query).
+  //   - 'tick' / 'tick_bidask'   → download the gzipped CSV blob, parse
+  //     to typed arrays (cached for the lifetime of the page so timeframe
+  //     swaps re-aggregate from memory), and aggregate to ReplayBar[] at
+  //     the active aggregationTimeframeSec.
+  //
+  // Skips work if a fresh cache entry already exists for this session at
+  // the active timeframe. Errors surface via setFetchError so the user
+  // sees the cause without the page crashing.
   const fetchBarsForSession = useCallback(
     async (sessionId: number) => {
       // Read via refs so this callback's identity stays stable. Reading
@@ -2066,8 +2540,23 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
       // bars/loading state change, cascading into spurious effect re-runs
       // and (worst case) the runResult memo re-running per intermediate
       // load step.
-      if (barsBySessionIdRef.current.has(sessionId)) return;
       if (loadingSessionIdsRef.current.has(sessionId)) return;
+      const session = sessions.find((s) => s.id === sessionId);
+      if (!session) return;
+
+      const isTickSession =
+        session.granularity === "tick" ||
+        session.granularity === "tick_bidask";
+
+      // Stale-cache check: for tick sessions we only short-circuit when
+      // bars are cached AND the cached aggregation seconds match the
+      // current timeframe. OHLCV sessions just need a cache hit.
+      if (barsBySessionIdRef.current.has(sessionId)) {
+        if (!isTickSession) return;
+        const cachedSec = barAggregationSecondsRef.current.get(sessionId);
+        if (cachedSec === aggregationTimeframeSecRef.current) return;
+        // else fall through and re-aggregate at the new timeframe
+      }
 
       setLoadingSessionIds((prev) => {
         const next = new Set(prev);
@@ -2076,35 +2565,54 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
       });
 
       try {
-        const supabase = createClient();
-        const PAGE_SIZE = 1000;
-        const allBars: ReplayBar[] = [];
-        let offset = 0;
-        let hasMore = true;
+        const store = getClientStore(backendMode);
 
-        while (hasMore) {
-          const { data, error } = await supabase
-            .from("replay_bars")
-            .select("*")
-            .eq("session_id", sessionId)
-            .order("bar_index", { ascending: true })
-            .range(offset, offset + PAGE_SIZE - 1);
-
-          if (error) {
-            setFetchError(`Failed to load session ${sessionId}: ${error.message}`);
-            return;
+        if (isTickSession) {
+          // 1. Fetch + parse the blob (or reuse the cached typed arrays).
+          let parsed = ticksBySessionIdRef.current.get(sessionId);
+          if (!parsed) {
+            if (!session.tick_blob_path) {
+              throw new Error(
+                `Tick session ${sessionId} has no tick_blob_path`
+              );
+            }
+            const signedUrl = await store.replay.getTickBlobUrl(
+              session.tick_blob_path,
+              3600
+            );
+            parsed = await fetchAndParseTicks(signedUrl);
+            ticksBySessionIdRef.current.set(sessionId, parsed);
           }
-          const rows = (data as ReplayBar[]) ?? [];
-          allBars.push(...rows);
-          hasMore = rows.length === PAGE_SIZE;
-          offset += PAGE_SIZE;
-        }
 
-        setBarsBySessionId((prev) => {
-          const next = new Map(prev);
-          next.set(sessionId, allBars);
-          return next;
-        });
+          // 2. Aggregate to bars at the active timeframe. Always reads
+          // through the ref so a timeframe change between the fetch
+          // start and finish picks up the user's latest choice.
+          // We use the with-ranges variant so tick-driven indicators
+          // (POC/VAH/VAL, vwap_tick, etc.) can map zone bars back to
+          // their constituent ticks without re-walking the stream.
+          const sec = aggregationTimeframeSecRef.current;
+          const aggregated = aggregateTicksWithRanges(
+            parsed,
+            { kind: "time", seconds: sec },
+            sessionId
+          );
+          barAggregationSecondsRef.current.set(sessionId, sec);
+          tickRangesBySessionIdRef.current.set(sessionId, aggregated.tickRanges);
+
+          setBarsBySessionId((prev) => {
+            const next = new Map(prev);
+            next.set(sessionId, aggregated.bars);
+            return next;
+          });
+        } else {
+          // OHLCV / ohlcv_bidask path — unchanged.
+          const allBars = await store.replay.listBarsForSession(sessionId);
+          setBarsBySessionId((prev) => {
+            const next = new Map(prev);
+            next.set(sessionId, allBars);
+            return next;
+          });
+        }
       } catch (err) {
         setFetchError(
           err instanceof Error ? err.message : "Unknown error fetching bars"
@@ -2117,10 +2625,11 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
         });
       }
     },
-    // Empty deps — checks are ref-driven, so the callback's identity is
-    // stable for the lifetime of the component. The trigger effect below
-    // can then drop fetchBarsForSession from its deps too.
-    []
+    // `sessions` is needed because the fetcher does a granularity lookup;
+    // `backendMode` because the store impl differs between Cloud / Local.
+    // aggregationTimeframeSec is read via ref so it isn't a dep — that
+    // keeps the callback identity stable across timeframe swaps.
+    [backendMode, sessions]
   );
 
   // Trigger fetches whenever the selection set grows. Already-loaded sessions
@@ -2129,11 +2638,70 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
     for (const id of selectedSessionIds) {
       fetchBarsForSession(id);
     }
-    // fetchBarsForSession is now stable (empty useCallback deps), so we
-    // only re-run when the selection itself changes — not on every
-    // intermediate fetch state update.
+    // fetchBarsForSession depends on `sessions` so it remains stable
+    // across renders that don't change the session library; we only
+    // re-run when the selection or session library changes.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [selectedSessionIds]);
+
+  // ─── Aggregation-timeframe change handler ───────────────────────
+  // When the user picks a different timeframe, every selected tick
+  // session whose cached bars were built at the OLD seconds value is
+  // stale. We evict those entries from the bar cache + the
+  // aggregation-seconds tracking ref, then re-trigger the fetcher —
+  // which will hit the ParsedTicks cache and re-aggregate in ~50ms
+  // (no network). OHLCV sessions are untouched since they aren't
+  // timeframe-dependent on the dashboard side.
+  //
+  // CRITICAL: the staleness check + ref mutation MUST run synchronously
+  // in the effect body, NOT inside a setState updater closure. The
+  // updater is invoked later (during the render commit), so any flag
+  // mutated inside it is still false when we'd check it after the
+  // setState call returns — which would silently skip the re-fetch and
+  // leave the bar cache empty. Compute the stale list up front, then
+  // apply the eviction + fetch.
+  useEffect(() => {
+    const stale: number[] = [];
+    for (const id of selectedSessionIds) {
+      const session = sessions.find((s) => s.id === id);
+      if (!session) continue;
+      const isTick =
+        session.granularity === "tick" ||
+        session.granularity === "tick_bidask";
+      if (!isTick) continue;
+      const cachedSec = barAggregationSecondsRef.current.get(id);
+      if (cachedSec === aggregationTimeframeSec) continue;
+      stale.push(id);
+    }
+    if (stale.length === 0) return;
+
+    // Synchronously drop the stale aggregation-seconds entries. The
+    // fetcher reads this ref on its next call to decide whether to
+    // re-aggregate — keeping it consistent with the bar-cache eviction
+    // below avoids a fetch short-circuiting on stale tracking data.
+    for (const id of stale) {
+      barAggregationSecondsRef.current.delete(id);
+      // Tick ranges are aggregation-bound (their indices align to the
+      // bars at this timeframe); evict them too so the fetcher rebuilds
+      // both arrays together at the new timeframe.
+      tickRangesBySessionIdRef.current.delete(id);
+    }
+
+    // Evict the stale bar entries via setState. Even though the
+    // updater runs later, the fetcher's bar-cache check tolerates the
+    // transient (it falls through to re-aggregate when cachedSec
+    // doesn't match), so we can fire the re-fetch right away.
+    setBarsBySessionId((prev) => {
+      const next = new Map(prev);
+      for (const id of stale) next.delete(id);
+      return next;
+    });
+
+    for (const id of stale) {
+      fetchBarsForSession(id);
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [aggregationTimeframeSec]);
 
   // Toggle one session in/out of the selection
   const toggleSession = (id: number) => {
@@ -2298,8 +2866,17 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
   // way more than any realistic strategy emits, and avoids the
   // sequential-running-counter that the old `runBacktestAcrossSessions`
   // path had to recompute on every memo run.
+  // Cache keyed by sessionId. Stores both the configKey AND the bars
+  // reference, because bars can change without the config changing —
+  // e.g. when the tick-aggregation timeframe is swapped, aggregateTicks
+  // produces a fresh ReplayBar[] array but strategy/params/rules stay
+  // put, so a configKey-only check would silently return last run's
+  // result and the user would see identical P&L across timeframes.
   const backtestCacheRef = useRef(
-    new Map<number, { configKey: string; result: BacktestRunResult }>()
+    new Map<
+      number,
+      { configKey: string; bars: ReplayBar[]; result: BacktestRunResult }
+    >()
   );
 
   const runResult = useMemo(() => {
@@ -2321,8 +2898,81 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
         syntheticBarsByZoneId: new Map<number, TradeZoneBar[]>(),
         syntheticPreEntryBarsByZoneId: new Map<number, TradeZoneBar[]>(),
         syntheticAtrByZoneId: new Map<number, number>(),
+        syntheticTickCtxByZoneId: new Map<number, TickContext>(),
         totalSignals: 0,
       };
+    }
+
+    // ── Strategy DSL override ───────────────────────────────────────
+    // When the applied script declares `signal.long.if = …` /
+    // `signal.short.if = …` statements, parse them out and pass to the
+    // engine via `strategyOverride`. The engine then bypasses
+    // `currentStrategy.generateSignals()` and runs the new per-bar
+    // evaluator on the user's DSL. `let` bindings travel with the
+    // signal stmts so they're in scope during evaluation. Inferred
+    // params.X values come from `scriptParams` (sidebar inputs); we
+    // overlay them on top of the dropdown's `params` so users can mix
+    // both conventions during transition.
+    let strategyOverrideForRun: {
+      stmts: StrategyStmt[];
+      paramOverrides: Record<string, number>;
+    } | null = null;
+    let strategyOverrideKey: string | null = null;
+    if (appliedScriptText) {
+      const parsedStrategy = parseStrategyScript(appliedScriptText);
+      const hasSignals = parsedStrategy.stmts.some((s) => s.kind === "signal");
+      if (hasSignals && parsedStrategy.errors.every((e) => e.severity !== "error")) {
+        // Keep `let` bindings (referenced by signal expressions) and
+        // the signal stmts themselves. Drop generic `assign` stmts —
+        // those route through the existing line-based DSL machinery
+        // (rules.X = …, filters.X = …) and shouldn't double-apply.
+        const stmts = parsedStrategy.stmts.filter(
+          (s) => s.kind === "let" || s.kind === "signal"
+        );
+        const paramOverrides: Record<string, number> = { ...params };
+        for (const ref of parsedStrategy.paramRefs) {
+          const key = ref.replace(/^params\./, "");
+          // Resolution order:
+          //   1. Explicit user value from the inferred-params sidebar
+          //   2. Template-supplied default (preset paramMeta)
+          //   3. Dropdown-strategy value (`params`) — present for keys
+          //      shared with the active legacy strategy
+          //   4. Cross-template default — search all builtin templates
+          //      for a paramMeta entry with this key. Lets a freshly-
+          //      opened disk .dsl that uses common params (lookback,
+          //      atrPeriod, …) get sensible defaults without forcing
+          //      the user to type each one.
+          //   5. Fallback to 0 — better than `undefined`, which would
+          //      resolve to NaN in the evaluator and silently kill every
+          //      signal that touches the param.
+          if (Object.prototype.hasOwnProperty.call(scriptParams, key)) {
+            paramOverrides[key] = scriptParams[key];
+          } else if (scriptParamMeta[key]?.default !== undefined) {
+            paramOverrides[key] = scriptParamMeta[key]!.default!;
+          } else if (paramOverrides[key] === undefined) {
+            let defaulted = 0;
+            for (const t of BUILTIN_STRATEGY_TEMPLATES) {
+              const m = t.paramMeta[key];
+              if (m?.default !== undefined) {
+                defaulted = m.default;
+                break;
+              }
+            }
+            paramOverrides[key] = defaulted;
+          }
+        }
+        strategyOverrideForRun = { stmts, paramOverrides };
+        // Cache key — sources are stable across parses since
+        // parseStrategyScript is deterministic on a given text.
+        strategyOverrideKey = JSON.stringify({
+          sources: stmts.map((s) =>
+            s.kind === "signal"
+              ? `sig.${s.side}:${s.source}`
+              : `let.${s.name}:${s.source}`
+          ),
+          paramOverrides,
+        });
+      }
     }
 
     // ── Script v2 + v3 overlay (built once per memo run) ───────────
@@ -2371,6 +3021,9 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
       strategyId: currentStrategy.id,
       params,
       rules,
+      // Strategy DSL override invalidates cache when its sources or
+      // inferred-param overrides change.
+      strategyOverride: strategyOverrideKey,
       // indicatorConfig affects the ctx_* fields stamped onto synthetic
       // zones, so it has to invalidate the cache the same way params /
       // rules do. Otherwise a user who changes adxPeriod from 14→20
@@ -2413,10 +3066,10 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
             warmup: scriptWarmup,
             optimizeSeed: overlayForRun?.optimizeSeed ?? null,
             // filter.if directives — the verbatim RHS source captures
-            // every byte of the AST (cond + branch statements). Listing
-            // the sources is enough for cache invalidation because the
-            // parser is deterministic on a given source string.
-            filterIfs: scriptFilterIfs.map((d) => d.source),
+            // every byte of the AST (cond + branch statements). Prefix
+            // with scope so `filter.long.if = X` and `filter.short.if = X`
+            // get distinct cache keys despite sharing RHS text.
+            filterIfs: scriptFilterIfs.map((d) => `${d.scope ?? "both"}|${d.source}`),
           }
         : null,
     });
@@ -2426,6 +3079,7 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
     const allBars = new Map<number, TradeZoneBar[]>();
     const allPreEntryBars = new Map<number, TradeZoneBar[]>();
     const allAtr = new Map<number, number>();
+    const allTickCtx = new Map<number, TickContext>();
     let totalSignals = 0;
     // Script v3: aggregate optimization history across sessions. Each
     // session has its own per-zone walk, so each session contributes
@@ -2442,9 +3096,20 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
     for (const s of ready) {
       const cached = cache.get(s.id);
       let result: BacktestRunResult;
-      if (cached && cached.configKey === configKey) {
+      // Both the config AND the bars reference must match to reuse a
+      // cached result. The bars-identity check catches tick-aggregation
+      // timeframe swaps, which change the bar set without touching any
+      // config field.
+      if (cached && cached.configKey === configKey && cached.bars === s.bars) {
         result = cached.result;
       } else {
+        // Tick-resolution data — present only for sessions sourced from
+        // a tick blob. When absent (plain OHLCV / ohlcv_bidask), the
+        // engine falls back to bar-level indicators only and tick-
+        // driven indicator calls in the DSL evaluate to NaN.
+        const sessionTicks = ticksBySessionIdRef.current.get(s.id) ?? null;
+        const sessionTickRanges =
+          tickRangesBySessionIdRef.current.get(s.id) ?? null;
         result = runBacktestForSession({
           bars: s.bars,
           instrument: s.instrument,
@@ -2456,8 +3121,11 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
           idOffset: s.id * 1_000_000,
           indicatorConfig,
           scriptOverlay: overlayForRun,
+          strategyOverride: strategyOverrideForRun,
+          sessionTicks,
+          sessionTickRanges,
         });
-        cache.set(s.id, { configKey, result });
+        cache.set(s.id, { configKey, bars: s.bars, result });
       }
 
       allTrades.push(...result.trades);
@@ -2466,6 +3134,7 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
       for (const [k, v] of result.syntheticPreEntryBarsByZoneId)
         allPreEntryBars.set(k, v);
       for (const [k, v] of result.syntheticAtrByZoneId) allAtr.set(k, v);
+      for (const [k, v] of result.syntheticTickCtxByZoneId) allTickCtx.set(k, v);
       totalSignals += result.totalSignals;
       // Append per-path optimization history. Trade indices are
       // SESSION-LOCAL — they reset at each session boundary. The
@@ -2561,6 +3230,7 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
       syntheticBarsByZoneId: allBars,
       syntheticPreEntryBarsByZoneId: allPreEntryBars,
       syntheticAtrByZoneId: allAtr,
+      syntheticTickCtxByZoneId: allTickCtx,
       totalSignals,
       optimizationHistory:
         Object.keys(allOptimizationHistory).length > 0
@@ -2569,7 +3239,7 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
       optimizationWarnings:
         allOptimizationWarnings.length > 0 ? allOptimizationWarnings : undefined,
     };
-  }, [selectedSessionIds, sessions, barsBySessionId, currentStrategy, params, rules, indicatorConfig, scriptNumericOverrides, scriptTradePrints, scriptOptimizeOverrides, scriptOptimizeAll, scriptWarmup, scriptFilterIfs, appliedScriptText]);
+  }, [selectedSessionIds, sessions, barsBySessionId, currentStrategy, params, rules, indicatorConfig, scriptNumericOverrides, scriptTradePrints, scriptOptimizeOverrides, scriptOptimizeAll, scriptWarmup, scriptFilterIfs, appliedScriptText, scriptParams, scriptParamMeta]);
 
   // ─── Apply context filters (ADX / ATR / Trend / Bollinger) ────────
   // Runs BEFORE the time filter so the chain is:
@@ -2588,7 +3258,8 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
       !maDistanceFilterEnabled &&
       !volumeFilterEnabled &&
       !rsiFilterEnabled &&
-      !(adxTrendFilterEnabled && adxTrendMode !== "any");
+      !(adxTrendFilterEnabled && adxTrendMode !== "any") &&
+      !deltaFilterEnabled;
     if (noneActive) return runResult.syntheticZones;
     return runResult.syntheticZones.filter((z) => {
       if (adxFilterEnabled) {
@@ -2672,6 +3343,16 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
           if (Math.abs(slope) > thresh) return false;
         }
       }
+      // Bid/ask delta imbalance — only meaningful for sessions whose
+      // source bars carry a bid/ask split. ctx_delta_ratio is null on
+      // plain ohlcv bars, which fail-closes (rejects every trade) when
+      // this filter is on — the same null-as-fail discipline the other
+      // indicator filters use.
+      if (deltaFilterEnabled) {
+        const d = z.ctx_delta_ratio ?? null;
+        if (d == null) return false;
+        if (d < deltaMin || d > deltaMax) return false;
+      }
       return true;
     });
   }, [
@@ -2703,6 +3384,9 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
     adxTrendFilterEnabled,
     adxTrendMode,
     adxTrendFlatThreshold,
+    deltaFilterEnabled,
+    deltaMin,
+    deltaMax,
   ]);
 
   // ─── Apply time-of-day filter to context-filtered synthetic zones ──
@@ -2822,6 +3506,21 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
           }
         : null;
 
+    // Inline strategy-DSL `let` bindings into this overlay's expressions
+    // — same substitution `runBacktestForSession` does on its own
+    // overlay. Without it, names like `bar_delta_ratio` (from a strategy
+    // `let`) resolve to NaN in the entry-context evaluator, and the
+    // filter-sim simulator emits NaN for every print/filter.if/rule
+    // expression that references a let. The two paths must stay in
+    // sync; if you add a let-substitution call in one, add it in the
+    // other.
+    if (overlayForFilterSim && appliedScriptText) {
+      const letBindings = buildLetBindings(parseStrategyScript(appliedScriptText).stmts);
+      if (letBindings.size > 0) {
+        overlayForFilterSim = applyBindingsToOverlay(overlayForFilterSim, letBindings);
+      }
+    }
+
     // Precompute indicator series for the filtered zones whenever the
     // overlay has expressions. Cheap because the exprs list is usually
     // tiny (a handful of rule expressions + tradePrints + filter.if
@@ -2844,7 +3543,10 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
           timeFilteredZones,
           runResult.syntheticBarsByZoneId,
           collectOverlayExprs(overlayForFilterSim),
-          runResult.syntheticPreEntryBarsByZoneId
+          runResult.syntheticPreEntryBarsByZoneId,
+          runResult.syntheticTickCtxByZoneId.size > 0
+            ? runResult.syntheticTickCtxByZoneId
+            : undefined,
         ),
       };
     }
@@ -2924,6 +3626,75 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
   ]);
   const trades = tradesAndOptimization.trades;
 
+  // ─── Script-mode chart inputs ──────────────────────────────────────
+  // Builds the bar array consumed by <BacktestScriptChart> when
+  // scriptViewMode === "chart". The chart shows one continuous time
+  // axis stitched from every selected session — bars are concatenated
+  // in chronological order, deduped by bar_time so overlapping sessions
+  // don't trip lightweight-charts' "strictly ascending time" assertion.
+  //
+  // Two early-return guards produce a non-null `warning` instead of bars:
+  //   - No sessions selected → "Pick at least one date".
+  //   - Multiple instruments selected → can't render coherent candles
+  //     because price scales differ across products. The user has to
+  //     narrow the selection before the chart can show anything useful.
+  //
+  // The signal + trade marker arrays passed to the chart come straight
+  // from `runResult.syntheticZones` (raw, pre-filter signals) and
+  // `trades` (post-filter trades) — see plan note about why no engine
+  // refactor is needed.
+  const scriptChartInputs = useMemo<{
+    bars: ReplayBar[];
+    warning: string | null;
+  }>(() => {
+    const ready = Array.from(selectedSessionIds)
+      .map((id) => sessions.find((s) => s.id === id))
+      .filter((s): s is ReplaySession => !!s)
+      .sort((a, b) => a.start_time.localeCompare(b.start_time));
+
+    if (ready.length === 0) {
+      return {
+        bars: [],
+        warning: "Pick at least one date to render a chart.",
+      };
+    }
+
+    const instruments = new Set(ready.map((s) => s.instrument));
+    if (instruments.size > 1) {
+      return {
+        bars: [],
+        warning:
+          "Chart unavailable when multiple instruments are selected. Pick a single instrument.",
+      };
+    }
+
+    // Stitch + dedupe. Set<string> on bar_time is cheap (a few hundred
+    // entries per session) and prevents the "Cannot update oldest data"
+    // assertion that fires if two stitched sessions share a timestamp.
+    const seen = new Set<string>();
+    const bars: ReplayBar[] = [];
+    for (const s of ready) {
+      const sessionBars = barsBySessionId.get(s.id) ?? [];
+      for (const b of sessionBars) {
+        if (!seen.has(b.bar_time)) {
+          seen.add(b.bar_time);
+          bars.push(b);
+        }
+      }
+    }
+    bars.sort((a, b) => a.bar_time.localeCompare(b.bar_time));
+
+    if (bars.length === 0) {
+      return {
+        bars: [],
+        warning:
+          "Bars are still loading for the selected sessions — give it a moment and the chart will fill in.",
+      };
+    }
+
+    return { bars, warning: null };
+  }, [selectedSessionIds, sessions, barsBySessionId]);
+
   // ─── Async optimizer runner ─────────────────────────────────────────
   // Owns the call to `runOnlineOptimizedBacktest` (now async). Triggers
   // whenever the optimizer's inputs change: builds a configKey, bails if
@@ -2967,6 +3738,15 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
       warmup: scriptWarmup,
       filterIfs: hasFilterIfsHere ? scriptFilterIfs : undefined,
     };
+    // Inline strategy-DSL `let` bindings — see comment in tradesAndOptimization
+    // memo. Without this, the optimizer's filter-sim emits NaN for every
+    // print/filter.if/rule expression that references a let.
+    if (appliedScriptText) {
+      const letBindings = buildLetBindings(parseStrategyScript(appliedScriptText).stmts);
+      if (letBindings.size > 0) {
+        overlayForFilterSim = applyBindingsToOverlay(overlayForFilterSim, letBindings);
+      }
+    }
     if (
       overlayForFilterSim.numericOverrides ||
       (overlayForFilterSim.tradePrints && overlayForFilterSim.tradePrints.length > 0) ||
@@ -2978,7 +3758,10 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
           timeFilteredZones,
           runResult.syntheticBarsByZoneId,
           collectOverlayExprs(overlayForFilterSim),
-          runResult.syntheticPreEntryBarsByZoneId
+          runResult.syntheticPreEntryBarsByZoneId,
+          runResult.syntheticTickCtxByZoneId.size > 0
+            ? runResult.syntheticTickCtxByZoneId
+            : undefined,
         ),
       };
     }
@@ -3014,7 +3797,7 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
             ])
           )
         : null,
-      filterIfs: scriptFilterIfs.map((d) => d.source),
+      filterIfs: scriptFilterIfs.map((d) => `${d.scope ?? "both"}|${d.source}`),
       seed: deriveSeed(appliedScriptText, Array.from(selectedSessionIds)),
     });
 
@@ -3422,7 +4205,10 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
         // Pre-entry bars warm up ATR/EMA/ADX so the value at bar_index 0
         // is real — the summary-print average across entries would
         // otherwise be NaN-poisoned.
-        runResult.syntheticPreEntryBarsByZoneId
+        runResult.syntheticPreEntryBarsByZoneId,
+        runResult.syntheticTickCtxByZoneId.size > 0
+          ? runResult.syntheticTickCtxByZoneId
+          : undefined,
       );
       const zoneById = new Map<number, TradeZone>();
       for (const z of runResult.syntheticZones) zoneById.set(z.id, z);
@@ -3499,6 +4285,39 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
       };
     });
   }, [trades]);
+
+  // ── Monte Carlo handler ─────────────────────────────────────────────
+  // Kicks off a 1000-simulation bootstrap over the current trade pool,
+  // sized to the requested horizon. We yield a frame before running so
+  // the "RUNNING…" button label paints — without the rAF the synchronous
+  // bootstrap blocks the UI thread and the spinner state never shows.
+  const handleRunMonteCarlo = useCallback(
+    (horizon: MonteCarloHorizon) => {
+      if (trades.length === 0) return;
+      setMonteCarloRunning(horizon);
+      // Defer one frame so React paints the "running" state before we
+      // hog the main thread. The bootstrap itself is ~30ms even at 1Y,
+      // so the user-visible "running" flash is brief but it confirms the
+      // click registered.
+      requestAnimationFrame(() => {
+        const tpd = tradesPerDay(summary);
+        const numTrades = horizonToTradeCount(horizon, tpd);
+        const result = runMonteCarlo(trades, numTrades, displayMode, horizon);
+        setMonteCarloResult(result);
+        setMonteCarloRunning(null);
+      });
+    },
+    [trades, summary, displayMode]
+  );
+
+  // Clear stale Monte Carlo results when the underlying data changes —
+  // running a new backtest, switching units, or any rule change makes the
+  // existing projection meaningless. We watch a coarse signal (trades and
+  // displayMode) so re-runs land on a clean slate without the user having
+  // to remember to dismiss the panel manually.
+  useEffect(() => {
+    setMonteCarloResult(null);
+  }, [trades, displayMode]);
 
   // Composite winning-trade builder — only computes when the user has
   // toggled the panel open. Stacks every winner on a normalized
@@ -3764,6 +4583,7 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
         | "volume"
         | "rsi"
         | "adxTrend"
+        | "delta"
     ) => {
       let pool = runResult.syntheticZones;
       if (adxFilterEnabled && exclude !== "adx") {
@@ -3855,6 +4675,13 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
           return Math.abs(slope) <= thresh;
         });
       }
+      if (deltaFilterEnabled && exclude !== "delta") {
+        pool = pool.filter((z) => {
+          const d = z.ctx_delta_ratio ?? null;
+          if (d == null) return false;
+          return d >= deltaMin && d <= deltaMax;
+        });
+      }
       if (timeFilterEnabled && timeWindows.length > 0) {
         const parsed = timeWindows.map((w) => ({
           from: parseTimeMinutes(w.from),
@@ -3904,6 +4731,9 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
       adxTrendFilterEnabled,
       adxTrendMode,
       adxTrendFlatThreshold,
+      deltaFilterEnabled,
+      deltaMin,
+      deltaMax,
       timeFilterEnabled,
       timeWindows,
       parseTimeMinutes,
@@ -4423,14 +5253,67 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
           >
             Next →
           </button>
+          {/* ── Script-mode View sub-toggle ──────────────────────
+              Only visible in script mode. Switches the left column
+              between the legacy controls (UI) and a TradingView
+              candlestick chart (Chart) of the selected sessions.
+              Lives in the walk-forward sticky bar so it stays in
+              reach while the user scrolls deep into the trade
+              table. `ml-auto` pushes it (and the days span that
+              follows) to the right edge of the bar — keeps the
+              walk-forward buttons grouped at the left. */}
+          {mode === "script" && (
+            <div
+              className="ml-auto inline-flex rounded-md overflow-hidden border border-card-border"
+              role="group"
+              aria-label="Script view"
+            >
+              {(["ui", "chart"] as const).map((v) => (
+                <button
+                  key={v}
+                  onClick={() => setScriptViewMode(v)}
+                  className={`px-2.5 py-1 text-xs font-medium transition-colors ${
+                    scriptViewMode === v
+                      ? "bg-accent-green/20 text-accent-green"
+                      : "bg-white/5 text-muted-foreground hover:text-foreground hover:bg-white/10"
+                  }`}
+                  title={
+                    v === "ui"
+                      ? "Show controls + day picker + results"
+                      : "Show a candlestick chart of the selected sessions with signal/trade markers"
+                  }
+                >
+                  {v === "ui" ? "UI" : "Chart"}
+                </button>
+              ))}
+            </div>
+          )}
           {selectedSessionIds.size > 0 && (
-            <span className="text-xs text-muted-foreground ml-auto">
+            <span
+              className={`text-xs text-muted-foreground ${
+                mode === "script" ? "" : "ml-auto"
+              }`}
+            >
               Days {walkForwardStart + 1}–{wfWindowEnd} of {sessionsChrono.length}
             </span>
           )}
         </div>
       )}
 
+      {/* ── Script-mode Chart-view branch ──────────────────────────────
+          When the user picks "Chart" in the View toggle (script mode
+          only), all the click-through left-column children (Presets,
+          Mode toggle, Day picker, Results, Stat cards, ...) are
+          collapsed and replaced with a candlestick chart of the
+          selected sessions. The walk-forward sticky bar above stays
+          visible because it owns the UI/Chart toggle that gets you
+          back here. The right rail (script editor + output panel) is
+          unaffected — it lives outside this wrapper.
+
+          UI-mode branch: render the entire legacy left-column
+          subtree, byte-identical to the pre-feature behavior. */}
+      {!(mode === "script" && scriptViewMode === "chart") && (
+        <>
       {/* ── Presets — saved configurations of strategy + params + rules
             + filters. Sits at the top so users land on it first when
             they want to switch between known-good setups. Day selection
@@ -4442,6 +5325,8 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
         onSaveAs={handleSavePreset}
         onUpdate={handleUpdatePreset}
         onDelete={handleDeletePreset}
+        liveScript={scriptText}
+        liveParamMeta={scriptParamMeta}
       />
 
       {/* ── UI ↔ Script mode toggle ─────────────────────────────────
@@ -4821,6 +5706,29 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
                 >
                   <span>{formatDate(s.session_date)}</span>
                   <span className="text-[10px] opacity-70">{s.instrument}</span>
+                  {/* Granularity chip — call out tick-derived sessions so
+                      the user knows which rows route through the in-browser
+                      aggregation path (and respect the timeframe selector
+                      above the strategy panel). Plain ohlcv rows get no
+                      chip to keep the chip grid uncluttered. */}
+                  {(s.granularity === "tick" ||
+                    s.granularity === "tick_bidask" ||
+                    s.granularity === "ohlcv_bidask") && (
+                    <span
+                      className={`text-[9px] px-1 py-px rounded uppercase tracking-wider font-semibold ${
+                        active
+                          ? "bg-accent-green/30 text-accent-green"
+                          : "bg-white/10 text-muted-foreground"
+                      }`}
+                      title={`Source granularity: ${s.granularity}`}
+                    >
+                      {s.granularity === "tick"
+                        ? "tick"
+                        : s.granularity === "tick_bidask"
+                          ? "tick+ba"
+                          : "ohlcv+ba"}
+                    </span>
+                  )}
                   {/* Loading dot — only when this specific session is fetching */}
                   {loading && (
                     <svg className="animate-spin h-3 w-3" viewBox="0 0 24 24" fill="none">
@@ -4841,6 +5749,106 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
           <p className="text-xs text-accent-red mt-3">⚠ {fetchError}</p>
         )}
       </div>
+
+      {/* ── Tick aggregation timeframe ─────────────────────────────────
+          Visible only when at least one selected session is tick or
+          tick_bidask. The bar fetcher routes those sessions through
+          aggregateTicks() at this period; OHLCV sessions ignore it.
+          Chips cover the common cases; the custom field accepts any
+          positive seconds value (1s..3600s). Changing the timeframe
+          evicts cached tick-derived bars and re-aggregates from the
+          ParsedTicks cache (~50ms, no network). */}
+      {hasTickSession && (
+        <div className="bg-card border border-card-border rounded-lg p-4">
+          <div className="flex items-center justify-between mb-3">
+            <h3 className="text-sm text-muted-foreground uppercase tracking-wider">
+              Tick Aggregation
+            </h3>
+            <span className="text-[10px] text-muted-foreground">
+              Bar period · current {aggregationTimeframeSec}s
+            </span>
+          </div>
+          <div className="flex items-center gap-2 flex-wrap">
+            {[
+              { label: "15s", sec: 15 },
+              { label: "30s", sec: 30 },
+              { label: "1m", sec: 60 },
+              { label: "5m", sec: 300 },
+              { label: "15m", sec: 900 },
+            ].map((chip) => {
+              const isActive = aggregationTimeframeSec === chip.sec;
+              return (
+                <button
+                  key={chip.sec}
+                  onClick={() => setAggregationTimeframeSec(chip.sec)}
+                  className={`px-3 py-1.5 rounded text-xs font-medium transition-colors ${
+                    isActive
+                      ? "bg-accent-green/20 text-accent-green"
+                      : "bg-white/5 text-muted-foreground hover:text-foreground hover:bg-white/10"
+                  }`}
+                  title={`Aggregate ticks into ${chip.label} bars`}
+                >
+                  {chip.label}
+                </button>
+              );
+            })}
+            <label className="flex items-center gap-1.5 ml-2" title="Custom bar period in seconds">
+              <span className="text-xs text-muted-foreground">Custom</span>
+              <input
+                type="number"
+                min={1}
+                max={3600}
+                step={1}
+                value={aggregationTimeframeSec}
+                onChange={(e) => {
+                  const n = Math.max(1, Math.min(3600, Number(e.target.value) || 1));
+                  setAggregationTimeframeSec(n);
+                }}
+                className="w-20 bg-card border border-card-border rounded-md px-2 py-1 text-xs text-foreground focus:outline-none focus:ring-1 focus:ring-accent-green"
+                aria-label="Custom aggregation seconds"
+              />
+              <span className="text-xs text-muted-foreground">s</span>
+            </label>
+          </div>
+          <p className="text-[11px] text-muted-foreground mt-2">
+            Tick / tick+ba sessions are aggregated to bars at this period.
+            Plain OHLCV sessions ignore this setting.
+          </p>
+        </div>
+      )}
+
+      {/* Script-strategy panel — only renders when the script contains
+          `signal.long.if = …` / `signal.short.if = …` statements OR
+          `params.X` references. Lets users author from scratch without
+          using the dropdown, and load any builtin template as a starting
+          point. Sits ABOVE the legacy panel so when active it's the
+          first thing the user sees. */}
+      <BacktestScriptStrategyPanel
+        scriptText={scriptText}
+        scriptParams={scriptParams}
+        paramMeta={scriptParamMeta}
+        onParamChange={(key, value) =>
+          setScriptParams((prev) => ({ ...prev, [key]: value }))
+        }
+        onLoadTemplate={(tpl: StrategyTemplate) => {
+          // Prepend the template's script with a separator so any
+          // existing rules/filters lines below remain. Most users start
+          // empty so this just installs the template.
+          const sep = scriptText.trim() === "" ? "" : `\n\n// ── existing script preserved below ──\n`;
+          setScriptText(tpl.script + sep + scriptText);
+          // Seed paramMeta + scriptParams with the template's defaults.
+          // The user's previously-tuned scriptParams for matching keys
+          // are preserved (preference > template default).
+          setScriptParamMeta((prev) => ({ ...tpl.paramMeta, ...prev }));
+          setScriptParams((prev) => {
+            const next = { ...prev };
+            for (const [k, m] of Object.entries(tpl.paramMeta)) {
+              if (next[k] === undefined) next[k] = m.default;
+            }
+            return next;
+          });
+        }}
+      />
 
       {/* All click-through configuration — strategy picker, parameter
           editor, time filter, context filters, and SimRules — only render
@@ -5743,6 +6751,63 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
         )}
       </div>
 
+      {/* Bid/ask delta-imbalance filter — gates on (ask − bid) / (ask + bid)
+          at the entry bar. Only meaningful for sessions whose source bars
+          carry a bid/ask split (tick / tick_bidask after aggregation, or
+          ohlcv_bidask). Plain ohlcv sessions reject every trade when this
+          is on — deliberate fail-closed default for a knob whose data
+          isn't present. */}
+      <div className="flex items-center gap-3 flex-wrap">
+        <button
+          onClick={() => setDeltaFilterEnabled(!deltaFilterEnabled)}
+          className={`px-2.5 py-1 rounded text-xs font-medium transition-colors ${
+            deltaFilterEnabled
+              ? "bg-accent-green/20 text-accent-green"
+              : "bg-white/5 text-muted-foreground hover:text-foreground"
+          }`}
+          title="Gate on bid/ask delta imbalance at entry. Requires tick / tick_bidask / ohlcv_bidask source data."
+        >
+          {deltaFilterEnabled ? "DELTA FILTER ON" : "DELTA FILTER OFF"}
+        </button>
+        {deltaFilterEnabled && (
+          <>
+            <div className="flex items-center gap-1.5">
+              <label className="text-xs text-muted-foreground">Min</label>
+              <input
+                type="number"
+                min={-1}
+                max={1}
+                step={0.05}
+                value={deltaMin}
+                onChange={(e) =>
+                  setDeltaMin(Math.max(-1, Math.min(1, Number(e.target.value))))
+                }
+                className="w-20 bg-card border border-card-border rounded-md px-2 py-1 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-accent-green"
+                title="Lower bound. -1 = pure sell-aggressor, 0 = balanced, +1 = pure buy-aggressor."
+              />
+            </div>
+            <div className="flex items-center gap-1.5">
+              <label className="text-xs text-muted-foreground">Max</label>
+              <input
+                type="number"
+                min={-1}
+                max={1}
+                step={0.05}
+                value={deltaMax}
+                onChange={(e) =>
+                  setDeltaMax(Math.max(-1, Math.min(1, Number(e.target.value))))
+                }
+                className="w-20 bg-card border border-card-border rounded-md px-2 py-1 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-accent-green"
+                title="Upper bound."
+              />
+            </div>
+            <span className="text-xs text-muted-foreground">
+              (ask − bid) / (ask + bid) ∈ [{deltaMin.toFixed(2)}, {deltaMax.toFixed(2)}]
+            </span>
+          </>
+        )}
+      </div>
+
       {/* Total context-filtered count — only visible when any context
           filter is active, so users see exactly how many signals
           survived BEFORE the time filter narrows further. */}
@@ -5754,7 +6819,8 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
         maDistanceFilterEnabled ||
         volumeFilterEnabled ||
         rsiFilterEnabled ||
-        (adxTrendFilterEnabled && adxTrendMode !== "any")) && (
+        (adxTrendFilterEnabled && adxTrendMode !== "any") ||
+        deltaFilterEnabled) && (
         <div className="text-xs text-muted-foreground">
           {contextFilteredZones.length} of {runResult.syntheticZones.length} signals pass context filters
         </div>
@@ -5876,37 +6942,87 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
         mode={displayMode}
       />
 
-      {/* Points / Dollars toggle — controls the unit for the equity curve
-          above and every metric in the SimulatorStatCards below. Sits
-          right under the curve so the unit context for everything that
-          follows is visible at a glance. */}
-      <div className="flex items-center justify-end gap-2 -mt-2">
-        <span className="text-xs text-muted-foreground uppercase tracking-wider">Display:</span>
-        <div className="inline-flex rounded-md border border-card-border bg-card overflow-hidden">
-          <button
-            type="button"
-            onClick={() => setDisplayMode("points")}
-            className={`px-3 py-1 text-xs font-medium transition-colors ${
-              displayMode === "points"
-                ? "bg-sky-500 text-white"
-                : "text-muted-foreground hover:text-foreground"
-            }`}
-          >
-            Points
-          </button>
-          <button
-            type="button"
-            onClick={() => setDisplayMode("dollars")}
-            className={`px-3 py-1 text-xs font-medium transition-colors ${
-              displayMode === "dollars"
-                ? "bg-sky-500 text-white"
-                : "text-muted-foreground hover:text-foreground"
-            }`}
-          >
-            Dollars
-          </button>
+      {/* Equity-curve action row — Monte Carlo horizon buttons on the
+          left, Points/Dollars unit toggle on the right. Both sit
+          directly under the equity curve so the controls that affect
+          everything below are clustered. */}
+      <div className="flex items-center justify-between gap-2 -mt-2 flex-wrap">
+        {/* ── Monte Carlo horizon buttons ─────────────────────────────
+            Click any horizon to bootstrap-resample the current trade
+            results into a projected equity curve at that timeframe.
+            Disabled when there are no trades to sample from. While a
+            run is in flight the active horizon shows "RUNNING…" so the
+            click feels acknowledged before the bootstrap finishes. */}
+        <div className="flex items-center gap-2">
+          <span className="text-xs text-muted-foreground uppercase tracking-wider">
+            Monte Carlo:
+          </span>
+          {(["1W", "1M", "1Y"] as MonteCarloHorizon[]).map((horizon) => {
+            const running = monteCarloRunning === horizon;
+            const active = monteCarloResult?.horizon === horizon && !monteCarloRunning;
+            return (
+              <button
+                key={horizon}
+                type="button"
+                onClick={() => handleRunMonteCarlo(horizon)}
+                disabled={trades.length === 0 || monteCarloRunning !== null}
+                className={`px-3 py-1 text-xs font-medium rounded border transition-colors disabled:opacity-40 disabled:cursor-not-allowed ${
+                  active
+                    ? "bg-sky-500 text-white border-sky-500"
+                    : "bg-card text-muted-foreground border-card-border hover:text-foreground hover:border-foreground"
+                }`}
+                title={
+                  trades.length === 0
+                    ? "Run a backtest first — Monte Carlo resamples your historical trades."
+                    : `Resample ${trades.length} historical trades into a projected ${horizon === "1W" ? "1-week" : horizon === "1M" ? "1-month" : "1-year"} equity curve.`
+                }
+              >
+                {running ? "RUNNING…" : horizon}
+              </button>
+            );
+          })}
+        </div>
+        {/* Points / Dollars toggle — controls the unit for the equity curve
+            above and every metric in the SimulatorStatCards below. */}
+        <div className="flex items-center gap-2">
+          <span className="text-xs text-muted-foreground uppercase tracking-wider">Display:</span>
+          <div className="inline-flex rounded-md border border-card-border bg-card overflow-hidden">
+            <button
+              type="button"
+              onClick={() => setDisplayMode("points")}
+              className={`px-3 py-1 text-xs font-medium transition-colors ${
+                displayMode === "points"
+                  ? "bg-sky-500 text-white"
+                  : "text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              Points
+            </button>
+            <button
+              type="button"
+              onClick={() => setDisplayMode("dollars")}
+              className={`px-3 py-1 text-xs font-medium transition-colors ${
+                displayMode === "dollars"
+                  ? "bg-sky-500 text-white"
+                  : "text-muted-foreground hover:text-foreground"
+              }`}
+            >
+              Dollars
+            </button>
+          </div>
         </div>
       </div>
+
+      {/* ── Monte Carlo projection chart ──
+          Renders only when the user has clicked a horizon button. Shows
+          the median path with 5–95 / 25–75 confidence bands plus a row
+          of stat tiles (% profitable, median final, drawdown, etc.). */}
+      {monteCarloResult && (
+        <MonteCarloCurve
+          result={monteCarloResult}
+          onDismiss={() => setMonteCarloResult(null)}
+        />
+      )}
 
       {/* ── Composite winning trade ──
           Inserts the "perfect trade" composite right after the equity curve,
@@ -6057,6 +7173,26 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
       {/* The script reference now lives at /script-reference and opens
           in a new tab from the "Reference ↗" button in the script-mode
           sticky control bar. The previous slide-out panel was removed. */}
+        </>
+      )}
+
+      {/* Chart view of script mode — a candlestick chart of the stitched
+          bars from every selected session, with two layered marker
+          tracks (raw signals + filtered trades). Independent of the
+          UI subtree above so the layout stays simple: exactly one of
+          {legacy children, chart} renders at a time. */}
+      {mode === "script" && scriptViewMode === "chart" && (
+        <BacktestScriptChart
+          bars={scriptChartInputs.bars}
+          signalZones={runResult.syntheticZones}
+          trades={trades}
+          showSignals={showSignalsLayer}
+          showTrades={showTradesLayer}
+          onToggleSignals={setShowSignalsLayer}
+          onToggleTrades={setShowTradesLayer}
+          warning={scriptChartInputs.warning}
+        />
+      )}
 
       </div>
 
@@ -6365,6 +7501,12 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
         </div>
       )}
 
+      {/* Embedded terminal drawer — collapsed tab in the bottom-right by
+          default. Lazy-mounts an xterm.js shell pane (rooted at the
+          project directory) when opened, so the user can run `claude`,
+          `git`, etc. without leaving the dashboard. Backed by
+          `scripts/term-server.mjs` over a localhost-only WebSocket. */}
+      <TerminalDrawer />
     </div>
   );
 }

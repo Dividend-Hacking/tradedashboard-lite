@@ -14,7 +14,8 @@
 import { useState, useMemo, useEffect } from "react";
 import { Trade } from "@/types/trade";
 import { rawDateString } from "@/lib/utils/format";
-import { createClient } from "@/lib/supabase/client";
+import { getClientStore } from "@/lib/store";
+import { useMode } from "@/components/mode-provider";
 import {
   computeSummaryStats,
   buildEquityCurve,
@@ -45,6 +46,8 @@ interface DashboardProps {
 }
 
 export function Dashboard({ trades: initialTrades }: DashboardProps) {
+  const mode = useMode();
+
   // --- Local trades state for optimistic deletion ---
   const [trades, setTrades] = useState<Trade[]>(initialTrades);
 
@@ -71,54 +74,34 @@ export function Dashboard({ trades: initialTrades }: DashboardProps) {
   const [startDate, setStartDate] = useState<string>("");
   const [endDate, setEndDate] = useState<string>("");
 
-  // --- Realtime subscription: keep trades state live via Supabase Realtime ---
-  // Subscribes once on mount, handles INSERT/UPDATE/DELETE, and cleans up on unmount.
-  // Supabase Realtime must be enabled for the `trades` table in the Supabase dashboard.
+  // --- Realtime subscription: keep trades state live ---
+  // In cloud mode this taps Supabase Realtime postgres_changes; in local
+  // mode it polls /api/local/realtime/trades-all every ~2s. Either way,
+  // the consumer-side dedup-by-id pattern means we don't need separate
+  // INSERT vs UPDATE handlers — we always upsert. DELETE only fires in
+  // cloud mode; local mode users see deleted trades disappear via the
+  // optimistic update path inside handleDelete below.
   useEffect(() => {
-    const supabase = createClient();
-    const channel = supabase
-      .channel("trades-realtime")
-      .on(
-        "postgres_changes",
-        { event: "*", schema: "public", table: "trades" },
-        (payload) => {
-          if (payload.eventType === "INSERT") {
-            // Append new trade and keep sorted by entry_time ascending
-            setTrades((prev) =>
-              [...prev, payload.new as Trade].sort(
-                (a, b) =>
-                  new Date(a.entry_time).getTime() -
-                  new Date(b.entry_time).getTime()
-              )
-            );
-          } else if (payload.eventType === "UPDATE") {
-            // Replace the matching trade in state (matched by id)
-            setTrades((prev) =>
-              prev.map((t) =>
-                t.id === (payload.new as Trade).id
-                  ? (payload.new as Trade)
-                  : t
-              )
-            );
-          } else if (payload.eventType === "DELETE") {
-            // Remove the deleted trade from state (matched by id)
-            setTrades((prev) =>
-              prev.filter((t) => t.id !== (payload.old as Trade).id)
-            );
-          }
+    const store = getClientStore(mode);
+    return store.trades.subscribeAll((row, kind) => {
+      if (kind === "delete") {
+        setTrades((prev) => prev.filter((t) => t.id !== row.id));
+        return;
+      }
+      setTrades((prev) => {
+        const idx = prev.findIndex((t) => t.id === row.id);
+        if (idx >= 0) {
+          const next = prev.slice();
+          next[idx] = row;
+          return next;
         }
-      )
-      .subscribe((status, err) => {
-        // Log subscription status for debugging realtime connectivity
-        if (err) console.error("Realtime subscription error:", err);
-        else console.log("Realtime status:", status);
+        return [...prev, row].sort(
+          (a, b) =>
+            new Date(a.entry_time).getTime() - new Date(b.entry_time).getTime()
+        );
       });
-
-    // Cleanup: unsubscribe channel when component unmounts
-    return () => {
-      supabase.removeChannel(channel);
-    };
-  }, []); // empty dep array — subscribe once on mount
+    });
+  }, [mode]);
 
   // --- Derive unique account names from the full dataset ---
   const accounts = useMemo(() => {
