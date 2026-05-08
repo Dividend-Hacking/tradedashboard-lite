@@ -22,7 +22,13 @@
  */
 
 import { TradeZone, TradeZoneBar } from "@/types/trade-zone";
-import { createClient } from "@/lib/supabase/client";
+import { getClientStore, type Mode } from "@/lib/store";
+
+function activeMode(): Mode {
+  if (typeof window === "undefined") return "cloud";
+  const w = window as unknown as { __tradeDashMode?: Mode };
+  return w.__tradeDashMode ?? "cloud";
+}
 
 /** A row from replay_sessions — only the columns we use */
 interface ReplaySessionRow {
@@ -64,12 +70,12 @@ export async function fetchZoneExtensionBars(
   const result = new Map<number, TradeZoneBar[]>();
   if (zones.length === 0) return result;
 
-  const supabase = createClient();
+  const store = getClientStore(activeMode());
 
   // ─── Step 1: pull candidate replay sessions ─────────────────────────
-  // Collect unique (instrument, timeframe) pairs so we can fetch all relevant
-  // sessions in one round-trip. Postgrest doesn't support tuple-IN, so we
-  // OR-filter by instrument set and timeframe set and post-filter in JS.
+  // Collect unique (instrument, timeframe) pairs and ask the store layer
+  // for matching sessions; we then post-filter in JS by exact (instrument,
+  // timeframe, time-window) match.
   const instruments = new Set<string>();
   const timeframes = new Set<string>();
   for (const z of zones) {
@@ -80,19 +86,17 @@ export async function fetchZoneExtensionBars(
   }
   if (instruments.size === 0) return result;
 
-  const { data: sessionRows, error: sessionErr } = await supabase
-    .from("replay_sessions")
-    .select("id, instrument, timeframe, start_time, end_time")
-    .in("instrument", Array.from(instruments))
-    .in("timeframe", Array.from(timeframes));
-
-  if (sessionErr || !sessionRows) {
+  let sessions: ReplaySessionRow[];
+  try {
+    sessions = (await store.replay.listSessionsByInstrumentsAndTimeframes(
+      Array.from(instruments),
+      Array.from(timeframes)
+    )) as ReplaySessionRow[];
+  } catch (err) {
     // Soft-fail: simulator should still work without extension data
-    console.warn("[zone-extension-fetcher] failed to load replay_sessions:", sessionErr);
+    console.warn("[zone-extension-fetcher] failed to load replay_sessions:", err);
     return result;
   }
-
-  const sessions = sessionRows as ReplaySessionRow[];
 
   // ─── Step 2: match each zone to its containing session ──────────────
   // A zone matches a session when instrument + timeframe match AND the zone's
@@ -147,30 +151,29 @@ export async function fetchZoneExtensionBars(
       if (m.zone.end_time < earliestEnd) earliestEnd = m.zone.end_time;
     }
 
-    // Paginate through replay_bars to bypass Postgrest's default 1000-row cap
-    // (same pattern used by SimulatorPanel for trade_zone_bars).
-    const PAGE_SIZE = 1000;
+    // Use a tiny epsilon greater than earliestEnd as the lower bound —
+    // the store's range method takes inclusive [from, to], and we want
+    // strictly > earliestEnd. Tacking on " " (after 'Z') is enough to push
+    // the ISO string past any same-instant timestamp. The upper bound is
+    // a far-future date so we get all bars after the earliest end.
     let allBars: ReplayBarRow[] = [];
-    let offset = 0;
-    let hasMore = true;
-
-    while (hasMore) {
-      const { data, error: barsErr } = await supabase
-        .from("replay_bars")
-        .select("session_id, bar_time, bar_open, bar_high, bar_low, bar_close, bar_volume")
-        .eq("session_id", sessionId)
-        .gt("bar_time", earliestEnd)
-        .order("bar_time", { ascending: true })
-        .range(offset, offset + PAGE_SIZE - 1);
-
-      if (barsErr) {
-        console.warn("[zone-extension-fetcher] failed to load replay_bars:", barsErr);
-        break;
-      }
-      const rows = (data as ReplayBarRow[]) ?? [];
-      allBars = allBars.concat(rows);
-      hasMore = rows.length === PAGE_SIZE;
-      offset += PAGE_SIZE;
+    try {
+      const rows = await store.replay.listBarsForSessionInTimeRange(
+        sessionId,
+        earliestEnd + " ",
+        "9999-12-31T23:59:59Z"
+      );
+      allBars = rows.map((r) => ({
+        session_id: r.session_id,
+        bar_time: r.bar_time,
+        bar_open: r.bar_open,
+        bar_high: r.bar_high,
+        bar_low: r.bar_low,
+        bar_close: r.bar_close,
+        bar_volume: r.bar_volume,
+      }));
+    } catch (err) {
+      console.warn("[zone-extension-fetcher] failed to load replay_bars:", err);
     }
 
     // ─── Step 4: slice per-zone and synthesize TradeZoneBar shapes ────

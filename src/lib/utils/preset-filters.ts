@@ -36,6 +36,9 @@ export interface FilterContext {
   ctx_volume_ratio?: number | null;
   ctx_rsi?: number | null;
   ctx_adx_slope?: number | null;
+  /** Bid/ask delta imbalance at entry — (ask − bid) / (ask + bid). Range
+   *  [−1, +1]; null on bars without a bid/ask split (plain `ohlcv`). */
+  ctx_delta_ratio?: number | null;
 }
 
 /** Evaluate every enabled sub-filter against a snapshot. Returns true iff
@@ -170,6 +173,17 @@ export function evaluatePresetFilters(
       // "flat"
       if (Math.abs(slope) > thresh) return false;
     }
+  }
+
+  // ── Bid/ask delta imbalance ───────────────────────────────────────
+  // (ask − bid) / (ask + bid) at entry, in [−1, +1]. Null drops same
+  // as the other indicator filters — plain `ohlcv` sessions reject
+  // every trade when this filter is on, which is the desired fail-
+  // closed behavior for a knob whose data isn't present.
+  if (filters.delta?.enabled) {
+    const d = ctx.ctx_delta_ratio;
+    if (d == null) return false;
+    if (d < filters.delta.min || d > filters.delta.max) return false;
   }
 
   // ── Time-of-day ───────────────────────────────────────────────────

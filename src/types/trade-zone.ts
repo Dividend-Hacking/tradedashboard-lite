@@ -43,6 +43,11 @@ export interface TradeZone {
   ctx_volume_ratio?: number | null;
   ctx_rsi?: number | null;
   ctx_adx_slope?: number | null;
+  /** Bid/ask delta imbalance at entry — (ask − bid) / (ask + bid), in
+   *  [−1, +1]. Populated for synthetic backtest zones whose source bars
+   *  carry a bid/ask split (tick / tick_bidask / ohlcv_bidask sessions);
+   *  absent / null otherwise. Drives the delta-imbalance entry filter. */
+  ctx_delta_ratio?: number | null;
   entry_hour: number | null; // Hour of entry (0-23)
   entry_day_of_week: number | null; // 0=Sun..6=Sat
   section_id: number | null; // FK → zone_sections.id (NULL = "default" fallback)
@@ -84,4 +89,12 @@ export interface TradeZoneBar {
   high_since_entry: number | null; // Running best favorable price reached
   retrace_from_peak: number | null; // How much given back from the peak
   created_at: string;
+  // ─── Order-flow split (optional) ──────────────────────────────────────
+  // Populated only when the source data carries bid/ask attribution
+  // (replay sessions with `ohlcv_bidask` or `tick_bidask` granularity).
+  // Plain `ohlcv` sessions and DB-loaded zones leave these undefined,
+  // and order-flow indicators (delta, CVD, etc.) treat undefined/null
+  // as missing data → NaN.
+  bar_volume_bid?: number | null;
+  bar_volume_ask?: number | null;
 }

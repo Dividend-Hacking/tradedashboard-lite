@@ -56,6 +56,7 @@ import {
   type EnumValue,
   type Expr,
   type OptimizeSpec,
+  type ExampleEntry,
 } from "./script-expr";
 
 // ─── Public types ───────────────────────────────────────────────────────────
@@ -124,6 +125,11 @@ export interface BacktestConfig {
       lookback: number;
       flatThreshold: number;
     };
+    delta: {
+      enabled: boolean;
+      min: number;
+      max: number;
+    };
   };
 }
 
@@ -173,6 +179,12 @@ export interface ScriptSchemaEntry {
    *  from UI still produces a faithful round-trip. The flag does NOT
    *  affect parser behavior; the path remains assignable. */
   legacyHiddenWhenDefault?: boolean;
+  /** Worked examples shown on the /script-reference page, the
+   *  script-editor hover tooltips, and the AI markdown export. Each
+   *  example pairs a parseable snippet (`rules.stopLossPoints = 10`)
+   *  with a plain-English scenario describing what happens. Optional —
+   *  legacy/auto-generated rows may not have any. */
+  examples?: ExampleEntry[];
 }
 
 // ─── Schema construction ────────────────────────────────────────────────────
@@ -184,7 +196,14 @@ export interface ScriptSchemaEntry {
 
 /** Union of all params across all strategies, deduplicated. Each row notes
  *  which strategies own the param so users get a hint when a param doesn't
- *  apply to their current strategy choice. */
+ *  apply to their current strategy choice.
+ *
+ *  Note on `examples`: when two strategies define the same param key,
+ *  this fn keeps the FIRST occurrence and just appends subsequent
+ *  strategies to the owner list. Examples on the second / later
+ *  strategies are silently dropped — to keep things simple, define
+ *  worked examples on the strategy where the param appears first in
+ *  iteration order. */
 function buildParamSchemaEntries(): ScriptSchemaEntry[] {
   const rows = new Map<string, ScriptSchemaEntry>();
   for (const strat of STRATEGIES) {
@@ -207,6 +226,7 @@ function buildParamSchemaEntries(): ScriptSchemaEntry[] {
         max: f.max,
         step: f.step,
         strategies: [strat.id],
+        examples: f.examples,
       });
     }
   }
@@ -264,29 +284,32 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     type: "enum",
     section: "Strategy",
     description:
-      "Which signal generator to run. Each strategy exposes its own params.* — see the Strategy params section. Soft-set: doesn't touch params.* — to also reset every param to that strategy's defaults, use `loadstrategy = ...` instead.",
+      "Picks which strategy generates the trade signals. Each strategy has its own knobs (see the Strategy params section). Note: this just switches the strategy — it does NOT reset your params. Use `loadstrategy` instead if you want a fresh start.",
     default: STRATEGIES[0].id,
     options: STRATEGIES.map((s) => s.id),
     enumerable: true,
+    examples: [
+      {
+        snippet: "strategy = signal_v2",
+        scenario: "Switch to the signal_v2 strategy, keeping any params you've already set.",
+      },
+    ],
   },
   {
-    // loadstrategy is a HOISTED directive: regardless of where the line
-    // appears in the script, the parser pre-pass applies it before any
-    // other line is processed. The effect is "switch strategy AND reset
-    // every params.* field to that strategy's default value." Subsequent
-    // params.* assignments in the same script then override individual
-    // defaults. This lets users swap strategies without manually
-    // rewriting every params.* line. NOT round-tripped by the
-    // serializer (it's a one-shot operation, not a stored value), so
-    // Sync from UI / Load Defaults never re-emit it.
     path: "loadstrategy",
     type: "enum",
     section: "Strategy",
     description:
-      'Switch strategy AND replace every params.* field with the new strategy\'s default values. Hoisted: applied BEFORE the rest of the script, so any `params.X = Y` lines you keep below will override the loaded defaults. Use this to switch strategies without manually rewriting every params.* line. Example: `loadstrategy = signal_v2`. NOT round-tripped — it\'s a one-shot operation, not a stored field.',
+      "Switch strategy AND wipe all params.* back to that strategy's defaults. Use this when you want a clean slate. Any params.* lines you write AFTER it still take effect (they override the freshly-loaded defaults).",
     default: STRATEGIES[0].id,
     options: STRATEGIES.map((s) => s.id),
     enumerable: true,
+    examples: [
+      {
+        snippet: "loadstrategy = signal_v2",
+        scenario: "Switch to signal_v2 and reset every param to that strategy's defaults.",
+      },
+    ],
   },
 
   // ── Strategy params (auto-built) ────────────────────────────────────────
@@ -297,119 +320,158 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     path: "rules.stopLossEnabled",
     type: "boolean",
     section: "Risk rules — Exits",
-    description: "Master toggle for the fixed stop loss.",
+    description: "Turn the fixed stop loss on or off.",
     default: true,
     enumerable: true,
+    examples: [
+      { snippet: "rules.stopLossEnabled = true", scenario: "Use a stop loss on every trade." },
+    ],
   },
   {
     path: "rules.stopLossPoints",
     type: "float",
     section: "Risk rules — Exits",
-    description: "Stop loss distance in points from entry.",
+    description: "How many points price has to move against you before the stop kicks in and exits the trade.",
     default: 10,
     min: 0,
     max: 200,
     step: 0.25,
+    examples: [
+      { snippet: "rules.stopLossPoints = 10", scenario: "Exit if price moves 10 points against your entry." },
+      { snippet: "rules.stopLossPoints = ATR * 1.5", scenario: "Use a volatility-based stop — wider on busy days, tighter on quiet ones." },
+    ],
   },
   {
     path: "rules.takeProfitEnabled",
     type: "boolean",
     section: "Risk rules — Exits",
-    description: "Master toggle for the fixed take profit.",
+    description: "Turn the fixed take profit on or off.",
     default: true,
     enumerable: true,
+    examples: [
+      { snippet: "rules.takeProfitEnabled = false", scenario: "Don't auto-exit on profit — let trailing stops or the timed exit close it." },
+    ],
   },
   {
     path: "rules.takeProfitPoints",
     type: "float",
     section: "Risk rules — Exits",
-    description: "Take profit distance in points from entry.",
+    description: "How many points of profit you want before automatically banking the trade.",
     default: 20,
     min: 0,
     max: 200,
     step: 0.25,
+    examples: [
+      { snippet: "rules.takeProfitPoints = 20", scenario: "Bank the trade once you're up 20 points." },
+      { snippet: "rules.takeProfitPoints = ATR * 3", scenario: "Aim for 3× the typical bar swing as profit." },
+    ],
   },
   {
     path: "rules.trailingStopEnabled",
     type: "boolean",
     section: "Risk rules — Exits",
-    description: "Trailing stop, locked in points behind the running peak.",
+    description: "Turn on a trailing stop — a stop that follows price up, locking in profit as the trade goes your way.",
     default: false,
     enumerable: true,
+    examples: [
+      { snippet: "rules.trailingStopEnabled = true", scenario: "Let winners run — exit only when price pulls back from the peak." },
+    ],
   },
   {
     path: "rules.trailingStopPoints",
     type: "float",
     section: "Risk rules — Exits",
-    description: "Trailing stop distance behind peak in points.",
+    description: "How far the trailing stop sits behind the best price the trade has reached. Smaller = locks in profit sooner; bigger = lets the trade breathe.",
     default: 8,
     min: 0,
     max: 100,
     step: 0.25,
+    examples: [
+      { snippet: "rules.trailingStopPoints = 8", scenario: "Exit if price pulls back 8 points from the high it has reached so far." },
+    ],
   },
   {
     path: "rules.timedExitEnabled",
     type: "boolean",
     section: "Risk rules — Exits",
-    description: "Force-exit after a fixed number of bars held.",
+    description: "Force the trade to close after a set number of bars, no matter what.",
     default: false,
     enumerable: true,
+    examples: [
+      { snippet: "rules.timedExitEnabled = true", scenario: "Don't hold trades forever — close them after a fixed bar count." },
+    ],
   },
   {
     path: "rules.timedExitBars",
     type: "int",
     section: "Risk rules — Exits",
-    description: "Bars to hold before forced timed exit.",
+    description: "How many bars to wait before force-closing the trade.",
     default: 20,
     min: 1,
     max: 200,
     step: 1,
+    examples: [
+      { snippet: "rules.timedExitBars = 20", scenario: "Close the trade after 20 bars, win or lose." },
+    ],
   },
   {
     path: "rules.breakEvenEnabled",
     type: "boolean",
     section: "Risk rules — Exits",
-    description: "Move stop to entry once profit clears the trigger.",
+    description: "Once the trade is up by a certain amount, move the stop to your entry price so you can't lose anymore.",
     default: false,
     enumerable: true,
+    examples: [
+      { snippet: "rules.breakEvenEnabled = true", scenario: "Lock in a free trade once profit reaches the trigger." },
+    ],
   },
   {
     path: "rules.breakEvenTrigger",
     type: "float",
     section: "Risk rules — Exits",
-    description: "Profit (in points) at which break-even snaps in.",
+    description: "How many points of profit you need before the stop gets pulled up to break-even.",
     default: 5,
     min: 0,
     max: 100,
     step: 0.25,
+    examples: [
+      { snippet: "rules.breakEvenTrigger = 5", scenario: "Once you're up 5 points, move the stop to entry — no more losses possible." },
+    ],
   },
   {
     path: "rules.exitAtBarClose",
     type: "boolean",
     section: "Risk rules — Exits",
-    description:
-      "true = exit at candle close after the trigger; false = exit at the exact trigger price intra-bar.",
+    description: "If true, the trade exits at the close of the bar that triggered the stop or target. If false, it exits at the exact price level the moment it hit (mid-bar).",
     default: true,
     enumerable: true,
+    examples: [
+      { snippet: "rules.exitAtBarClose = false", scenario: "Be more realistic — exit the moment the stop/target price prints, not at the candle close." },
+    ],
   },
   {
     path: "rules.extensionBarsEnabled",
     type: "boolean",
     section: "Risk rules — Exits",
-    description:
-      "Append N replay bars after the zone end so the simulator can simulate holding longer.",
+    description: "Lets the simulator hold a trade past the end of the original zone by adding extra bars to play out.",
     default: false,
     enumerable: true,
+    examples: [
+      { snippet: "rules.extensionBarsEnabled = true", scenario: "Don't auto-close at zone end — give the trade more bars to find its target." },
+    ],
   },
   {
     path: "rules.extensionBars",
     type: "int",
     section: "Risk rules — Exits",
-    description: "How many extra bars to append when extensionBarsEnabled is true.",
+    description: "How many extra bars to append after a zone ends, when extension bars are turned on.",
     default: 20,
     min: 1,
     max: 100,
     step: 1,
+    examples: [
+      { snippet: "rules.extensionBars = 20", scenario: "Give every trade 20 extra bars to play out beyond its zone." },
+    ],
   },
 
   // ── Risk rules: ATR adjust ──────────────────────────────────────────────
@@ -418,27 +480,33 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     type: "float",
     section: "Risk rules — ATR adjust",
     description:
-      "Stop loss = stopLossPoints + slAtrAdjust × ATR(14). 0 = fixed-points behavior.",
+      "Adds a volatility-based bonus to your stop. Stop = stopLossPoints + this × ATR(14). 0 = fixed stop. Positive = wider stop on volatile days. Negative = tighter on volatile days.",
     default: 0,
     min: -2,
     max: 2,
     step: 0.05,
+    examples: [
+      { snippet: "rules.slAtrAdjust = 1", scenario: "Add 1× ATR to your fixed stop — stops widen automatically when the market is busy." },
+    ],
   },
   {
     path: "rules.tpAtrAdjust",
     type: "float",
     section: "Risk rules — ATR adjust",
-    description: "Take profit = takeProfitPoints + tpAtrAdjust × ATR(14).",
+    description: "Adds an ATR-based bonus to your take-profit target. Same idea as the stop adjust, but for profit.",
     default: 0,
     min: -2,
     max: 2,
     step: 0.05,
+    examples: [
+      { snippet: "rules.tpAtrAdjust = 2", scenario: "Make the target stretch by 2× ATR on busy days." },
+    ],
   },
   {
     path: "rules.trailAtrAdjust",
     type: "float",
     section: "Risk rules — ATR adjust",
-    description: "Trailing distance = trailingStopPoints + trailAtrAdjust × ATR(14).",
+    description: "Adds an ATR bonus to the trailing stop distance.",
     default: 0,
     min: -2,
     max: 2,
@@ -448,7 +516,7 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     path: "rules.beAtrAdjust",
     type: "float",
     section: "Risk rules — ATR adjust",
-    description: "Break-even trigger = breakEvenTrigger + beAtrAdjust × ATR(14).",
+    description: "Adds an ATR bonus to the break-even trigger amount.",
     default: 0,
     min: -2,
     max: 2,
@@ -461,11 +529,14 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     type: "enum",
     section: "Risk rules — Position overlap",
     description:
-      "How to handle a new signal while a previous trade is still open. " +
-      `"default" simulates each zone in isolation; "close-previous" closes ALL open trades on a new signal; "add-close" closes only OPPOSING open trades; "null" drops new signals while anything is open; "add-null" drops new signals only while an opposing trade is open; "reverse-null" flips the side on an opposing signal (drops same-direction signals) and resets size; "reverse-add" flips on opposing (size reset) and stacks on same-direction.`,
+      'What to do when a new signal happens while another trade is still open. "default" runs each trade in its own world. "close-previous" closes everything open. "add-close" closes only trades going the opposite way. "null" ignores new signals while anything is open. "reverse-null" / "reverse-add" handle flips.',
     default: "default",
     options: POSITION_MODES,
     enumerable: true,
+    examples: [
+      { snippet: 'rules.positionMode = "close-previous"', scenario: "When a new signal fires, close any open trades first, then take the new one." },
+      { snippet: 'rules.positionMode = "null"', scenario: "Skip any new signal while a trade is open — one at a time only." },
+    ],
   },
 
   // ── Risk rules: Scaling ────────────────────────────────────────────────
@@ -473,46 +544,57 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     path: "rules.scalingEnabled",
     type: "boolean",
     section: "Risk rules — Scaling",
-    description:
-      "Walks position size across trades: + winStep on win, − lossStep on loss, clamped to [minSize, maxSize].",
+    description: "Lets your trade size grow after winners and shrink after losers, instead of being a fixed amount every time.",
     default: false,
     enumerable: true,
+    examples: [
+      { snippet: "rules.scalingEnabled = true", scenario: "Press your edge — risk more after wins, less after losses." },
+    ],
   },
   {
     path: "rules.scalingStartSize",
     type: "int",
     section: "Risk rules — Scaling",
-    description: "Initial position size for the scaling walk.",
+    description: "How many contracts the scaling system starts with.",
     default: 1,
     min: 1,
     max: 100,
     step: 1,
+    examples: [
+      { snippet: "rules.scalingStartSize = 1", scenario: "Begin scaling from 1 contract." },
+    ],
   },
   {
     path: "rules.scalingWinStep",
     type: "int",
     section: "Risk rules — Scaling",
-    description: "Contracts added after a winning trade.",
+    description: "How many contracts to ADD after a winning trade.",
     default: 1,
     min: 0,
     max: 20,
     step: 1,
+    examples: [
+      { snippet: "rules.scalingWinStep = 1", scenario: "Add 1 contract after each win." },
+    ],
   },
   {
     path: "rules.scalingLossStep",
     type: "int",
     section: "Risk rules — Scaling",
-    description: "Contracts removed after a losing trade.",
+    description: "How many contracts to REMOVE after a losing trade.",
     default: 1,
     min: 0,
     max: 20,
     step: 1,
+    examples: [
+      { snippet: "rules.scalingLossStep = 1", scenario: "Drop 1 contract after each loss." },
+    ],
   },
   {
     path: "rules.scalingMinSize",
     type: "int",
     section: "Risk rules — Scaling",
-    description: "Floor for the running scaled size.",
+    description: "The smallest size your scaling will ever shrink down to.",
     default: 1,
     min: 1,
     max: 100,
@@ -522,20 +604,25 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     path: "rules.scalingMaxSize",
     type: "int",
     section: "Risk rules — Scaling",
-    description: "Ceiling for the running scaled size.",
+    description: "The biggest size your scaling will grow to.",
     default: 5,
     min: 1,
     max: 100,
     step: 1,
+    examples: [
+      { snippet: "rules.scalingMaxSize = 5", scenario: "Cap scaling at 5 contracts no matter how many wins in a row." },
+    ],
   },
   {
     path: "rules.scalingResetDaily",
     type: "boolean",
     section: "Risk rules — Scaling",
-    description:
-      "Reset running size back to scalingStartSize at every day boundary so each session starts fresh.",
+    description: "If true, scaling size resets to the start size at the beginning of each day. Stops a hot streak from carrying into a fresh session.",
     default: false,
     enumerable: true,
+    examples: [
+      { snippet: "rules.scalingResetDaily = true", scenario: "Each new trading day starts back at scalingStartSize." },
+    ],
   },
 
   // ── Risk rules: Daily kill switches ────────────────────────────────────
@@ -543,105 +630,132 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     path: "rules.dailyStopLossEnabled",
     type: "boolean",
     section: "Risk rules — Daily limits",
-    description:
-      "Stop trading for the day after cumulative scaled P&L crosses below −dailyStopLossPoints.",
+    description: "Stop trading for the day if total losses get too big. A safety net so a bad day doesn't snowball.",
     default: false,
     enumerable: true,
+    examples: [
+      { snippet: "rules.dailyStopLossEnabled = true", scenario: "Walk away once you've lost too much in one day." },
+    ],
   },
   {
     path: "rules.dailyStopLossPoints",
     type: "float",
     section: "Risk rules — Daily limits",
-    description: "Daily loss threshold (positive number, treated as −X internally).",
+    description: "How many points in the red before the daily stop kicks in (use a positive number — it's treated as a loss).",
     default: 50,
     min: 0,
     max: 1000,
     step: 1,
+    examples: [
+      { snippet: "rules.dailyStopLossPoints = 50", scenario: "Stop trading for the day once you're down 50 points." },
+    ],
   },
   {
     path: "rules.dailyTakeProfitEnabled",
     type: "boolean",
     section: "Risk rules — Daily limits",
-    description: "Stop trading for the day after cumulative scaled P&L crosses +dailyTakeProfitPoints.",
+    description: "Stop trading for the day after you've made enough profit. Locks in a green day.",
     default: false,
     enumerable: true,
+    examples: [
+      { snippet: "rules.dailyTakeProfitEnabled = true", scenario: "Quit while you're ahead — stop trading after hitting a daily profit goal." },
+    ],
   },
   {
     path: "rules.dailyTakeProfitPoints",
     type: "float",
     section: "Risk rules — Daily limits",
-    description: "Daily profit threshold.",
+    description: "How many points of profit to make before quitting for the day.",
     default: 50,
     min: 0,
     max: 1000,
     step: 1,
+    examples: [
+      { snippet: "rules.dailyTakeProfitPoints = 50", scenario: "Stop trading once you've banked 50 points for the day." },
+    ],
   },
   {
     path: "rules.dailyLimitExactMode",
     type: "boolean",
     section: "Risk rules — Daily limits",
-    description:
-      "When true, in-flight trades are force-closed at the bar the daily limit fires; when false, they finish naturally and the day-stop only blocks new entries.",
+    description: "If true, the daily limit force-closes any open trades the moment it triggers. If false, open trades are allowed to finish naturally — only NEW entries get blocked.",
     default: false,
     enumerable: true,
+    examples: [
+      { snippet: "rules.dailyLimitExactMode = true", scenario: "Hit your daily limit? Close everything immediately." },
+    ],
   },
   {
     path: "rules.maxTradesPerDayEnabled",
     type: "boolean",
     section: "Risk rules — Daily limits",
-    description:
-      "Hard cap on entries per calendar day. Once N trades have started today, every later entry is dropped — independent of P&L.",
+    description: "Set a hard cap on how many trades you can take in one day.",
     default: false,
     enumerable: true,
+    examples: [
+      { snippet: "rules.maxTradesPerDayEnabled = true", scenario: "Limit how many trades fire each day to prevent over-trading." },
+    ],
   },
   {
     path: "rules.maxTradesPerDay",
     type: "int",
     section: "Risk rules — Daily limits",
-    description: "Max number of trades allowed per day when enabled.",
+    description: "How many trades you're allowed in a single day before further entries get blocked.",
     default: 5,
     min: 1,
     max: 200,
     step: 1,
+    examples: [
+      { snippet: "rules.maxTradesPerDay = 5", scenario: "Allow at most 5 trades per day; ignore anything beyond that." },
+    ],
   },
   {
     path: "rules.maxLossesPerDayEnabled",
     type: "boolean",
     section: "Risk rules — Daily limits",
-    description:
-      "Hard cap on LOSING trades per day. Once N losers (per-contract exitPoints < 0) have closed today, every later entry is dropped.",
+    description: "Stop trading for the day after a certain number of LOSING trades. Useful if you tilt easily after losses.",
     default: false,
     enumerable: true,
+    examples: [
+      { snippet: "rules.maxLossesPerDayEnabled = true", scenario: "Walk away after a streak of losers — fight tilt." },
+    ],
   },
   {
     path: "rules.maxLossesPerDay",
     type: "int",
     section: "Risk rules — Daily limits",
-    description: "Max number of losing trades allowed per day when enabled.",
+    description: "How many losing trades are allowed per day before the day ends.",
     default: 3,
     min: 1,
     max: 50,
     step: 1,
+    examples: [
+      { snippet: "rules.maxLossesPerDay = 3", scenario: "After 3 losers in one day, stop taking new trades." },
+    ],
   },
   {
     path: "rules.cooldownBetweenTradesEnabled",
     type: "boolean",
     section: "Risk rules — Daily limits",
-    description:
-      "Drop new entries that fire within `cooldownBetweenTradesBars` minutes of the previous KEPT trade's exit. Caps over-trading.",
+    description: "Forces a wait between trades. Stops you from rapid-firing entries on top of each other.",
     default: false,
     enumerable: true,
+    examples: [
+      { snippet: "rules.cooldownBetweenTradesEnabled = true", scenario: "Wait a few minutes after each trade before allowing the next entry." },
+    ],
   },
   {
     path: "rules.cooldownBetweenTradesBars",
     type: "int",
     section: "Risk rules — Daily limits",
-    description:
-      "Cooldown window after each kept trade's exit, in minutes. Approximate match for sub-minute timeframes.",
+    description: "How many minutes to wait after a trade closes before another entry is allowed.",
     default: 5,
     min: 1,
     max: 240,
     step: 1,
+    examples: [
+      { snippet: "rules.cooldownBetweenTradesBars = 5", scenario: "Wait 5 minutes after each closed trade before the next entry." },
+    ],
   },
 
   // ── Fills & Costs ──────────────────────────────────────────────────────
@@ -655,49 +769,61 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     type: "enum",
     section: "Risk rules — Fills & Costs",
     description:
-      '"next_open" (default) fills at the FOLLOWING bar\'s open — matches NinjaTrader\'s Calculate.OnBarClose live behavior and is the realistic default. "close" fills at the trigger bar\'s close (legacy; assumes a market order that gets the closing print). Switch to "close" only to reproduce historical results from before this field existed.',
+      'Where the trade actually fills. "next_open" (default) fills at the open of the bar AFTER the signal — matches how live trading really works. "close" fills at the exact closing price of the signal bar (less realistic, but useful to replicate older backtests).',
     default: "next_open",
     options: ["close", "next_open"],
     enumerable: true,
+    examples: [
+      { snippet: 'rules.fillMode = "next_open"', scenario: "Realistic — fills at the next bar's open like real live trading." },
+    ],
   },
   {
     path: "rules.tickConfigMode",
     type: "enum",
     section: "Risk rules — Fills & Costs",
     description:
-      'Auto-resolve tick / point values from the instrument symbol (NQ, ES, GC, CL, BTC, etc. — see futures.ts for the full table) OR use the explicit rules.* values below. "auto" is correct for any standard CME contract; switch to "manual" only for custom or unrecognized instruments.',
+      'Whether tick sizes are figured out automatically from the instrument symbol (auto), or set by hand (manual). "auto" works for all standard futures like NQ, ES, GC, CL, BTC. Use "manual" only for custom instruments.',
     default: "auto",
     options: ["auto", "manual"],
     enumerable: true,
+    examples: [
+      { snippet: 'rules.tickConfigMode = "auto"', scenario: "Let the dashboard figure out the right tick size for each instrument." },
+    ],
   },
   {
     path: "rules.pointValue",
     type: "float",
     section: "Risk rules — Fills & Costs",
     description:
-      "Dollar value per 1.0 price point per contract. ONLY used when tickConfigMode is \"manual\" (or as fallback when an instrument symbol isn't in the auto-detect table). NQ=20, ES=50, CL=1000, GC=100.",
+      "Dollars per 1 full price point per contract. Only used when tickConfigMode is \"manual\". Reference: NQ=20, ES=50, CL=1000, GC=100.",
     default: 20,
     min: 0,
     max: 100000,
     step: 0.01,
+    examples: [
+      { snippet: "rules.pointValue = 50", scenario: "Manually set the point value to $50 (e.g. for ES)." },
+    ],
   },
   {
     path: "rules.ticksPerPoint",
     type: "float",
     section: "Risk rules — Fills & Costs",
     description:
-      "Ticks per price point. ONLY used when tickConfigMode is \"manual\" (or as fallback for unrecognized instruments). NQ/ES=4 (0.25-pt ticks), CL=100, GC=10, RTY=10, BTC=0.2, ZB=32.",
+      "How many ticks make up one full price point. Only used when tickConfigMode is \"manual\". Reference: NQ/ES=4, CL=100, GC=10, BTC=0.2.",
     default: 4,
     min: 0.01,
     max: 10000,
     step: 0.01,
+    examples: [
+      { snippet: "rules.ticksPerPoint = 4", scenario: "Manually set 4 ticks per point (NQ/ES style)." },
+    ],
   },
   {
     path: "rules.tickValue",
     type: "float",
     section: "Risk rules — Fills & Costs",
     description:
-      "Dollar value per tick. ONLY used when tickConfigMode is \"manual\". Should equal pointValue / ticksPerPoint. NQ=5, ES=12.5, CL=10, GC=10, BTC=25.",
+      "Dollar value of one tick. Only used in manual mode. Should equal pointValue ÷ ticksPerPoint.",
     default: 5,
     min: 0,
     max: 100000,
@@ -708,22 +834,28 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     type: "float",
     section: "Risk rules — Fills & Costs",
     description:
-      "Per-side slippage in price points. Subtracted twice (round trip) from each trade's exitPoints. 0 = perfect fills.",
+      "Extra cost (in points) you pay each time you enter or exit. Models real-world fill quality — your stop or target rarely fills exactly at the price you wanted.",
     default: 0,
     min: 0,
     max: 100,
     step: 0.01,
+    examples: [
+      { snippet: "rules.slippagePoints = 0.25", scenario: "Pay 0.25 points slippage on entry AND exit (so 0.5 round-trip)." },
+    ],
   },
   {
     path: "rules.commissionPerRoundTrip",
     type: "float",
     section: "Risk rules — Fills & Costs",
     description:
-      "Flat $ commission per closed trade (round trip). Reported in $ totals; doesn't affect points-based metrics.",
+      "Flat dollar fee per completed trade (entry + exit combined). Affects dollar totals, not points totals.",
     default: 0,
     min: 0,
     max: 1000,
     step: 0.01,
+    examples: [
+      { snippet: "rules.commissionPerRoundTrip = 4", scenario: "Charge $4 per closed trade as broker commission." },
+    ],
   },
 
   // ── Filters: time of day ───────────────────────────────────────────────
@@ -731,32 +863,42 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     path: "filters.time.enabled",
     type: "boolean",
     section: "Filters — Time of day",
-    description: "Restrict trades to entries whose start time falls in [from, to]. Wraps midnight if from > to.",
+    description: "Only allow trades during certain hours of the day. Skip the rest.",
     default: false,
     enumerable: true,
+    examples: [
+      { snippet: "filters.time.enabled = true", scenario: "Restrict trading to a specific time-of-day window." },
+    ],
   },
   {
     path: "filters.time.from",
     type: "string",
     section: "Filters — Time of day",
-    description: 'Window start — "HH:MM" (24-hour).',
+    description: 'When the trading window starts — written as "HH:MM" in 24-hour format.',
     default: "09:30",
+    examples: [
+      { snippet: 'filters.time.from = "09:30"', scenario: "Start trading at 9:30 AM." },
+    ],
   },
   {
     path: "filters.time.to",
     type: "string",
     section: "Filters — Time of day",
-    description:
-      'Window end — "HH:MM" (24-hour). Mirrors `windows[0].to` when multiple windows are configured. Use `filters.time.windows` for multi-window setups.',
+    description: 'When the trading window ends — "HH:MM" in 24-hour format.',
     default: "16:00",
+    examples: [
+      { snippet: 'filters.time.to = "16:00"', scenario: "Stop allowing new entries after 4:00 PM." },
+    ],
   },
   {
     path: "filters.time.windows",
     type: "stringArray",
     section: "Filters — Time of day",
-    description:
-      'Multi-window list. Each element is "HH:MM-HH:MM" (24-hour, wraps midnight when the start is later than the end). A bar passes when its time falls in ANY window. Empty array falls back to the single [from, to] pair above.',
+    description: 'Multiple trading windows in one list. Each one is "HH:MM-HH:MM". A bar passes if it falls in ANY of these windows. Useful for things like "morning OR power hour".',
     default: ["09:30-16:00"],
+    examples: [
+      { snippet: 'filters.time.windows = ["09:30-11:00", "14:00-16:00"]', scenario: "Only trade during the open and the last 2 hours — skip lunch chop." },
+    ],
   },
 
   // ── Filters: ADX ───────────────────────────────────────────────────────
@@ -767,27 +909,33 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     path: "filters.adx.enabled",
     type: "boolean",
     section: "Filters — ADX",
-    description: "Keep only trades whose entry-bar ADX(14) is in [min, max]. Drops zones with no ADX value.",
+    description: "Only allow trades when the trend strength score (ADX) is between your chosen min and max. Tip: the same effect can be done with `filter.if = ADX(14) >= min && ADX(14) <= max`, which is more flexible.",
     default: false,
     enumerable: true,
     legacyHiddenWhenDefault: true,
+    examples: [
+      { snippet: "filters.adx.enabled = true", scenario: "Turn on the legacy ADX filter — trades only fire when ADX is in your band." },
+    ],
   },
   {
     path: "filters.adx.min",
     type: "float",
     section: "Filters — ADX",
-    description: "Inclusive lower bound on ADX(14).",
+    description: "Smallest ADX value allowed for a trade. ADX below this gets blocked.",
     default: 0,
     min: 0,
     max: 100,
     step: 1,
     legacyHiddenWhenDefault: true,
+    examples: [
+      { snippet: "filters.adx.min = 25", scenario: "Skip weak/choppy markets — only trade when ADX is at least 25." },
+    ],
   },
   {
     path: "filters.adx.max",
     type: "float",
     section: "Filters — ADX",
-    description: "Inclusive upper bound on ADX(14).",
+    description: "Biggest ADX value allowed. ADX above this gets blocked.",
     default: 100,
     min: 0,
     max: 100,
@@ -798,8 +946,7 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     path: "filters.adx.period",
     type: "int",
     section: "Filters — ADX",
-    description:
-      "Wilder ADX period. Default 14. Drives the ctx_adx14 value used by this filter.",
+    description: "How many bars the ADX is calculated over. Standard is 14.",
     default: 14,
     min: 2,
     max: 200,
@@ -816,27 +963,33 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     path: "filters.atr.enabled",
     type: "boolean",
     section: "Filters — ATR",
-    description: "Keep only trades whose entry-bar ATR(14) is in [min, max]. Drops zones with no ATR value.",
+    description: "Only allow trades when the volatility (ATR) is in your chosen band. Skip dead-quiet markets or super-wild ones.",
     default: false,
     enumerable: true,
     legacyHiddenWhenDefault: true,
+    examples: [
+      { snippet: "filters.atr.enabled = true", scenario: "Turn on the legacy ATR filter so volatility has to be in range." },
+    ],
   },
   {
     path: "filters.atr.min",
     type: "float",
     section: "Filters — ATR",
-    description: "Inclusive lower bound on ATR(14) (points).",
+    description: "Smallest allowed ATR (points). Below this = market too quiet to trade.",
     default: 0,
     min: 0,
     max: 100,
     step: 0.25,
     legacyHiddenWhenDefault: true,
+    examples: [
+      { snippet: "filters.atr.min = 0.5", scenario: "Skip dead-quiet markets where ATR is below 0.5." },
+    ],
   },
   {
     path: "filters.atr.max",
     type: "float",
     section: "Filters — ATR",
-    description: "Inclusive upper bound on ATR(14) (points).",
+    description: "Largest allowed ATR (points). Above this = market too wild.",
     default: 100,
     min: 0,
     max: 100,
@@ -847,8 +1000,7 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     path: "filters.atr.period",
     type: "int",
     section: "Filters — ATR",
-    description:
-      "Wilder ATR period. Default 14. Drives BOTH this filter AND the per-rule ATR-adjust math on SL/TP/Trail/BE.",
+    description: "How many bars the ATR is averaged over. Standard is 14. Also used by the ATR-adjust math on stops/targets.",
     default: 14,
     min: 2,
     max: 200,
@@ -868,38 +1020,46 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     path: "filters.trend.enabled",
     type: "boolean",
     section: "Filters — Trend",
-    description: "Master toggle for EMA20 / EMA200 trend-mode filtering.",
+    description: "Turn on a trend filter that uses two moving averages (a fast one and a slow one). Forces trades to go with or against the trend.",
     default: false,
     enumerable: true,
     legacyHiddenWhenDefault: true,
+    examples: [
+      { snippet: "filters.trend.enabled = true", scenario: "Turn on legacy trend filtering." },
+    ],
   },
   {
     path: "filters.trend.ema20",
     type: "enum",
     section: "Filters — Trend",
     description:
-      `EMA20 mode: "with" keeps trades where price is on the side of EMA20 matching the trade direction; "against" the opposite; "any" disables this leg.`,
+      'How the fast trend (EMA20) gates trades. "with" = only trade in the direction of the trend. "against" = only trade against it. "any" = ignore this leg.',
     default: "with",
     options: TREND_MODES,
     enumerable: true,
     legacyHiddenWhenDefault: true,
+    examples: [
+      { snippet: 'filters.trend.ema20 = "with"', scenario: "Only take trades that go in the direction of the EMA20 trend." },
+    ],
   },
   {
     path: "filters.trend.ema200",
     type: "enum",
     section: "Filters — Trend",
-    description: `Same as ema20 but for the long-term EMA200 trend.`,
+    description: 'Same as ema20 but for the long-term trend (EMA200). Useful for big-picture bias.',
     default: "any",
     options: TREND_MODES,
     enumerable: true,
     legacyHiddenWhenDefault: true,
+    examples: [
+      { snippet: 'filters.trend.ema200 = "with"', scenario: "Only trade in the direction of the long-term trend." },
+    ],
   },
   {
     path: "filters.trend.fastPeriod",
     type: "int",
     section: "Filters — Trend",
-    description:
-      "Period of the FAST trend MA (the leg whose mode lives at filters.trend.ema20). Default 20. Lets users replace the legacy hardcoded EMA(20) with anything (9, 50, 100, …).",
+    description: "How many bars the FAST trend line is calculated over. Default 20.",
     default: 20,
     min: 2,
     max: 500,
@@ -910,7 +1070,7 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     path: "filters.trend.fastType",
     type: "enum",
     section: "Filters — Trend",
-    description: 'Smoothing flavor of the fast MA — "ema" or "sma".',
+    description: 'What flavor of average to use for the fast trend — "ema" (faster) or "sma" (smoother).',
     default: "ema",
     options: MA_TYPES,
     enumerable: true,
@@ -920,8 +1080,7 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     path: "filters.trend.slowPeriod",
     type: "int",
     section: "Filters — Trend",
-    description:
-      "Period of the SLOW trend MA (the leg whose mode lives at filters.trend.ema200). Default 200.",
+    description: "How many bars the SLOW trend line is calculated over. Default 200.",
     default: 200,
     min: 2,
     max: 1000,
@@ -932,7 +1091,7 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     path: "filters.trend.slowType",
     type: "enum",
     section: "Filters — Trend",
-    description: 'Smoothing flavor of the slow MA — "ema" or "sma".',
+    description: 'What flavor of average to use for the slow trend — "ema" or "sma".',
     default: "ema",
     options: MA_TYPES,
     enumerable: true,
@@ -944,26 +1103,30 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     path: "filters.bollinger.enabled",
     type: "boolean",
     section: "Filters — Bollinger",
-    description: "Keep only trades whose entry-bar bollinger position is in `allowed`.",
+    description: "Only allow trades when price is in a chosen position relative to Bollinger Bands (above the upper, inside the bands, or below the lower).",
     default: false,
     enumerable: true,
+    examples: [
+      { snippet: "filters.bollinger.enabled = true", scenario: "Turn on the Bollinger position filter." },
+    ],
   },
   {
     path: "filters.bollinger.allowed",
     type: "stringArray",
     section: "Filters — Bollinger",
-    description:
-      "Allowed bollinger positions. Any subset of [\"above_upper\", \"inside\", \"below_lower\"]. Empty array drops everything.",
+    description: 'Which positions are allowed. Pick any combination of "above_upper", "inside", "below_lower". Empty list = no trades.',
     default: BOLLINGER_POSITIONS,
     options: BOLLINGER_POSITIONS,
     enumerable: true,
+    examples: [
+      { snippet: 'filters.bollinger.allowed = ["below_lower"]', scenario: "Only trade when price has dropped below the lower band — mean-reversion buys." },
+    ],
   },
   {
     path: "filters.bollinger.period",
     type: "int",
     section: "Filters — Bollinger",
-    description:
-      "BB centerline (SMA) period. Default 20. Shared with the BB-width filter.",
+    description: "How many bars the Bollinger Bands center line is calculated over. Default 20. Also used by the BB-width filter.",
     default: 20,
     min: 2,
     max: 500,
@@ -973,8 +1136,7 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     path: "filters.bollinger.stdDev",
     type: "float",
     section: "Filters — Bollinger",
-    description:
-      "Stddev multiplier for the bands — band = mean ± multiplier × σ. Default 2.0.",
+    description: "How many standard deviations the bands sit out from the middle line. Default 2 (the classic Bollinger setting).",
     default: 2,
     min: 0.5,
     max: 5,
@@ -986,26 +1148,31 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     path: "filters.bbWidth.enabled",
     type: "boolean",
     section: "Filters — BB width",
-    description:
-      "Range gate on Bollinger band width (upper − lower) in price points at entry. Useful for filtering compressed-volatility ranges or wide chop. Period and stddev come from filters.bollinger.*",
+    description: "Only allow trades when the Bollinger Bands are at a chosen width. Narrow bands = squeezed market (often before big moves). Wide bands = high volatility.",
     default: false,
     enumerable: true,
+    examples: [
+      { snippet: "filters.bbWidth.enabled = true", scenario: "Turn on the BB width filter to gate by volatility regime." },
+    ],
   },
   {
     path: "filters.bbWidth.min",
     type: "float",
     section: "Filters — BB width",
-    description: "Minimum band width in price points (inclusive).",
+    description: "Smallest allowed band width (in points). Below this = market too tight.",
     default: 0,
     min: 0,
     max: 1000,
     step: 0.25,
+    examples: [
+      { snippet: "filters.bbWidth.min = 5", scenario: "Skip ultra-squeezed conditions; only trade when bands are at least 5 points wide." },
+    ],
   },
   {
     path: "filters.bbWidth.max",
     type: "float",
     section: "Filters — BB width",
-    description: "Maximum band width in price points (inclusive).",
+    description: "Largest allowed band width (in points). Above this = market too wide.",
     default: 1000,
     min: 0,
     max: 10000,
@@ -1020,17 +1187,19 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     path: "filters.maDistance.enabled",
     type: "boolean",
     section: "Filters — MA distance",
-    description:
-      "Range gate on the entry-bar distance from a configurable MA, measured in ATR units (using filters.atr.period). Independent of the trend filter — pick any reference MA.",
+    description: "Only allow trades when price is a chosen distance away from a moving average. Useful for catching pullbacks (close to the MA) or breakouts (far from it).",
     default: false,
     enumerable: true,
     legacyHiddenWhenDefault: true,
+    examples: [
+      { snippet: "filters.maDistance.enabled = true", scenario: "Turn on the MA-distance filter." },
+    ],
   },
   {
     path: "filters.maDistance.period",
     type: "int",
     section: "Filters — MA distance",
-    description: "Period of the reference MA. Default 50.",
+    description: "How many bars the reference moving average covers. Default 50.",
     default: 50,
     min: 2,
     max: 1000,
@@ -1041,7 +1210,7 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     path: "filters.maDistance.type",
     type: "enum",
     section: "Filters — MA distance",
-    description: 'MA flavor — "ema" or "sma".',
+    description: 'What flavor of average to use — "ema" (faster) or "sma" (smoother).',
     default: "ema",
     options: MA_TYPES,
     enumerable: true,
@@ -1052,28 +1221,34 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     type: "enum",
     section: "Filters — MA distance",
     description:
-      '"absolute" → |distance| in [min, max]; "above" → price must be ABOVE the MA and the (positive) distance in [min, max]; "below" → price must be BELOW and |distance| in [min, max].',
+      '"absolute" = just measure how far without caring which side. "above" = price must be ABOVE the MA. "below" = price must be BELOW.',
     default: "absolute",
     options: MA_DISTANCE_MODES,
     enumerable: true,
     legacyHiddenWhenDefault: true,
+    examples: [
+      { snippet: 'filters.maDistance.mode = "above"', scenario: "Only take trades where price is above the moving average." },
+    ],
   },
   {
     path: "filters.maDistance.min",
     type: "float",
     section: "Filters — MA distance",
-    description: "Lower bound on distance (in ATR units).",
+    description: "Smallest allowed distance from the MA, measured in ATR units (so it scales with volatility).",
     default: 0,
     min: 0,
     max: 50,
     step: 0.05,
+    examples: [
+      { snippet: "filters.maDistance.min = 0.5", scenario: "Only trade when price is at least half an ATR away from the reference MA." },
+    ],
     legacyHiddenWhenDefault: true,
   },
   {
     path: "filters.maDistance.max",
     type: "float",
     section: "Filters — MA distance",
-    description: "Upper bound on distance (in ATR units).",
+    description: "Largest allowed distance from the MA, in ATR units.",
     default: 5,
     min: 0,
     max: 50,
@@ -1088,17 +1263,19 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     path: "filters.volume.enabled",
     type: "boolean",
     section: "Filters — Volume",
-    description:
-      "Range gate on the ratio of the entry bar's volume to its N-bar average. 1.0 = at average. minRatio=1.5 keeps only above-average-volume entries.",
+    description: "Only allow trades when the current bar's volume is in a chosen ratio compared to its recent average. Skip dead bars or trade only on volume bursts.",
     default: false,
     enumerable: true,
     legacyHiddenWhenDefault: true,
+    examples: [
+      { snippet: "filters.volume.enabled = true", scenario: "Turn on the volume filter — gate trades by activity." },
+    ],
   },
   {
     path: "filters.volume.period",
     type: "int",
     section: "Filters — Volume",
-    description: "N-bar lookback for the volume average. Default 20.",
+    description: "How many bars to average volume over. Default 20.",
     default: 20,
     min: 2,
     max: 500,
@@ -1109,18 +1286,21 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     path: "filters.volume.minRatio",
     type: "float",
     section: "Filters — Volume",
-    description: "Minimum volume / N-bar avg ratio (inclusive).",
+    description: "Smallest allowed volume-to-average ratio. 1.0 = at average; 1.5 = at least 50% above average.",
     default: 0,
     min: 0,
     max: 100,
     step: 0.05,
     legacyHiddenWhenDefault: true,
+    examples: [
+      { snippet: "filters.volume.minRatio = 1.5", scenario: "Only trade when this bar has 1.5× the average volume." },
+    ],
   },
   {
     path: "filters.volume.maxRatio",
     type: "float",
     section: "Filters — Volume",
-    description: "Maximum volume / N-bar avg ratio (inclusive).",
+    description: "Largest allowed volume-to-average ratio. Use to skip bars with crazy spikes if you don't trust them.",
     default: 100,
     min: 0,
     max: 1000,
@@ -1133,16 +1313,18 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     path: "filters.rsi.enabled",
     type: "boolean",
     section: "Filters — RSI",
-    description:
-      "Keep only entries whose Wilder RSI(period) at entry is in [min, max]. Classic oversold/overbought zones are < 30 / > 70.",
+    description: "Only allow trades when RSI is in your chosen band. Classic oversold = below 30; overbought = above 70.",
     default: false,
     enumerable: true,
+    examples: [
+      { snippet: "filters.rsi.enabled = true", scenario: "Turn on the RSI filter so trades only fire in your RSI window." },
+    ],
   },
   {
     path: "filters.rsi.period",
     type: "int",
     section: "Filters — RSI",
-    description: "Wilder RSI period. Default 14.",
+    description: "How many bars the RSI is calculated over. Default 14.",
     default: 14,
     min: 2,
     max: 200,
@@ -1152,21 +1334,27 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     path: "filters.rsi.min",
     type: "float",
     section: "Filters — RSI",
-    description: "Inclusive lower bound on RSI (0–100).",
+    description: "Smallest allowed RSI (0–100).",
     default: 0,
     min: 0,
     max: 100,
     step: 1,
+    examples: [
+      { snippet: "filters.rsi.min = 30", scenario: "Skip oversold conditions — only trade when RSI is 30 or higher." },
+    ],
   },
   {
     path: "filters.rsi.max",
     type: "float",
     section: "Filters — RSI",
-    description: "Inclusive upper bound on RSI (0–100).",
+    description: "Largest allowed RSI (0–100).",
     default: 100,
     min: 0,
     max: 100,
     step: 1,
+    examples: [
+      { snippet: "filters.rsi.max = 70", scenario: "Skip overbought conditions — block trades when RSI is above 70." },
+    ],
   },
 
   // ── Filters: ADX direction (rising / falling / flat) ───────────────────
@@ -1174,27 +1362,30 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     path: "filters.adxTrend.enabled",
     type: "boolean",
     section: "Filters — ADX direction",
-    description:
-      "Gate on the DIRECTION of ADX at entry — rising (trend strength building), falling (losing strength), or flat (range / regime stable). Slope = ADX[i] − ADX[i − lookback].",
+    description: "Only allow trades when ADX is moving the way you want — rising (trend getting stronger), falling (weakening), or flat (steady).",
     default: false,
     enumerable: true,
+    examples: [
+      { snippet: "filters.adxTrend.enabled = true", scenario: "Turn on the ADX-direction filter." },
+    ],
   },
   {
     path: "filters.adxTrend.mode",
     type: "enum",
     section: "Filters — ADX direction",
-    description:
-      '"rising" → slope > flatThreshold; "falling" → slope < -flatThreshold; "flat" → |slope| ≤ flatThreshold; "any" disables the gate.',
+    description: '"rising" = trend strength building. "falling" = losing strength. "flat" = stable. "any" = ignore.',
     default: "rising",
     options: ADX_TREND_MODES,
     enumerable: true,
+    examples: [
+      { snippet: 'filters.adxTrend.mode = "rising"', scenario: "Only take trades when trend strength is GROWING — fresh momentum." },
+    ],
   },
   {
     path: "filters.adxTrend.lookback",
     type: "int",
     section: "Filters — ADX direction",
-    description:
-      "Bars looked back when computing the slope. Default 5. Changing this re-runs the backtest because the slope value is stamped at signal time.",
+    description: "How many bars back to compare ADX against to figure out direction. Default 5.",
     default: 5,
     min: 1,
     max: 100,
@@ -1204,12 +1395,53 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     path: "filters.adxTrend.flatThreshold",
     type: "float",
     section: "Filters — ADX direction",
-    description:
-      "|slope| ≤ this is considered flat. Larger values widen the flat band and narrow the rising/falling bands.",
+    description: "How small the change in ADX needs to be before we call it \"flat\". Bigger value = wider flat zone.",
     default: 1,
     min: 0,
     max: 50,
     step: 0.1,
+  },
+
+  // ── Filters: Bid/ask delta imbalance ──────────────────────────────────
+  // Imbalance ratio at the entry bar = (ask − bid) / (ask + bid). Range
+  // [−1, +1]. Requires a session with bid/ask volumes (tick / tick_bidask
+  // / ohlcv_bidask). On plain `ohlcv` sessions ctx_delta_ratio is null and
+  // every trade is rejected when this filter is enabled — a deliberate
+  // fail-closed default so a stale filter setting can't silently widen
+  // the trade set on a session it can't reason about.
+  {
+    path: "filters.delta.enabled",
+    type: "boolean",
+    section: "Filters — Bid/ask delta",
+    description: "Only allow trades when buy/sell aggression is at a chosen level. NEEDS bid/ask data — on plain OHLCV sessions every trade gets rejected.",
+    default: false,
+    enumerable: true,
+    examples: [
+      { snippet: "filters.delta.enabled = true", scenario: "Turn on the buy/sell aggression filter (needs tick or ohlcv_bidask data)." },
+    ],
+  },
+  {
+    path: "filters.delta.min",
+    type: "float",
+    section: "Filters — Bid/ask delta",
+    description: "Smallest allowed buyer-vs-seller score (−1 to +1). −1 = pure sellers, 0 = balanced, +1 = pure buyers.",
+    default: -1,
+    min: -1,
+    max: 1,
+    step: 0.05,
+    examples: [
+      { snippet: "filters.delta.min = 0.2", scenario: "Only take longs when buyers are clearly winning the bar." },
+    ],
+  },
+  {
+    path: "filters.delta.max",
+    type: "float",
+    section: "Filters — Bid/ask delta",
+    description: "Largest allowed buyer-vs-seller score (−1 to +1). Combine with min to make a band.",
+    default: 1,
+    min: -1,
+    max: 1,
+    step: 0.05,
   },
 
   // ── Print directives (Script v2) ──────────────────────────────────────
@@ -1223,16 +1455,24 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     type: "directive",
     section: "Output — Strategy prints",
     description:
-      'Strategy-level print: evaluated ONCE after the run against aggregate stats. RHS is an expression with optional `, "label"`. Available identifiers: winRate, profitFactor, totalPnl, expectancy, avgBarsHeld (alias avgtradetime), dailyEv, sharpeOriginal, sharpeSimulated, totalTrades, winners, losers — see the docs panel for the full list.',
+      'Show a custom number in the Output panel after the backtest finishes. Use any summary identifier (winRate, profitFactor, etc.). Add `, "label"` for a friendly name.',
     default: "",
+    examples: [
+      { snippet: 'print = winRate * 100, "Win %"', scenario: 'Show the win rate as a percentage labeled "Win %".' },
+      { snippet: 'print = profitFactor, "PF"', scenario: 'Show the profit factor in a card labeled "PF".' },
+    ],
   },
   {
     path: "ontrade.print",
     type: "directive",
     section: "Output — Per-trade prints",
     description:
-      'Per-trade print: evaluated at each trade\'s entry bar. RHS is an expression with optional `, "label"`. Available identifiers: ATR, EMA20, ADX, volume, close, etc. Function-call form supported: ATR(14), volume(14), trailVol(14), stdev(14). One column per unique label appears on the trades table.',
+      'Add a column to the trade table showing a value calculated at each trade. Use indicators (ATR, RSI, EMA20, etc.) or bar fields (close, volume).',
     default: "",
+    examples: [
+      { snippet: 'ontrade.print = ATR(14), "Entry ATR"', scenario: "Add a column showing the ATR at the moment each trade entered." },
+      { snippet: 'ontrade.print = close - EMA50, "Dist from EMA50"', scenario: "Show how far each entry was from the 50-bar trend line." },
+    ],
   },
 
   // ── Conditional filter (Script v2.1) ──────────────────────────────────
@@ -1252,32 +1492,59 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     type: "directive",
     section: "Filters — Conditional",
     description:
-      'Conditional filter. Single-arg form `filter.if = ATR > 0.5` gates each trade by a boolean expression (true = pass, false = reject). 3-arg form `filter.if = (cond, if_true_actions, if_false_actions)` runs action statements per branch — `rules.X = expr`, `print(expr [, "label"])`, `pass`, `reject`, nested `filter.if = (...)`, all separated by `;`. Empty slot keeps the default verdict; defining a slot REPLACES it (write `reject` explicitly to keep the default-false reject). Multiple `filter.if` lines AND together.',
+      "The most flexible filter. Simple form: write a yes/no expression and trades only fire when the answer is yes. 3-part form: `filter.if = (condition, do_when_true, do_when_false)` lets you run different rule overrides or prints depending on which branch is taken. Use `pass` and `reject` to force the verdict. Multiple `filter.if` lines all have to pass for a trade to fire.",
     default: "",
+    examples: [
+      { snippet: "filter.if = ADX > 25 && close > EMA20", scenario: "Only trade in a strong uptrend." },
+      { snippet: "filter.if = (ADX > 25, rules.stopLossPoints = 8, rules.stopLossPoints = 15)", scenario: "Use a tight stop in strong trends, a wider one in weak conditions." },
+      { snippet: 'filter.if = (volume(14) > 100, , print("weak vol"); reject)', scenario: 'Reject trades on weak volume and print a diagnostic.' },
+    ],
+  },
+  {
+    path: "filter.long.if",
+    type: "directive",
+    section: "Filters — Conditional",
+    description: "Same as `filter.if` but ONLY applies to long trades. Short trades skip this filter entirely. Saves you from having to write `direction > 0 && ...` everywhere.",
+    default: "",
+    examples: [
+      { snippet: "filter.long.if = close > EMA(200)", scenario: "Only allow longs when price is above the long-term trend line." },
+    ],
+  },
+  {
+    path: "filter.short.if",
+    type: "directive",
+    section: "Filters — Conditional",
+    description: "Same as `filter.if` but ONLY applies to short trades.",
+    default: "",
+    examples: [
+      { snippet: "filter.short.if = close < EMA(200)", scenario: "Only allow shorts when price is below the long-term trend line." },
+    ],
   },
 
   // ── Optimization (Script v3) ─────────────────────────────────────────
-  // OptimizeAll controls how multiple `Optimize.X.Y(...)` directives
-  // co-evolve. When false (default) each directive runs its own
-  // independent TPE search; when true they share a single joint search
-  // and must agree on the objective.
   {
     path: "OptimizeAll",
     type: "boolean",
     section: "Optimization",
     description:
-      "When true, all Optimize.X.Y(...) directives in this script share one TPE search over the joint multi-dim space (must agree on objective). When false (default), each directive optimizes independently.",
+      "When `true`, all `Optimize.X.Y(...)` lines tune together as a team (and must measure the same thing). When `false` (default), each one tunes its own number on its own.",
     default: false,
     enumerable: true,
+    examples: [
+      { snippet: "OptimizeAll = true", scenario: "Tune all your Optimize-driven values together — useful when stops and targets need to balance each other." },
+    ],
   },
   {
     path: "Warmup",
     type: "boolean",
     section: "Optimization",
     description:
-      "When true (default), trades fired before the optimizer's lookback fills are included in the final stats — useful for understanding how the strategy performs without optimization. When false, those warmup trades are excluded so the final stats reflect only the optimized phase. Either way, the optimizer still uses warmup trades internally to build its lookback window.",
+      "Controls whether warmup trades (early ones used to fill Optimize's window) show up in your final stats. `true` (default) keeps them. `false` hides them so stats reflect only the optimized phase.",
     default: true,
     enumerable: true,
+    examples: [
+      { snippet: "Warmup = false", scenario: "Cleaner stats — only count trades that ran with optimized values." },
+    ],
   },
 ];
 
@@ -1365,6 +1632,11 @@ export type PartialBacktestConfig = {
       mode?: AdxTrendMode;
       lookback?: number;
       flatThreshold?: number;
+    };
+    delta?: {
+      enabled?: boolean;
+      min?: number;
+      max?: number;
     };
   };
   // ── Script v2 additions ────────────────────────────────────────────────
@@ -1502,6 +1774,12 @@ export interface FilterIfDirective {
    *  entirely instead of rejecting every trade via NaN-as-fail. Empty
    *  set or undefined = no var dependencies, filter always applies. */
   referencedVarNames?: Set<string>;
+  /** Direction this filter applies to. Set by the parser based on the
+   *  LHS path: `filter.if` → undefined (both), `filter.long.if` →
+   *  "long" (skipped on short trades — auto-pass), `filter.short.if` →
+   *  "short" (skipped on long trades — auto-pass). The runtime checks
+   *  this against `zone.direction` before evaluating the cond. */
+  scope?: "long" | "short";
 }
 
 /** Strip a trailing inline comment from `s`, respecting double-quoted
@@ -2620,11 +2898,78 @@ export function parseBacktestScript(text: string): ParseResult {
     config.replaceParams = true;
   }
 
+  // Track whether we're inside a multi-line strategy DSL statement
+  // (`let X = …` or `signal.long.if = …`) that wraps across newlines.
+  // The strategy parser handles those; the line-based parser must not
+  // emit warnings/errors for the continuation lines.
+  //
+  // A line continues the previous strategy DSL line when EITHER:
+  //   - the previous line ended with a binary operator / comma / open
+  //     paren-bracket / `=` (so it's incomplete on its own), OR
+  //   - the current line starts with `&& || , + - * / %` or any other
+  //     binop, which only makes sense as a continuation.
+  let inStrategyContinuation = false;
+  let prevEndsWithOp = false;
+
+  function endsWithContinuationOp(line: string): boolean {
+    const tail = line.replace(/\s+$/, "");
+    if (tail.length < 1) return false;
+    const last2 = tail.slice(-2);
+    const last1 = tail.slice(-1);
+    if (
+      last2 === "&&" || last2 === "||" || last2 === "==" ||
+      last2 === "!=" || last2 === ">=" || last2 === "<="
+    ) return true;
+    return "+-*/%^,<>=!([".includes(last1);
+  }
+
+  function startsWithContinuationOp(line: string): boolean {
+    const lead2 = line.slice(0, 2);
+    const lead1 = line[0];
+    if (
+      lead2 === "&&" || lead2 === "||" || lead2 === "==" ||
+      lead2 === "!=" || lead2 === ">=" || lead2 === "<="
+    ) return true;
+    return "+-*/%^,<>)]".includes(lead1);
+  }
+
   for (let i = 0; i < lines.length; i++) {
     const lineNo = i + 1;
     const stripped = stripInlineComment(lines[i]).trim();
-    if (stripped === "") continue;
+    if (stripped === "") {
+      inStrategyContinuation = false;
+      prevEndsWithOp = false;
+      continue;
+    }
     if (stripped.startsWith("//") || stripped.startsWith("#")) continue;
+
+    // Strategy DSL — `let <name> = …`, `signal.long.if = …`,
+    // `signal.short.if = …`. These are parsed and evaluated by the
+    // strategy-evaluator module. Skip them here so the line-based DSL
+    // parser doesn't try to coerce them into the config schema and
+    // emit phantom "unknown path" warnings.
+    if (
+      /^let\s+/.test(stripped) ||
+      /^signal\.(long|short)\.if\s*=/.test(stripped)
+    ) {
+      inStrategyContinuation = true;
+      prevEndsWithOp = endsWithContinuationOp(stripped);
+      continue;
+    }
+
+    // Continuation of a strategy-DSL statement (multi-line `&&` / `||`
+    // / `,` / arithmetic continuation). Treat as continuation when the
+    // previous line ended with an operator OR the current line starts
+    // with one — covers both styles users write (trailing-op or
+    // leading-op).
+    if (inStrategyContinuation && (prevEndsWithOp || startsWithContinuationOp(stripped))) {
+      prevEndsWithOp = endsWithContinuationOp(stripped);
+      continue;
+    }
+    // Not a continuation — fresh statement. Reset the flag and fall
+    // through to the regular path-based parser.
+    inStrategyContinuation = false;
+    prevEndsWithOp = false;
 
     const eqIdx = stripped.indexOf("=");
     if (eqIdx < 0) {
@@ -2787,7 +3132,13 @@ export function parseBacktestScript(text: string): ParseResult {
     // path accumulate into an array. filter.if has its own RHS shape
     // (cond + branches) so it dispatches to a different parser.
     if (entry.type === "directive") {
-      if (path === "filter.if") {
+      if (path === "filter.if" || path === "filter.long.if" || path === "filter.short.if") {
+        // Per-direction variants share the same parser / runtime as
+        // `filter.if` — only the `scope` field on the resulting
+        // directive changes. The runtime auto-passes a scoped
+        // directive on the wrong-direction signal.
+        const scope: "long" | "short" | undefined =
+          path === "filter.long.if" ? "long" : path === "filter.short.if" ? "short" : undefined;
         // Lift any inline `Optimize.X.Y(...)` calls in the RHS to
         // synthetic var idents so the expression tokenizer (which
         // can't handle `.` inside identifiers) sees clean names.
@@ -2797,12 +3148,12 @@ export function parseBacktestScript(text: string): ParseResult {
         // and string-aware — see liftInlineOptimize for details.
         const lifted = liftInlineOptimize(rhs, config, inlineOptimizeCounter);
         if (!lifted.ok) {
-          errors.push({ line: lineNo, message: `filter.if: ${lifted.error}`, severity: "error" });
+          errors.push({ line: lineNo, message: `${path}: ${lifted.error}`, severity: "error" });
           continue;
         }
         const r = parseFilterIfRhs(lifted.text);
         if (!r.ok) {
-          errors.push({ line: lineNo, message: `filter.if: ${r.error}`, severity: "error" });
+          errors.push({ line: lineNo, message: `${path}: ${r.error}`, severity: "error" });
           continue;
         }
         // Sticky modifier is parsed but the v1 runtime only honors
@@ -2811,7 +3162,7 @@ export function parseBacktestScript(text: string): ParseResult {
         // is accepted but the cross-trade behavior is deferred.
         const stickyWarn = collectStickyWarnings(r.directive);
         for (const w of stickyWarn) {
-          errors.push({ line: lineNo, message: `filter.if: ${w}`, severity: "warning" });
+          errors.push({ line: lineNo, message: `${path}: ${w}`, severity: "warning" });
         }
         config.filterIfs ??= [];
         // Inline any active var bindings into the cond + every
@@ -2832,6 +3183,7 @@ export function parseBacktestScript(text: string): ParseResult {
         if (referencedVarNames.size > 0) {
           bound.referencedVarNames = referencedVarNames;
         }
+        if (scope) bound.scope = scope;
         config.filterIfs.push(bound);
         continue;
       }
@@ -3242,7 +3594,12 @@ export function serializeBacktestScript(
     out.push("");
     out.push(`// ── Filters — Conditional ──`);
     for (const d of filterIfs) {
-      out.push(`filter.if = ${d.source}`);
+      // Emit at the path matching the directive's scope so a
+      // round-trip preserves long/short selectivity. Undefined scope
+      // emits as the original `filter.if` (both directions).
+      const lhs =
+        d.scope === "long" ? "filter.long.if" : d.scope === "short" ? "filter.short.if" : "filter.if";
+      out.push(`${lhs} = ${d.source}`);
     }
   } else if (extras?.includeFilterIfTemplates) {
     // Active filter.if templates wired as no-ops so they evaluate the
@@ -3281,6 +3638,9 @@ export function serializeBacktestScript(
     out.push(
       "filter.if = ((direction > 0 && close > EMA(20)) || (direction < 0 && close < EMA(20)), , pass)"
     );
+    out.push("// Or, equivalently, the per-side variants — auto-pass on the wrong side:");
+    out.push("// filter.long.if  = close > EMA(20)");
+    out.push("// filter.short.if = close < EMA(20)");
     out.push("");
     out.push("// Volume surge — require entry volume above its 20-bar average.");
     out.push("filter.if = (volume / volume(20) >= 1.5, , pass)");
@@ -3387,6 +3747,7 @@ export function mergeConfig(
         ...base.filters.adxTrend,
         ...(patch.filters?.adxTrend ?? {}),
       },
+      delta: { ...base.filters.delta, ...(patch.filters?.delta ?? {}) },
     },
   };
   return next;
@@ -3491,6 +3852,7 @@ export function defaultBacktestConfig(): BacktestConfig {
         lookback: 5,
         flatThreshold: 1,
       },
+      delta: { enabled: false, min: -1, max: 1 },
     },
   };
 }

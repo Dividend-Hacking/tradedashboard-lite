@@ -22,7 +22,13 @@ import { rawTimestampToUnix } from "@/lib/utils/format";
 
 /** Minimal bar shape accepted by every calculator. Both LiveBar and
  *  ReplayBar satisfy this (they just add an `instrument`/`timeframe`
- *  tag that indicators don't care about). */
+ *  tag that indicators don't care about).
+ *
+ *  Order-flow fields (`bar_volume_bid` / `bar_volume_ask`) are optional
+ *  because they only exist on bars derived from bid/ask-aware sources
+ *  (`ohlcv_bidask` or `tick_bidask` granularity). Order-flow indicators
+ *  read them via `bar_volume_bid ?? NaN` so plain OHLCV bars degrade to
+ *  NaN cleanly without throwing. */
 export interface IndicatorBar {
   bar_time: string;
   bar_open: number;
@@ -30,6 +36,8 @@ export interface IndicatorBar {
   bar_low: number;
   bar_close: number;
   bar_volume: number;
+  bar_volume_bid?: number | null;
+  bar_volume_ask?: number | null;
 }
 
 /** A single line-indicator point. `time` is always a UTCTimestamp (unix
@@ -1865,5 +1873,962 @@ export function volumeNSeries(bars: IndicatorBar[], n: number): number[] {
   const out = new Array(bars.length).fill(NaN);
   if (n < 0) return out;
   for (let i = n; i < bars.length; i++) out[i] = bars[i - n].bar_volume;
+  return out;
+}
+
+// ─── Order-flow / delta ────────────────────────────────────────────────────
+//
+// All of the following operate on `bar_volume_bid` / `bar_volume_ask`,
+// which are present on bars derived from bid/ask-aware sources (replay
+// granularity `ohlcv_bidask` or `tick_bidask`). When either side is null
+// or undefined, the helpers emit NaN at that index — callers (the DSL
+// evaluator) treat NaN as "missing", which is the same null-as-fail
+// discipline used everywhere else.
+
+/** Per-bar net delta — `bar_volume_ask − bar_volume_bid`. Sign indicates
+ *  the dominant aggressor (positive = buy aggression, negative = sell).
+ *  NaN when bid/ask is absent. */
+export function deltaSeries(bars: IndicatorBar[]): number[] {
+  const out = new Array(bars.length).fill(NaN);
+  for (let i = 0; i < bars.length; i++) {
+    const bid = bars[i].bar_volume_bid;
+    const ask = bars[i].bar_volume_ask;
+    if (bid == null || ask == null) continue;
+    out[i] = ask - bid;
+  }
+  return out;
+}
+
+/** Cumulative volume delta — running sum of `deltaSeries`. Resets to 0
+ *  at the first bar with valid bid/ask data and accumulates from there;
+ *  bars without bid/ask data hold the prior running total (so a single
+ *  malformed row doesn't poison the whole series). NaN before the first
+ *  valid bar. Mirrors the canonical CVD rendering used by Bookmap /
+ *  Sierra footprint charts — running total of net trade aggression. */
+export function cvdSeries(bars: IndicatorBar[]): number[] {
+  const out = new Array(bars.length).fill(NaN);
+  let running = 0;
+  let started = false;
+  for (let i = 0; i < bars.length; i++) {
+    const bid = bars[i].bar_volume_bid;
+    const ask = bars[i].bar_volume_ask;
+    if (bid != null && ask != null) {
+      running += ask - bid;
+      started = true;
+    }
+    if (started) out[i] = running;
+  }
+  return out;
+}
+
+/** Per-bar delta ratio — `(ask − bid) / (ask + bid)`, range [−1, 1].
+ *  NaN when bid/ask absent or total zero. Same math as the engine's
+ *  `deltaRatioSeries` (backtest-engine.ts) but emitted as plain numbers
+ *  (not number-or-null) so it composes with the rest of the indicator
+ *  series. */
+export function deltaRatioBarSeries(bars: IndicatorBar[]): number[] {
+  const out = new Array(bars.length).fill(NaN);
+  for (let i = 0; i < bars.length; i++) {
+    const bid = bars[i].bar_volume_bid;
+    const ask = bars[i].bar_volume_ask;
+    if (bid == null || ask == null) continue;
+    const total = bid + ask;
+    if (total <= 0) continue;
+    out[i] = (ask - bid) / total;
+  }
+  return out;
+}
+
+/** Buy pressure — `bar_volume_ask / bar_volume`, range [0, 1]. NaN
+ *  when total volume is zero or bid/ask absent. Useful as a normalized
+ *  scalar where 0.5 = balanced flow. */
+export function buyPressureSeries(bars: IndicatorBar[]): number[] {
+  const out = new Array(bars.length).fill(NaN);
+  for (let i = 0; i < bars.length; i++) {
+    const ask = bars[i].bar_volume_ask;
+    const total = bars[i].bar_volume;
+    if (ask == null || !Number.isFinite(total) || total <= 0) continue;
+    out[i] = ask / total;
+  }
+  return out;
+}
+
+// ─── Keltner Channels ──────────────────────────────────────────────────────
+//
+// EMA(close, period) ± mult * ATR(period). A volatility-aware envelope
+// like Bollinger Bands but using ATR instead of stdev — tracks trends
+// more cleanly because ATR doesn't shrink during one-sided moves the
+// way stdev does.
+
+export function keltnerMidSeries(bars: IndicatorBar[], period: number): number[] {
+  return emaSeries(bars, period);
+}
+
+function keltnerBandSeries(
+  bars: IndicatorBar[],
+  period: number,
+  mult: number,
+  sign: 1 | -1,
+): number[] {
+  const out = new Array(bars.length).fill(NaN);
+  if (period <= 0 || !Number.isFinite(mult)) return out;
+  const mid = emaSeries(bars, period);
+  const a = atrSeries(bars, period);
+  for (let i = 0; i < bars.length; i++) {
+    if (Number.isFinite(mid[i]) && Number.isFinite(a[i])) {
+      out[i] = mid[i] + sign * mult * a[i];
+    }
+  }
+  return out;
+}
+
+export function keltnerUpperSeries(
+  bars: IndicatorBar[],
+  period: number,
+  mult: number,
+): number[] {
+  return keltnerBandSeries(bars, period, mult, 1);
+}
+
+export function keltnerLowerSeries(
+  bars: IndicatorBar[],
+  period: number,
+  mult: number,
+): number[] {
+  return keltnerBandSeries(bars, period, mult, -1);
+}
+
+// ─── Supertrend ────────────────────────────────────────────────────────────
+//
+// Single-line trailing-stop indicator built from ATR-banded mid price.
+// The line itself flips between an upper-band (in downtrend) and lower-
+// band (in uptrend) regime when price closes through the previous
+// trail. We emit the SIGNED line where positive = uptrend (line below
+// price) and negative = downtrend (line above price), so users can
+// switch on the sign to gate longs vs shorts without exposing a
+// separate direction series.
+//
+// Formula:
+//   hl2  = (high + low) / 2
+//   up   = hl2 + mult * ATR
+//   dn   = hl2 - mult * ATR
+//   trailUp[i]  = min(up[i],  trailUp[i-1])  if close[i-1] <= trailUp[i-1] else up[i]
+//   trailDn[i]  = max(dn[i],  trailDn[i-1])  if close[i-1] >= trailDn[i-1] else dn[i]
+//   if dir[i-1] == down and close[i] > trailUp[i] → flip to up
+//   if dir[i-1] == up   and close[i] < trailDn[i] → flip to down
+
+export function supertrendSeries(
+  bars: IndicatorBar[],
+  period: number,
+  mult: number,
+): number[] {
+  const out = new Array(bars.length).fill(NaN);
+  if (period <= 0 || !Number.isFinite(mult) || mult <= 0) return out;
+  if (bars.length < period + 1) return out;
+  const a = atrSeries(bars, period);
+
+  // Pre-build raw upper/lower band arrays (NaN where ATR isn't ready).
+  const up = new Array(bars.length).fill(NaN);
+  const dn = new Array(bars.length).fill(NaN);
+  for (let i = 0; i < bars.length; i++) {
+    if (!Number.isFinite(a[i])) continue;
+    const hl2 = (bars[i].bar_high + bars[i].bar_low) / 2;
+    up[i] = hl2 + mult * a[i];
+    dn[i] = hl2 - mult * a[i];
+  }
+
+  // Trailing-band smoothing — the canonical "lock the band tighter"
+  // logic: upper band only ratchets DOWN when price stays below the
+  // prior trail, lower band only ratchets UP when price stays above.
+  const trailUp = new Array(bars.length).fill(NaN);
+  const trailDn = new Array(bars.length).fill(NaN);
+  let dir: 1 | -1 = 1; // 1 = uptrend (line is the lower band), -1 = downtrend
+  let started = false;
+  for (let i = 0; i < bars.length; i++) {
+    if (!Number.isFinite(up[i]) || !Number.isFinite(dn[i])) continue;
+    if (!started) {
+      trailUp[i] = up[i];
+      trailDn[i] = dn[i];
+      started = true;
+      // Initial direction: assume uptrend; flips on the next bar if
+      // close pierces the upper trail.
+      out[i] = dn[i];
+      continue;
+    }
+    const prevClose = bars[i - 1].bar_close;
+    trailUp[i] =
+      prevClose <= (Number.isFinite(trailUp[i - 1]) ? trailUp[i - 1] : Infinity)
+        ? Math.min(up[i], trailUp[i - 1])
+        : up[i];
+    trailDn[i] =
+      prevClose >= (Number.isFinite(trailDn[i - 1]) ? trailDn[i - 1] : -Infinity)
+        ? Math.max(dn[i], trailDn[i - 1])
+        : dn[i];
+    // Flip direction on closes through the opposing trail.
+    if (dir === -1 && bars[i].bar_close > trailUp[i]) dir = 1;
+    else if (dir === 1 && bars[i].bar_close < trailDn[i]) dir = -1;
+    // Emit signed line: positive in uptrend, negative in downtrend.
+    out[i] = dir === 1 ? trailDn[i] : -trailUp[i];
+  }
+  return out;
+}
+
+// ─── Parabolic SAR ─────────────────────────────────────────────────────────
+//
+// Wilder's stop-and-reverse trailing dot. Algorithm:
+//   - Pick an initial trend (up if close[1] > close[0], else down).
+//   - SAR starts at the prior bar's extreme (low for up, high for down).
+//   - Each bar: SAR moves by (EP - prevSAR) * AF, where EP is the
+//     extreme point in the current trend and AF (acceleration factor)
+//     starts at `step`, increments by `step` each time a new EP is
+//     made, capped at `max`.
+//   - SAR clamped so it can't penetrate the prior 2 bars' range
+//     (stops a fast-flip scenario from putting SAR inside price).
+//   - When price crosses SAR, flip trend, reset AF to step, anchor SAR
+//     at the prior trend's EP.
+
+export function psarSeries(
+  bars: IndicatorBar[],
+  step: number,
+  max: number,
+): number[] {
+  const out = new Array(bars.length).fill(NaN);
+  if (
+    bars.length < 2 ||
+    !Number.isFinite(step) ||
+    step <= 0 ||
+    !Number.isFinite(max) ||
+    max <= 0 ||
+    step > max
+  ) {
+    return out;
+  }
+  let trend: 1 | -1 = bars[1].bar_close > bars[0].bar_close ? 1 : -1;
+  let ep = trend === 1 ? bars[1].bar_high : bars[1].bar_low;
+  let af = step;
+  let sar = trend === 1 ? bars[0].bar_low : bars[0].bar_high;
+  out[1] = sar;
+  for (let i = 2; i < bars.length; i++) {
+    sar = sar + af * (ep - sar);
+    if (trend === 1) {
+      // SAR shouldn't dip below the lowest of the prior two bars.
+      sar = Math.min(sar, bars[i - 1].bar_low, bars[i - 2].bar_low);
+      if (bars[i].bar_low < sar) {
+        // Flip to down.
+        trend = -1;
+        sar = ep;
+        ep = bars[i].bar_low;
+        af = step;
+      } else {
+        if (bars[i].bar_high > ep) {
+          ep = bars[i].bar_high;
+          af = Math.min(af + step, max);
+        }
+      }
+    } else {
+      sar = Math.max(sar, bars[i - 1].bar_high, bars[i - 2].bar_high);
+      if (bars[i].bar_high > sar) {
+        trend = 1;
+        sar = ep;
+        ep = bars[i].bar_high;
+        af = step;
+      } else {
+        if (bars[i].bar_low < ep) {
+          ep = bars[i].bar_low;
+          af = Math.min(af + step, max);
+        }
+      }
+    }
+    out[i] = sar;
+  }
+  return out;
+}
+
+// ─── Ichimoku family ───────────────────────────────────────────────────────
+//
+// Tenkan (conversion) and Kijun (base): midpoints of the highest-high /
+// lowest-low over `tenkanPeriod` (9) and `kijunPeriod` (26) respectively.
+// Senkou A: average of Tenkan + Kijun, plotted `kijunPeriod` bars
+// FORWARD. Senkou B: midpoint of HHV/LLV over `senkouBPeriod` (52),
+// plotted forward.
+// Chikou: close plotted `kijunPeriod` bars BACK.
+//
+// We emit "in-place" series — i.e. we DON'T project Senkou forward in
+// time. The DSL user reads `Ichimoku_senkouA(9, 26)` at the entry bar
+// and gets the forward-leading-span value AS COMPUTED FROM bars at
+// index `i - kijunPeriod` (the cloud's leading edge that arrived at
+// bar i). This matches what most strategy DSLs (e.g. pandas-ta with
+// `lookahead=False`) do — projecting forward would peek into the
+// future, which a backtest evaluator shouldn't do.
+
+function midOfHHVLLV(bars: IndicatorBar[], period: number): number[] {
+  const out = new Array(bars.length).fill(NaN);
+  if (period <= 0 || bars.length < period) return out;
+  for (let i = period - 1; i < bars.length; i++) {
+    let hh = -Infinity;
+    let ll = Infinity;
+    for (let k = 0; k < period; k++) {
+      if (bars[i - k].bar_high > hh) hh = bars[i - k].bar_high;
+      if (bars[i - k].bar_low < ll) ll = bars[i - k].bar_low;
+    }
+    out[i] = (hh + ll) / 2;
+  }
+  return out;
+}
+
+export function ichimokuTenkanSeries(
+  bars: IndicatorBar[],
+  period: number,
+): number[] {
+  return midOfHHVLLV(bars, period);
+}
+
+export function ichimokuKijunSeries(
+  bars: IndicatorBar[],
+  period: number,
+): number[] {
+  return midOfHHVLLV(bars, period);
+}
+
+/** Senkou A — average of Tenkan(fast) and Kijun(slow). Plotted forward
+ *  on charts; here we emit the value AT the bar where it would arrive
+ *  in real time (i.e. computed from bars [i - slow + 1 .. i]). */
+export function ichimokuSenkouASeries(
+  bars: IndicatorBar[],
+  fast: number,
+  slow: number,
+): number[] {
+  const out = new Array(bars.length).fill(NaN);
+  if (fast <= 0 || slow <= 0) return out;
+  const tenkan = midOfHHVLLV(bars, fast);
+  const kijun = midOfHHVLLV(bars, slow);
+  for (let i = 0; i < bars.length; i++) {
+    if (Number.isFinite(tenkan[i]) && Number.isFinite(kijun[i])) {
+      out[i] = (tenkan[i] + kijun[i]) / 2;
+    }
+  }
+  return out;
+}
+
+/** Senkou B — midpoint of HHV/LLV over `period` (typically 52). */
+export function ichimokuSenkouBSeries(
+  bars: IndicatorBar[],
+  period: number,
+): number[] {
+  return midOfHHVLLV(bars, period);
+}
+
+/** Chikou — close plotted `n` bars BACK. To avoid future-peeking we
+ *  emit the value at index `i + n` AS the close from index `i`,
+ *  meaning `series[i]` for i < bars.length - n is the close from
+ *  bars[i + n] — but in DSL terms the user reads
+ *  `Ichimoku_chikou(26)` at the entry bar `i`, gets `bars[i].close`,
+ *  which is just `close` itself. We emit `close_n(-period)` semantics
+ *  here for completeness, but most users want this rendered on a
+ *  chart. We return `close[i]` aligned 1-to-1 — same value the DSL
+ *  user gets via `close`. */
+export function ichimokuChikouSeries(
+  bars: IndicatorBar[],
+  _period: number,
+): number[] {
+  const out = new Array(bars.length).fill(NaN);
+  for (let i = 0; i < bars.length; i++) out[i] = bars[i].bar_close;
+  return out;
+}
+
+// ─── Aroon ─────────────────────────────────────────────────────────────────
+//
+// Aroon Up / Down measure how recently the highest high / lowest low in
+// a `period` window was made, expressed as a 0-100 percentage:
+//   AroonUp   = 100 * (period - barsSinceHHV) / period
+//   AroonDown = 100 * (period - barsSinceLLV) / period
+// Aroon Oscillator = AroonUp - AroonDown, range [-100, 100].
+
+function barsSinceExtreme(
+  bars: IndicatorBar[],
+  period: number,
+  pickHigh: boolean,
+): number[] {
+  const out = new Array(bars.length).fill(NaN);
+  if (period <= 0 || bars.length < period + 1) return out;
+  for (let i = period; i < bars.length; i++) {
+    let bestK = 0;
+    let best = pickHigh ? -Infinity : Infinity;
+    for (let k = 0; k <= period; k++) {
+      const v = pickHigh ? bars[i - k].bar_high : bars[i - k].bar_low;
+      if (pickHigh ? v > best : v < best) {
+        best = v;
+        bestK = k;
+      }
+    }
+    out[i] = bestK;
+  }
+  return out;
+}
+
+export function aroonUpSeries(bars: IndicatorBar[], period: number): number[] {
+  const out = new Array(bars.length).fill(NaN);
+  if (period <= 0) return out;
+  const sinceHigh = barsSinceExtreme(bars, period, true);
+  for (let i = 0; i < bars.length; i++) {
+    if (Number.isFinite(sinceHigh[i])) {
+      out[i] = (100 * (period - sinceHigh[i])) / period;
+    }
+  }
+  return out;
+}
+
+export function aroonDownSeries(bars: IndicatorBar[], period: number): number[] {
+  const out = new Array(bars.length).fill(NaN);
+  if (period <= 0) return out;
+  const sinceLow = barsSinceExtreme(bars, period, false);
+  for (let i = 0; i < bars.length; i++) {
+    if (Number.isFinite(sinceLow[i])) {
+      out[i] = (100 * (period - sinceLow[i])) / period;
+    }
+  }
+  return out;
+}
+
+export function aroonOscSeries(bars: IndicatorBar[], period: number): number[] {
+  const up = aroonUpSeries(bars, period);
+  const dn = aroonDownSeries(bars, period);
+  const out = new Array(bars.length).fill(NaN);
+  for (let i = 0; i < bars.length; i++) {
+    if (Number.isFinite(up[i]) && Number.isFinite(dn[i])) out[i] = up[i] - dn[i];
+  }
+  return out;
+}
+
+// ─── Vortex Indicator ──────────────────────────────────────────────────────
+//
+// VI+ and VI- track positive vs negative trend pressure:
+//   VM+ = |high[i] - low[i-1]|
+//   VM- = |low[i]  - high[i-1]|
+//   VI+ = sum(VM+, period) / sum(TR, period)
+//   VI- = sum(VM-, period) / sum(TR, period)
+
+function vortexCommon(bars: IndicatorBar[], period: number): { vmPlus: number[]; vmMinus: number[]; trs: number[] } | null {
+  if (period <= 0 || bars.length < period + 1) return null;
+  const vmPlus = new Array(bars.length).fill(NaN);
+  const vmMinus = new Array(bars.length).fill(NaN);
+  const trs = new Array(bars.length).fill(NaN);
+  for (let i = 1; i < bars.length; i++) {
+    vmPlus[i] = Math.abs(bars[i].bar_high - bars[i - 1].bar_low);
+    vmMinus[i] = Math.abs(bars[i].bar_low - bars[i - 1].bar_high);
+    const h = bars[i].bar_high;
+    const l = bars[i].bar_low;
+    const pc = bars[i - 1].bar_close;
+    trs[i] = Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc));
+  }
+  return { vmPlus, vmMinus, trs };
+}
+
+function vortexLeg(
+  bars: IndicatorBar[],
+  period: number,
+  pickPlus: boolean,
+): number[] {
+  const out = new Array(bars.length).fill(NaN);
+  const c = vortexCommon(bars, period);
+  if (!c) return out;
+  const { vmPlus, vmMinus, trs } = c;
+  for (let i = period; i < bars.length; i++) {
+    let sumVm = 0;
+    let sumTr = 0;
+    for (let k = 0; k < period; k++) {
+      sumVm += pickPlus ? vmPlus[i - k] : vmMinus[i - k];
+      sumTr += trs[i - k];
+    }
+    if (sumTr > 0) out[i] = sumVm / sumTr;
+  }
+  return out;
+}
+
+export function vortexPlusSeries(bars: IndicatorBar[], period: number): number[] {
+  return vortexLeg(bars, period, true);
+}
+
+export function vortexMinusSeries(bars: IndicatorBar[], period: number): number[] {
+  return vortexLeg(bars, period, false);
+}
+
+// ─── Directional Index components (DI+, DI-) ───────────────────────────────
+//
+// The +DI and -DI legs that ADX is built from. Useful on their own as a
+// trend-strength + direction pair: DI+ above DI- = uptrend. We expose
+// each leg directly so users don't have to read the ADX-internal math.
+
+function dxLegs(bars: IndicatorBar[], period: number): { plusDI: number[]; minusDI: number[] } | null {
+  if (period <= 0 || bars.length < period + 1) return null;
+  const plusDM: number[] = [];
+  const minusDM: number[] = [];
+  const trs: number[] = [];
+  for (let i = 1; i < bars.length; i++) {
+    const upMove = bars[i].bar_high - bars[i - 1].bar_high;
+    const downMove = bars[i - 1].bar_low - bars[i].bar_low;
+    plusDM.push(upMove > downMove && upMove > 0 ? upMove : 0);
+    minusDM.push(downMove > upMove && downMove > 0 ? downMove : 0);
+    const h = bars[i].bar_high;
+    const l = bars[i].bar_low;
+    const pc = bars[i - 1].bar_close;
+    trs.push(Math.max(h - l, Math.abs(h - pc), Math.abs(l - pc)));
+  }
+  // Wilder running sum smoothing.
+  function wilder(series: number[]): number[] {
+    if (series.length < period) return [];
+    const smoothed: number[] = [];
+    let sum = 0;
+    for (let i = 0; i < period; i++) sum += series[i];
+    smoothed.push(sum);
+    for (let i = period; i < series.length; i++) {
+      sum = sum - sum / period + series[i];
+      smoothed.push(sum);
+    }
+    return smoothed;
+  }
+  const ps = wilder(plusDM);
+  const ms = wilder(minusDM);
+  const ts = wilder(trs);
+
+  const plusDI = new Array(bars.length).fill(NaN);
+  const minusDI = new Array(bars.length).fill(NaN);
+  // smoothed[0] aligns with raw[period-1] which is bars[period].
+  for (let i = 0; i < ts.length; i++) {
+    const tr = ts[i];
+    if (tr <= 0) continue;
+    plusDI[i + period] = (100 * ps[i]) / tr;
+    minusDI[i + period] = (100 * ms[i]) / tr;
+  }
+  return { plusDI, minusDI };
+}
+
+export function diPlusSeries(bars: IndicatorBar[], period: number): number[] {
+  const r = dxLegs(bars, period);
+  return r ? r.plusDI : new Array(bars.length).fill(NaN);
+}
+
+export function diMinusSeries(bars: IndicatorBar[], period: number): number[] {
+  const r = dxLegs(bars, period);
+  return r ? r.minusDI : new Array(bars.length).fill(NaN);
+}
+
+// ─── Awesome / Ultimate Oscillators ────────────────────────────────────────
+
+/** Awesome Oscillator — SMA(median, 5) − SMA(median, 34). Bill
+ *  Williams' classic. Zero-arg; caller supplies bars only. */
+export function aoSeries(bars: IndicatorBar[]): number[] {
+  const out = new Array(bars.length).fill(NaN);
+  if (bars.length < 34) return out;
+  const med = new Array(bars.length);
+  for (let i = 0; i < bars.length; i++) {
+    med[i] = (bars[i].bar_high + bars[i].bar_low) / 2;
+  }
+  let sum5 = 0;
+  let sum34 = 0;
+  for (let i = 0; i < bars.length; i++) {
+    sum5 += med[i];
+    sum34 += med[i];
+    if (i >= 5) sum5 -= med[i - 5];
+    if (i >= 34) sum34 -= med[i - 34];
+    if (i >= 33) out[i] = sum5 / 5 - sum34 / 34;
+  }
+  return out;
+}
+
+/** Ultimate Oscillator — weighted average of buying-pressure ratios
+ *  over three windows. Range [0, 100]. */
+export function uoSeries(
+  bars: IndicatorBar[],
+  short: number,
+  mid: number,
+  long: number,
+): number[] {
+  const out = new Array(bars.length).fill(NaN);
+  if (short <= 0 || mid <= 0 || long <= 0 || bars.length < long + 1) return out;
+  // BP[i] = close - min(low, prevClose); TR[i] = max(high, prevClose) - min(low, prevClose)
+  const bp = new Array(bars.length).fill(NaN);
+  const tr = new Array(bars.length).fill(NaN);
+  for (let i = 1; i < bars.length; i++) {
+    const pc = bars[i - 1].bar_close;
+    const trueLow = Math.min(bars[i].bar_low, pc);
+    const trueHigh = Math.max(bars[i].bar_high, pc);
+    bp[i] = bars[i].bar_close - trueLow;
+    tr[i] = trueHigh - trueLow;
+  }
+  for (let i = long; i < bars.length; i++) {
+    let bpS = 0, trS = 0, bpM = 0, trM = 0, bpL = 0, trL = 0;
+    for (let k = 0; k < long; k++) {
+      const idx = i - k;
+      if (k < short) { bpS += bp[idx]; trS += tr[idx]; }
+      if (k < mid)   { bpM += bp[idx]; trM += tr[idx]; }
+      bpL += bp[idx]; trL += tr[idx];
+    }
+    if (trS > 0 && trM > 0 && trL > 0) {
+      const avgS = bpS / trS;
+      const avgM = bpM / trM;
+      const avgL = bpL / trL;
+      out[i] = (100 * (4 * avgS + 2 * avgM + avgL)) / 7;
+    }
+  }
+  return out;
+}
+
+// ─── Fisher Transform ──────────────────────────────────────────────────────
+//
+// Fisher transform of price normalizes price to [-1, 1] over `period`
+// bars then applies 0.5 * log((1+x)/(1-x)). The result is a near-Gaussian
+// oscillator — extreme readings (>2 or <-2) are statistically rare and
+// often coincide with reversals.
+
+export function fisherSeries(bars: IndicatorBar[], period: number): number[] {
+  const out = new Array(bars.length).fill(NaN);
+  if (period <= 0 || bars.length < period) return out;
+  let prevValue = 0;
+  let prevFisher = 0;
+  for (let i = period - 1; i < bars.length; i++) {
+    let hh = -Infinity;
+    let ll = Infinity;
+    for (let k = 0; k < period; k++) {
+      const v = (bars[i - k].bar_high + bars[i - k].bar_low) / 2;
+      if (v > hh) hh = v;
+      if (v < ll) ll = v;
+    }
+    const median = (bars[i].bar_high + bars[i].bar_low) / 2;
+    const span = hh - ll;
+    let raw = span > 0 ? 2 * ((median - ll) / span - 0.5) : 0;
+    // EMA-like smoothing on the normalized input — alpha 0.33 matches
+    // the canonical Ehlers definition and prevents log-divergence at
+    // ±1 (which would yield ±Infinity).
+    const value = 0.33 * raw + 0.67 * prevValue;
+    const clamped = Math.max(-0.999, Math.min(0.999, value));
+    const fisher = 0.5 * Math.log((1 + clamped) / (1 - clamped)) + 0.5 * prevFisher;
+    out[i] = fisher;
+    prevValue = clamped;
+    prevFisher = fisher;
+  }
+  return out;
+}
+
+// ─── Choppiness / Ulcer ────────────────────────────────────────────────────
+
+/** Choppiness Index — log10(sum(TR, period) / (HHV - LLV)) / log10(period) * 100.
+ *  Range typically [0, 100]. > 61.8 = chop, < 38.2 = trend. */
+export function choppinessSeries(bars: IndicatorBar[], period: number): number[] {
+  const out = new Array(bars.length).fill(NaN);
+  if (period <= 0 || bars.length < period + 1) return out;
+  const tr = trSeries(bars);
+  for (let i = period; i < bars.length; i++) {
+    let sumTr = 0;
+    let hh = -Infinity;
+    let ll = Infinity;
+    let valid = true;
+    for (let k = 0; k < period; k++) {
+      const t = tr[i - k];
+      if (!Number.isFinite(t)) { valid = false; break; }
+      sumTr += t;
+      if (bars[i - k].bar_high > hh) hh = bars[i - k].bar_high;
+      if (bars[i - k].bar_low < ll) ll = bars[i - k].bar_low;
+    }
+    if (!valid) continue;
+    const span = hh - ll;
+    if (span <= 0 || sumTr <= 0) continue;
+    out[i] = (100 * Math.log10(sumTr / span)) / Math.log10(period);
+  }
+  return out;
+}
+
+/** Ulcer Index — RMS of percentage drawdowns from the rolling high
+ *  over `period` bars. A volatility measure that only counts downside
+ *  moves. */
+export function ulcerSeries(bars: IndicatorBar[], period: number): number[] {
+  const out = new Array(bars.length).fill(NaN);
+  if (period <= 0 || bars.length < period) return out;
+  for (let i = period - 1; i < bars.length; i++) {
+    let hh = -Infinity;
+    for (let k = 0; k < period; k++) {
+      if (bars[i - k].bar_close > hh) hh = bars[i - k].bar_close;
+    }
+    if (hh <= 0) continue;
+    let sumSq = 0;
+    for (let k = 0; k < period; k++) {
+      // Walk forward from oldest to newest within the window so the
+      // running max matches what was seen at that point in time —
+      // standard Ulcer treats DD as `(close − maxToDate) / maxToDate`.
+      let maxToDate = -Infinity;
+      for (let m = k; m < period; m++) {
+        if (bars[i - m].bar_close > maxToDate) maxToDate = bars[i - m].bar_close;
+      }
+      // Simpler form: use the rolling-window max as the reference.
+      const dd = maxToDate > 0 ? (100 * (bars[i - k].bar_close - maxToDate)) / maxToDate : 0;
+      sumSq += dd * dd;
+    }
+    out[i] = Math.sqrt(sumSq / period);
+  }
+  return out;
+}
+
+// ─── Statistical helpers ───────────────────────────────────────────────────
+
+/** Z-score of close: `(close − SMA(period)) / popStdev(close, period)`.
+ *  Expresses how many stdevs the current close sits from its rolling
+ *  mean — symmetric, dimensionless, comparable across instruments. */
+export function zscoreSeries(bars: IndicatorBar[], period: number): number[] {
+  const out = new Array(bars.length).fill(NaN);
+  if (period <= 0 || bars.length < period) return out;
+  for (let i = period - 1; i < bars.length; i++) {
+    let sum = 0;
+    for (let k = 0; k < period; k++) sum += bars[i - k].bar_close;
+    const mean = sum / period;
+    let varSum = 0;
+    for (let k = 0; k < period; k++) {
+      const d = bars[i - k].bar_close - mean;
+      varSum += d * d;
+    }
+    const sd = Math.sqrt(varSum / period); // population stdev
+    if (sd > 0) out[i] = (bars[i].bar_close - mean) / sd;
+  }
+  return out;
+}
+
+/** Linear-regression-line common precompute — returns slope, intercept
+ *  per index over `period` close values. Bar `i`'s line is fit to the
+ *  last `period` closes with x = bar offset (0..period-1). */
+function linRegFit(bars: IndicatorBar[], period: number): { slope: number[]; intercept: number[]; rsq: number[] } {
+  const slope = new Array(bars.length).fill(NaN);
+  const intercept = new Array(bars.length).fill(NaN);
+  const rsq = new Array(bars.length).fill(NaN);
+  if (period <= 0 || bars.length < period) return { slope, intercept, rsq };
+  // x-stats are constant for fixed `period`.
+  const n = period;
+  let sumX = 0, sumXX = 0;
+  for (let k = 0; k < n; k++) {
+    sumX += k;
+    sumXX += k * k;
+  }
+  const denomX = n * sumXX - sumX * sumX;
+  for (let i = period - 1; i < bars.length; i++) {
+    let sumY = 0, sumXY = 0, sumYY = 0;
+    for (let k = 0; k < n; k++) {
+      const y = bars[i - (n - 1 - k)].bar_close; // x increases with time
+      sumY += y;
+      sumXY += k * y;
+      sumYY += y * y;
+    }
+    if (denomX === 0) continue;
+    const m = (n * sumXY - sumX * sumY) / denomX;
+    const b = (sumY - m * sumX) / n;
+    slope[i] = m;
+    intercept[i] = b;
+    // R^2 = 1 - SSE / SST
+    const meanY = sumY / n;
+    let sse = 0, sst = 0;
+    for (let k = 0; k < n; k++) {
+      const y = bars[i - (n - 1 - k)].bar_close;
+      const yhat = m * k + b;
+      sse += (y - yhat) * (y - yhat);
+      sst += (y - meanY) * (y - meanY);
+    }
+    rsq[i] = sst > 0 ? 1 - sse / sst : NaN;
+  }
+  return { slope, intercept, rsq };
+}
+
+export function lrSlopeSeries(bars: IndicatorBar[], period: number): number[] {
+  return linRegFit(bars, period).slope;
+}
+
+export function lrInterceptSeries(bars: IndicatorBar[], period: number): number[] {
+  return linRegFit(bars, period).intercept;
+}
+
+/** Fitted regression value at the current bar — the y-coordinate of
+ *  the regression line at x = period - 1. */
+export function lrValueSeries(bars: IndicatorBar[], period: number): number[] {
+  const out = new Array(bars.length).fill(NaN);
+  const fit = linRegFit(bars, period);
+  for (let i = 0; i < bars.length; i++) {
+    if (Number.isFinite(fit.slope[i]) && Number.isFinite(fit.intercept[i])) {
+      out[i] = fit.slope[i] * (period - 1) + fit.intercept[i];
+    }
+  }
+  return out;
+}
+
+export function r2Series(bars: IndicatorBar[], period: number): number[] {
+  return linRegFit(bars, period).rsq;
+}
+
+// ─── Volume-based ──────────────────────────────────────────────────────────
+
+/** Rolling N-bar VWAP — `Σ(typical * volume) / Σ(volume)` over the last
+ *  `period` bars. Distinct from session-anchored VWAP (which restarts
+ *  daily); this rolls. */
+export function vwapRollingSeries(bars: IndicatorBar[], period: number): number[] {
+  const out = new Array(bars.length).fill(NaN);
+  if (period <= 0 || bars.length < period) return out;
+  let sumPV = 0;
+  let sumV = 0;
+  for (let i = 0; i < bars.length; i++) {
+    const tp = (bars[i].bar_high + bars[i].bar_low + bars[i].bar_close) / 3;
+    sumPV += tp * bars[i].bar_volume;
+    sumV += bars[i].bar_volume;
+    if (i >= period) {
+      const j = i - period;
+      const tpj = (bars[j].bar_high + bars[j].bar_low + bars[j].bar_close) / 3;
+      sumPV -= tpj * bars[j].bar_volume;
+      sumV -= bars[j].bar_volume;
+    }
+    if (i >= period - 1 && sumV > 0) out[i] = sumPV / sumV;
+  }
+  return out;
+}
+
+/** Klinger Volume Oscillator — EMA(fast, VF) − EMA(slow, VF), where
+ *  VF (volume force) is signed by typical-price direction. Standard
+ *  (34, 55). */
+export function kvoSeries(
+  bars: IndicatorBar[],
+  fast: number,
+  slow: number,
+): number[] {
+  const out = new Array(bars.length).fill(NaN);
+  if (fast <= 0 || slow <= 0 || bars.length < slow + 1) return out;
+  // Volume force: sign by typical-price direction × volume × |dm-trend|.
+  // We use the simplified canonical form: signed volume.
+  const vf = new Array(bars.length).fill(NaN);
+  for (let i = 1; i < bars.length; i++) {
+    const tp = bars[i].bar_high + bars[i].bar_low + bars[i].bar_close;
+    const tpPrev = bars[i - 1].bar_high + bars[i - 1].bar_low + bars[i - 1].bar_close;
+    const sign = tp > tpPrev ? 1 : tp < tpPrev ? -1 : 0;
+    vf[i] = sign * bars[i].bar_volume;
+  }
+  // EMA over the vf series (skipping NaN at index 0).
+  function emaOf(xs: number[], p: number): number[] {
+    const o = new Array(xs.length).fill(NaN);
+    if (p <= 0 || xs.length < p + 1) return o;
+    // Find seed: first p finite values starting from index 1.
+    let seedSum = 0;
+    let seedCount = 0;
+    let seedAt = -1;
+    for (let i = 1; i < xs.length; i++) {
+      if (Number.isFinite(xs[i])) {
+        seedSum += xs[i];
+        seedCount++;
+        if (seedCount === p) {
+          seedAt = i;
+          break;
+        }
+      }
+    }
+    if (seedAt < 0) return o;
+    let prev = seedSum / p;
+    o[seedAt] = prev;
+    const alpha = 2 / (p + 1);
+    for (let i = seedAt + 1; i < xs.length; i++) {
+      if (!Number.isFinite(xs[i])) {
+        o[i] = prev;
+        continue;
+      }
+      prev = xs[i] * alpha + prev * (1 - alpha);
+      o[i] = prev;
+    }
+    return o;
+  }
+  const eFast = emaOf(vf, fast);
+  const eSlow = emaOf(vf, slow);
+  for (let i = 0; i < bars.length; i++) {
+    if (Number.isFinite(eFast[i]) && Number.isFinite(eSlow[i])) {
+      out[i] = eFast[i] - eSlow[i];
+    }
+  }
+  return out;
+}
+
+/** Force Index — `(close - prevClose) * volume`, EMA-smoothed over
+ *  `period`. Elder's Force Index. Standard period 13. */
+export function forceIndexSeries(bars: IndicatorBar[], period: number): number[] {
+  const out = new Array(bars.length).fill(NaN);
+  if (period <= 0 || bars.length < period + 1) return out;
+  const raw = new Array(bars.length).fill(NaN);
+  for (let i = 1; i < bars.length; i++) {
+    raw[i] = (bars[i].bar_close - bars[i - 1].bar_close) * bars[i].bar_volume;
+  }
+  // EMA over raw[1..]. Seed = mean of first `period` raw values.
+  let seed = 0;
+  for (let k = 1; k <= period; k++) seed += raw[k];
+  let prev = seed / period;
+  out[period] = prev;
+  const alpha = 2 / (period + 1);
+  for (let i = period + 1; i < bars.length; i++) {
+    prev = raw[i] * alpha + prev * (1 - alpha);
+    out[i] = prev;
+  }
+  return out;
+}
+
+/** Ease of Movement — `((high+low)/2 - prev(high+low)/2) / (volume / (high-low))`,
+ *  SMA-smoothed over `period`. Standard period 14. */
+export function emvSeries(bars: IndicatorBar[], period: number): number[] {
+  const out = new Array(bars.length).fill(NaN);
+  if (period <= 0 || bars.length < period + 1) return out;
+  const raw = new Array(bars.length).fill(NaN);
+  for (let i = 1; i < bars.length; i++) {
+    const med = (bars[i].bar_high + bars[i].bar_low) / 2;
+    const medPrev = (bars[i - 1].bar_high + bars[i - 1].bar_low) / 2;
+    const span = bars[i].bar_high - bars[i].bar_low;
+    const vol = bars[i].bar_volume;
+    if (span > 0 && vol > 0) {
+      raw[i] = (med - medPrev) / (vol / span);
+    }
+  }
+  // Rolling mean of raw[1..]. Skip NaN entries (treat as 0 contribution
+  // but exclude from count? — pandas-ta keeps NaN as 0 for sum). We
+  // require all `period` raw values to be finite for a non-NaN output;
+  // otherwise the user is reading EMV during a zero-range bar window
+  // and should know.
+  for (let i = period; i < bars.length; i++) {
+    let sum = 0;
+    let valid = true;
+    for (let k = 0; k < period; k++) {
+      const r = raw[i - k];
+      if (!Number.isFinite(r)) { valid = false; break; }
+      sum += r;
+    }
+    if (valid) out[i] = sum / period;
+  }
+  return out;
+}
+
+/** Negative Volume Index — running cumulative that updates only on
+ *  bars where volume DECREASED vs the prior bar. The classic Norman
+ *  Fosback indicator. Seeded at 1000 (canonical seed). */
+export function nviSeries(bars: IndicatorBar[]): number[] {
+  const out = new Array(bars.length).fill(NaN);
+  if (bars.length === 0) return out;
+  let nvi = 1000;
+  out[0] = nvi;
+  for (let i = 1; i < bars.length; i++) {
+    if (bars[i].bar_volume < bars[i - 1].bar_volume && bars[i - 1].bar_close > 0) {
+      nvi *= 1 + (bars[i].bar_close - bars[i - 1].bar_close) / bars[i - 1].bar_close;
+    }
+    out[i] = nvi;
+  }
+  return out;
+}
+
+/** Positive Volume Index — running cumulative that updates only on
+ *  bars where volume INCREASED vs the prior bar. Seeded at 1000. */
+export function pviSeries(bars: IndicatorBar[]): number[] {
+  const out = new Array(bars.length).fill(NaN);
+  if (bars.length === 0) return out;
+  let pvi = 1000;
+  out[0] = pvi;
+  for (let i = 1; i < bars.length; i++) {
+    if (bars[i].bar_volume > bars[i - 1].bar_volume && bars[i - 1].bar_close > 0) {
+      pvi *= 1 + (bars[i].bar_close - bars[i - 1].bar_close) / bars[i - 1].bar_close;
+    }
+    out[i] = pvi;
+  }
   return out;
 }

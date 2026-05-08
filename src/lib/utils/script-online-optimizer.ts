@@ -617,8 +617,16 @@ export async function runOnlineOptimizedBacktest(
       // see SimulateMetrics docstring for why we attribute to first
       // rather than all rejecting directives.
       let firstRejectIdx = -1;
+      // Direction of the candidate so per-side directives (filter.long.if /
+      // filter.short.if) can be skipped on the wrong side.
+      const isLong = z.direction === "Long";
       for (let dIdx = 0; dIdx < filterIfs.length; dIdx++) {
         const d = filterIfs[dIdx];
+        // Per-direction auto-pass: scoped directive on the wrong side
+        // is silently skipped — same semantics as evaluateAllFilterIfs
+        // in zone-simulator.ts.
+        if (d.scope === "long" && !isLong) continue;
+        if (d.scope === "short" && isLong) continue;
         // Per-directive auto-disable: if any var the cond references
         // is currently unresolved, skip THIS directive without
         // touching the running verdict. Only filters touching

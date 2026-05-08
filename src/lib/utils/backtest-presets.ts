@@ -47,10 +47,20 @@
  *     v2 adds a field.
  */
 import { SimRules, DEFAULT_SIM_RULES } from "./zone-simulator";
-import { createClient } from "@/lib/supabase/client";
+import { getClientStore, type Mode } from "@/lib/store";
+
+/** Cache of the active mode so the sync helpers can pick the right backend
+ *  without each call site needing to thread it through. The browser layout
+ *  publishes the mode into a window-level global on mount so this module
+ *  stays a plain util (no React hooks). */
+function activeMode(): Mode {
+  if (typeof window === "undefined") return "cloud";
+  const w = window as unknown as { __tradeDashMode?: Mode };
+  return w.__tradeDashMode ?? "cloud";
+}
 
 /** Schema version. Bump when the preset shape adds/removes/renames fields. */
-export const PRESET_SCHEMA_VERSION = 1;
+export const PRESET_SCHEMA_VERSION = 2;
 
 /** Bollinger position keys — must stay in sync with backtest-dashboard.tsx. */
 export type BollingerPos = "above_upper" | "inside" | "below_lower";
@@ -216,6 +226,24 @@ export interface PresetFilters {
     lookback: number;
     flatThreshold: number;
   };
+  /** New filter: keep only entries whose bid/ask delta imbalance at the
+   *  entry bar is in [min, max]. Imbalance is computed as
+   *  (ask − bid) / (ask + bid) where ask = buy-aggressor volume and
+   *  bid = sell-aggressor volume; the value lives in [−1, +1] so a
+   *  range of [0.1, 1] keeps only buyer-dominated bars and [−1, −0.1]
+   *  keeps only seller-dominated bars.
+   *
+   *  ⚠️  TYPESCRIPT-ONLY ⚠️
+   *  Requires bid/ask split on the source bars, which only the dashboard's
+   *  tick-aggregation path and `ohlcv_bidask` granularity produce. The
+   *  NT8 BacktestRunner currently fetches plain OHLCV, so this filter is
+   *  silently a no-op on the C# side until that pipeline is taught to
+   *  request bid/ask streams and PresetFilterEvaluator.cs gains a port. */
+  delta: {
+    enabled: boolean;
+    min: number;
+    max: number;
+  };
 }
 
 /** A complete saved configuration. The id is a uuid-ish stable token so the
@@ -245,10 +273,35 @@ export interface BacktestPreset {
   name: string;
   createdAt: string;
   updatedAt: string;
+  /** Legacy: id of a builtin strategy from the registry. v1 presets had
+   *  this as the single source-of-truth for signal generation. v2+ keep
+   *  it for backwards compat with the auto-trader and NT8 conversion
+   *  paths, which still recognize strategies by id. New user-authored
+   *  strategies set strategyId to "user_script" (or similar sentinel).
+   *  Loading: when `script` is missing on a v1 preset, normalizePresetForLoad
+   *  fills it from the matching builtin template. */
   strategyId: string;
   params: Record<string, number>;
   rules: SimRules;
   filters: PresetFilters;
+  /** v2: DSL script text. Authoritative source for signal generation
+   *  when present. The legacy `strategyId` + `params` path is kept for
+   *  back-compat in consumers (auto-trader / NT8) that haven't migrated
+   *  to script execution yet. */
+  script?: string;
+  /** v2: per-param metadata (defaults / min / max / step / type / label).
+   *  Inferred from the script's `params.X` references, then user-tuned in
+   *  the dashboard sidebar. Persisted alongside `script` so re-loads see
+   *  the user's tuned values. */
+  paramMeta?: Record<string, {
+    default: number;
+    min?: number;
+    max?: number;
+    step?: number;
+    type?: "int" | "float";
+    label?: string;
+    description?: string;
+  }>;
 }
 
 /** Default filter state — matches the initial useState defaults in
@@ -296,6 +349,7 @@ export const DEFAULT_PRESET_FILTERS: PresetFilters = {
     lookback: 5,
     flatThreshold: 1,
   },
+  delta: { enabled: false, min: -1, max: 1 },
 };
 
 /** Single localStorage key — value is a JSON array of presets so we can
@@ -340,6 +394,18 @@ export interface NewPresetInput {
   params: Record<string, number>;
   rules: SimRules;
   filters: PresetFilters;
+  /** Verbatim DSL script text. The dashboard previously didn't capture
+   *  this when saving presets, so /api/convert-to-nt8 received an empty
+   *  `preset.script` and silently fell back to the legacy strategyId
+   *  template (with no `filters.X = Y` directives). The transpiler then
+   *  produced a `.cs` missing the time/trend filter wiring, causing
+   *  NT8 parity to drift wildly. Always pass the live editor's
+   *  scriptText through here so the saved preset round-trips correctly
+   *  through `findTemplateByLegacyId` / TO NT8 / re-load. */
+  script?: string;
+  /** Optional paramMeta — already on BacktestPreset and forwarded if
+   *  the caller has it. Same persistence story as `script`. */
+  paramMeta?: BacktestPreset["paramMeta"];
 }
 
 /** Append a new preset to the saved list and return it. The list is kept
@@ -355,6 +421,11 @@ export function createPreset(input: NewPresetInput): BacktestPreset {
     createdAt: now,
     updatedAt: now,
     strategyId: input.strategyId,
+    // The verbatim DSL script. Without this, /api/convert-to-nt8 falls
+    // back to the legacy template and drops every `filters.X = Y`
+    // directive — see plan round 4.
+    script: input.script,
+    paramMeta: input.paramMeta,
     // Defensive shallow copies — caller may keep mutating its state.
     params: { ...input.params },
     rules: { ...input.rules },
@@ -380,11 +451,12 @@ export function createPreset(input: NewPresetInput): BacktestPreset {
       volume: { ...input.filters.volume },
       rsi: { ...input.filters.rsi },
       adxTrend: { ...input.filters.adxTrend },
+      delta: { ...input.filters.delta },
     },
   };
   const next = [preset, ...loadPresets()];
   writePresets(next);
-  pushPresetToSupabase(preset).catch(() => {});
+  pushPresetToBackend(preset).catch(() => {});
   emitPresetsChanged();
   return preset;
 }
@@ -403,6 +475,10 @@ export function updatePreset(
     ...prev,
     name: (patch.name ?? prev.name).trim() || prev.name,
     strategyId: patch.strategyId ?? prev.strategyId,
+    // Round 4 fix — accept script + paramMeta in update so re-saves
+    // pick up changes the user made in the script editor.
+    script: patch.script !== undefined ? patch.script : prev.script,
+    paramMeta: patch.paramMeta !== undefined ? patch.paramMeta : prev.paramMeta,
     params: patch.params ? { ...patch.params } : prev.params,
     rules: patch.rules ? { ...patch.rules } : prev.rules,
     filters: patch.filters
@@ -426,23 +502,24 @@ export function updatePreset(
           volume: { ...patch.filters.volume },
           rsi: { ...patch.filters.rsi },
           adxTrend: { ...patch.filters.adxTrend },
+          delta: { ...patch.filters.delta },
         }
       : prev.filters,
     updatedAt: new Date().toISOString(),
   };
   list[idx] = next;
   writePresets(list);
-  pushPresetToSupabase(next).catch(() => {});
+  pushPresetToBackend(next).catch(() => {});
   emitPresetsChanged();
   return next;
 }
 
 /** Remove a preset by id. No-op if not found. localStorage update is
- *  synchronous; Supabase delete fires in the background. */
+ *  synchronous; backend delete fires in the background. */
 export function deletePreset(id: string): void {
   const next = loadPresets().filter((p) => p.id !== id);
   writePresets(next);
-  deletePresetFromSupabase(id).catch(() => {});
+  deletePresetFromBackend(id).catch(() => {});
   emitPresetsChanged();
 }
 
@@ -451,10 +528,27 @@ export function deletePreset(id: string): void {
  * SimRules fields added since the preset was saved get sensible defaults
  * instead of `undefined`. Same deal for filters: missing sub-filters fall
  * back to the current defaults. This is the load-time forward-compat shim.
+ *
+ * v1 → v2 upgrade: when a preset has `strategyId` matching a builtin and
+ * no `script` field, populate `script` from the matching template and
+ * seed `paramMeta` from the saved `params` (preserving user-tuned values
+ * as the new defaults). This keeps existing presets fully functional
+ * under the new evaluator without requiring a migration write.
  */
 export function normalizePresetForLoad(preset: BacktestPreset): BacktestPreset {
+  // The editor's scriptText is the single source of truth — preset.script
+  // is whatever the user had in the editor when they clicked Save. The
+  // legacy findTemplateByLegacyId fallback (round-4) used to silently
+  // backfill empty preset.script from a built-in template, which caused
+  // wildly different dashboard-vs-NT8 behavior because the templates had
+  // diverged from any disk file the user might be editing. Removed: a
+  // preset without `script` now keeps preset.script empty, and the
+  // dashboard's load handler skips setScriptText (preserving whatever's
+  // currently in the editor).
   return {
     ...preset,
+    script: preset.script,
+    paramMeta: preset.paramMeta,
     rules: { ...DEFAULT_SIM_RULES, ...preset.rules },
     filters: {
       time: (() => {
@@ -520,6 +614,10 @@ export function normalizePresetForLoad(preset: BacktestPreset): BacktestPreset {
         ...DEFAULT_PRESET_FILTERS.adxTrend,
         ...(preset.filters?.adxTrend ?? {}),
       },
+      delta: {
+        ...DEFAULT_PRESET_FILTERS.delta,
+        ...(preset.filters?.delta ?? {}),
+      },
     },
   };
 }
@@ -539,89 +637,35 @@ function emitPresetsChanged(): void {
   window.dispatchEvent(new Event(PRESETS_CHANGED_EVENT));
 }
 
-/** Map a Supabase row (snake_case columns) into the BacktestPreset shape
- *  the rest of the app uses. Defensive about missing/null jsonb sub-objects
- *  for the same forward-compat reason as normalizePresetForLoad. */
-interface PresetRow {
-  id: string;
-  name: string;
-  version: number;
-  strategy_id: string;
-  params: Record<string, number>;
-  rules: SimRules;
-  filters: PresetFilters;
-  created_at: string;
-  updated_at: string;
-}
-
-function rowToPreset(row: PresetRow): BacktestPreset {
-  return {
-    version: row.version ?? PRESET_SCHEMA_VERSION,
-    id: row.id,
-    name: row.name,
-    createdAt: row.created_at,
-    updatedAt: row.updated_at,
-    strategyId: row.strategy_id,
-    params: row.params ?? {},
-    rules: row.rules ?? DEFAULT_SIM_RULES,
-    filters: row.filters ?? DEFAULT_PRESET_FILTERS,
-  };
-}
-
-/** Inverse of rowToPreset — produce the snake_case shape for upsert. */
-function presetToRow(p: BacktestPreset): PresetRow {
-  return {
-    id: p.id,
-    name: p.name,
-    version: p.version,
-    strategy_id: p.strategyId,
-    params: p.params,
-    rules: p.rules,
-    filters: p.filters,
-    created_at: p.createdAt,
-    updated_at: p.updatedAt,
-  };
-}
-
-/** Upsert a single preset to Supabase. Fire-and-forget at call sites; we
- *  don't surface failures to the UI because the localStorage write already
+/** Upsert a single preset to the active backend (Supabase in cloud mode,
+ *  SQLite in local mode). Fire-and-forget — the localStorage write already
  *  succeeded and the next sync will retry. */
-async function pushPresetToSupabase(preset: BacktestPreset): Promise<void> {
+async function pushPresetToBackend(preset: BacktestPreset): Promise<void> {
   if (typeof window === "undefined") return;
   try {
-    const supabase = createClient();
-    const { error } = await supabase
-      .from("backtest_presets")
-      .upsert(presetToRow(preset), { onConflict: "id" });
-    if (error) {
-      console.warn("[backtest-presets] Supabase upsert failed:", error.message);
-    }
+    const store = getClientStore(activeMode());
+    await store.presets.upsert(preset);
   } catch (err) {
-    console.warn("[backtest-presets] Supabase upsert threw:", err);
+    console.warn("[backtest-presets] backend upsert failed:", err);
   }
 }
 
-/** Delete a preset from Supabase by id. Fire-and-forget. */
-async function deletePresetFromSupabase(id: string): Promise<void> {
+/** Delete a preset from the active backend. Fire-and-forget. */
+async function deletePresetFromBackend(id: string): Promise<void> {
   if (typeof window === "undefined") return;
   try {
-    const supabase = createClient();
-    const { error } = await supabase
-      .from("backtest_presets")
-      .delete()
-      .eq("id", id);
-    if (error) {
-      console.warn("[backtest-presets] Supabase delete failed:", error.message);
-    }
+    const store = getClientStore(activeMode());
+    await store.presets.delete(id);
   } catch (err) {
-    console.warn("[backtest-presets] Supabase delete threw:", err);
+    console.warn("[backtest-presets] backend delete failed:", err);
   }
 }
 
 /**
- * Pull the full preset list from Supabase, reconcile with local cache by
- * `updated_at`, and rewrite localStorage to the merged result. Dispatches
- * `presets-changed` if anything changed so subscribed components refresh.
+ * Pull the full preset list from the active backend, reconcile with the
+ * localStorage cache by `updated_at`, and rewrite localStorage to the
+ * merged result. Dispatches `presets-changed` if anything changed so
+ * subscribed components refresh.
  *
  * Reconciliation rules (single-user, no auth, last-write-wins):
  *   - Server has row, local doesn't → take server (covers a fresh device).
@@ -638,25 +682,18 @@ async function deletePresetFromSupabase(id: string): Promise<void> {
 export async function syncPresetsFromSupabase(): Promise<BacktestPreset[]> {
   if (typeof window === "undefined") return [];
 
-  let serverRows: PresetRow[] = [];
+  let serverPresets: BacktestPreset[] = [];
   try {
-    const supabase = createClient();
-    const { data, error } = await supabase
-      .from("backtest_presets")
-      .select("*");
-    if (error) {
-      console.warn("[backtest-presets] Supabase fetch failed:", error.message);
-      return loadPresets();
-    }
-    serverRows = (data ?? []) as PresetRow[];
+    const store = getClientStore(activeMode());
+    serverPresets = await store.presets.list();
   } catch (err) {
-    console.warn("[backtest-presets] Supabase fetch threw:", err);
+    console.warn("[backtest-presets] backend fetch failed:", err);
     return loadPresets();
   }
 
   const local = loadPresets();
   const localById = new Map(local.map((p) => [p.id, p]));
-  const serverById = new Map(serverRows.map((r) => [r.id, rowToPreset(r)]));
+  const serverById = new Map(serverPresets.map((p) => [p.id, p]));
 
   const merged: BacktestPreset[] = [];
   const idsToPush: BacktestPreset[] = [];
@@ -708,7 +745,7 @@ export async function syncPresetsFromSupabase(): Promise<BacktestPreset[]> {
   // Push any locally-newer rows up. Don't await — the sync result has
   // already been returned to the caller; uploads can finish in their own time.
   for (const p of idsToPush) {
-    pushPresetToSupabase(p).catch(() => {});
+    pushPresetToBackend(p).catch(() => {});
   }
 
   return merged;

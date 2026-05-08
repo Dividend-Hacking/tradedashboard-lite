@@ -142,10 +142,20 @@ function directiveSourceLine(
   directive: FilterIfDirective,
   fallbackIndex: number
 ): string {
+  // Prefix scoped directives so the user can tell at a glance whether
+  // the rejection came from the global `filter.if` or one of its
+  // per-direction variants. Without the prefix two directives with
+  // the same RHS but different scope would render identically.
+  const lhs =
+    directive.scope === "long"
+      ? "filter.long.if"
+      : directive.scope === "short"
+        ? "filter.short.if"
+        : "filter.if";
   if (typeof directive.source === "string" && directive.source.trim().length > 0) {
-    return directive.source.trim();
+    return `${lhs} = ${directive.source.trim()}`;
   }
-  return `filter.if #${fallbackIndex}`;
+  return `${lhs} #${fallbackIndex}`;
 }
 
 /** Compact one OptimizationRecord array into the summary's per-directive

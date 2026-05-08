@@ -29,7 +29,16 @@
  */
 
 import { TradeZone } from "@/types/trade-zone";
-import { createClient } from "@/lib/supabase/client";
+import { getClientStore, type Mode } from "@/lib/store";
+
+/** Read the active mode from the window-level global the ModeProvider
+ *  publishes on mount. Same pattern as backtest-presets / trader-prefs
+ *  so this plain util module stays free of React hooks. */
+function activeMode(): Mode {
+  if (typeof window === "undefined") return "cloud";
+  const w = window as unknown as { __tradeDashMode?: Mode };
+  return w.__tradeDashMode ?? "cloud";
+}
 
 interface ReplaySessionRow {
   id: number;
@@ -113,7 +122,7 @@ export async function fetchZoneAtr(
   const result = new Map<number, number>();
   if (zones.length === 0) return result;
 
-  const supabase = createClient();
+  const store = getClientStore(activeMode());
 
   // ─── Step 1: pull candidate replay sessions ─────────────────────────
   const instruments = new Set<string>();
@@ -126,17 +135,16 @@ export async function fetchZoneAtr(
   }
   if (instruments.size === 0) return result;
 
-  const { data: sessionRows, error: sessionErr } = await supabase
-    .from("replay_sessions")
-    .select("id, instrument, timeframe, start_time, end_time")
-    .in("instrument", Array.from(instruments))
-    .in("timeframe", Array.from(timeframes));
-
-  if (sessionErr || !sessionRows) {
-    console.warn("[zone-atr-fetcher] failed to load replay_sessions:", sessionErr);
+  let sessions: ReplaySessionRow[];
+  try {
+    sessions = (await store.replay.listSessionsByInstrumentsAndTimeframes(
+      Array.from(instruments),
+      Array.from(timeframes)
+    )) as ReplaySessionRow[];
+  } catch (err) {
+    console.warn("[zone-atr-fetcher] failed to load replay_sessions:", err);
     return result;
   }
-  const sessions = sessionRows as ReplaySessionRow[];
 
   // ─── Step 2: match each zone to its containing session ──────────────
   interface ZoneMatch {
@@ -189,30 +197,25 @@ export async function fetchZoneAtr(
     const lookbackStartIso = new Date(earliestStartMs - lookbackSec * 1000).toISOString();
 
     // One query: all bars in [lookbackStart, latestStart] for this session.
-    // Paginate to bypass the 1000-row Postgrest cap (rare but possible if the
-    // group is wide).
-    const PAGE_SIZE = 1000;
+    // The store layer handles pagination internally — Supabase pages
+    // through PostgREST's 1000-row cap, SQLite returns everything in
+    // one go.
     let allBars: ReplayBarRow[] = [];
-    let offset = 0;
-    let hasMore = true;
-    while (hasMore) {
-      const { data, error: barsErr } = await supabase
-        .from("replay_bars")
-        .select("bar_time, bar_high, bar_low, bar_close")
-        .eq("session_id", sessionId)
-        .gte("bar_time", lookbackStartIso)
-        .lte("bar_time", latestStart)
-        .order("bar_time", { ascending: true })
-        .range(offset, offset + PAGE_SIZE - 1);
-
-      if (barsErr) {
-        console.warn("[zone-atr-fetcher] failed to load replay_bars:", barsErr);
-        break;
-      }
-      const rows = (data as ReplayBarRow[]) ?? [];
-      allBars = allBars.concat(rows);
-      hasMore = rows.length === PAGE_SIZE;
-      offset += PAGE_SIZE;
+    try {
+      const rows = await store.replay.listBarsForSessionInTimeRange(
+        sessionId,
+        lookbackStartIso,
+        latestStart
+      );
+      // Project to the columns the ATR helper needs.
+      allBars = rows.map((r) => ({
+        bar_time: r.bar_time,
+        bar_high: r.bar_high,
+        bar_low: r.bar_low,
+        bar_close: r.bar_close,
+      }));
+    } catch (err) {
+      console.warn("[zone-atr-fetcher] failed to load replay_bars:", err);
     }
 
     // ─── Step 4: per zone, slice the last 30 bars before zone.start_time ──

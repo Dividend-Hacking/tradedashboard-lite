@@ -10,18 +10,34 @@
 
 // ─── Replay Data (from NT8 export) ─────────────────────────────────────────
 
+/**
+ * Granularity of an exported session. Drives both how the data was fetched
+ * from NT8 and where it lives:
+ *   - 'ohlcv'        — bars in replay_bars, no bid/ask split (existing path)
+ *   - 'ohlcv_bidask' — bars in replay_bars + bar_volume_bid/ask populated
+ *   - 'tick'         — every trade in a gzipped CSV blob in Storage; side=null
+ *   - 'tick_bidask'  — same as 'tick' but each row has side='bid'|'ask'|null
+ */
+export type Granularity = "ohlcv" | "ohlcv_bidask" | "tick" | "tick_bidask";
+
 /** One exported data set — a specific instrument/timeframe/date from NinjaTrader */
 export interface ReplaySession {
   id: number;
   instrument: string;
-  timeframe: string;        // e.g. "1 Minute", "5 Minute", "15 Second"
+  timeframe: string;        // e.g. "1 Minute", "5 Minute", "15 Second", "1 Second", "Tick"
   session_date: string;     // ISO date string (YYYY-MM-DD)
-  start_time: string;       // ISO timestamptz of first bar
-  end_time: string;         // ISO timestamptz of last bar
-  bar_count: number;
+  start_time: string;       // ISO timestamptz of first bar/tick
+  end_time: string;         // ISO timestamptz of last bar/tick
+  bar_count: number;        // bar count for OHLCV sessions; 0 for pure tick sessions
   last_bar_index: number;   // last viewed bar position (0 = never started)
   notes: string | null;
   created_at: string;
+  granularity: Granularity;
+  /** Storage path under the `replay-ticks` bucket, e.g. "session-1234.csv.gz".
+   *  Populated only for 'tick' / 'tick_bidask' granularities. */
+  tick_blob_path: string | null;
+  /** Number of ticks in the blob. Separate from bar_count to keep semantics clean. */
+  tick_count: number | null;
 }
 
 /** Single OHLCV bar within a replay session */
@@ -35,6 +51,27 @@ export interface ReplayBar {
   bar_low: number;
   bar_close: number;
   bar_volume: number;
+  /** Sell-aggressor volume for this bar — populated for 'ohlcv_bidask' only. */
+  bar_volume_bid: number | null;
+  /** Buy-aggressor volume for this bar — populated for 'ohlcv_bidask' only. */
+  bar_volume_ask: number | null;
+}
+
+/**
+ * Single trade row inside a tick CSV blob. Rows are stored gzipped in Supabase
+ * Storage rather than Postgres because a busy session is 3-8M trades. The web
+ * client downloads + parses the blob on demand for footprint/volume-profile
+ * charts. NOT a database row — this type describes one parsed CSV line.
+ */
+export interface ReplayTick {
+  tick_index: number;
+  tick_time: string;        // ISO timestamptz with millisecond precision
+  price: number;
+  size: number;
+  /** Aggressor side: 'bid' = sell-aggressor, 'ask' = buy-aggressor.
+   *  null when the data feed didn't classify the trade or the granularity
+   *  is plain 'tick' (no side attribution requested). */
+  side: "bid" | "ask" | null;
 }
 
 // ─── Practice Data (user's practice trading results) ────────────────────────
@@ -79,9 +116,40 @@ export interface DataRequest {
   instrument: string;
   timeframe: string;
   session_date: string;
-  status: "pending" | "processing" | "completed" | "error";
+  /** Lifecycle:
+   *    pending → processing → completed   (happy path)
+   *    pending → processing → error       (transient — auto-retried)
+   *    pending → processing → no_data     (terminal — broker has no bars
+   *                                        for this date, e.g. holiday
+   *                                        we missed or pre-contract date) */
+  status: "pending" | "processing" | "completed" | "error" | "no_data";
   error_message: string | null;
   replay_session_id: number | null;
   created_at: string;
   updated_at: string;
+  /** Which data variant was requested. NT8's DataExporter polls this field
+   *  to decide whether to run a single Last BarsRequest, three parallel
+   *  Last/Bid/Ask requests for bid/ask split, or a tick request. */
+  granularity: Granularity;
+  /** Number of times the sweeper has reset this row (stuck `processing`
+   *  or transient `error`). Stops auto-retrying at 3. */
+  retry_count: number;
+  /** Set when NT8 PATCHes the row to `processing`; nulled on terminal
+   *  status. Sweeper compares against `now - 10min` to detect crashes. */
+  claimed_at: string | null;
+}
+
+/** Summary counts shown in the queue banner (server-rendered on first paint
+ *  so the page survives a refresh without a flash of empty state). */
+export interface DataRequestQueueSummary {
+  completed: number;
+  pending: number;
+  processing: number;
+  errored: number;
+  /** Days the broker confirmed have no bars (terminal). Distinguished from
+   *  `errored` so the user isn't pushed to retry something that won't ever
+   *  succeed, and the sweeper leaves them alone. */
+  noData: number;
+  /** Most recent updated_at across all rows; null if the table is empty. */
+  lastActivityAt: string | null;
 }

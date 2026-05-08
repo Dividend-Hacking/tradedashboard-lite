@@ -38,8 +38,17 @@ import {
   simulateAllZones,
   computeSimSummary,
 } from "./zone-simulator";
-import { precomputeIndicators, maxIndicatorPeriod } from "./script-expr";
+import {
+  precomputeIndicators,
+  maxIndicatorPeriod,
+  applyBindings,
+  type Expr,
+  type NumericValue,
+  type OptimizeSpec,
+  type TickContext,
+} from "./script-expr";
 import { runOnlineOptimizedBacktest } from "./script-online-optimizer";
+import type { ParsedTicks } from "./tick-aggregation";
 
 // ─── Public types ───────────────────────────────────────────────────────────
 
@@ -62,6 +71,11 @@ export interface StrategyParamField {
   step: number;
   default: number;
   description?: string;
+  /** Worked examples for the /script-reference docs page. Imported as
+   *  a structural shape (not a typed import) to avoid a circular import
+   *  back into script-expr — the only consumer of these is the docs UI,
+   *  which type-casts at the boundary. */
+  examples?: { snippet: string; scenario: string }[];
 }
 
 /** A strategy: name, parameter schema, and a pure function from bars+params
@@ -406,6 +420,13 @@ export interface ContextSeries {
   maDistance: number[];
   volumeMa: number[];
   rsi: number[];
+  /** Per-bar bid/ask delta imbalance: (ask − bid) / (ask + bid). Range
+   *  [−1, 1]: positive = ask-aggressor (buy) dominated, negative = bid-
+   *  aggressor (sell) dominated, zero = balanced. null when the source
+   *  bars don't carry bid/ask volume (plain `ohlcv` granularity). Drives
+   *  the delta-imbalance entry filter — only meaningful for sessions
+   *  derived from tick / tick_bidask / ohlcv_bidask data. */
+  deltaRatio: (number | null)[];
 }
 
 export function buildContextSeries(
@@ -425,7 +446,40 @@ export function buildContextSeries(
     ),
     volumeMa: volumeMaSeries(bars, config.volumeMaPeriod),
     rsi: rsiSeries(bars, config.rsiPeriod),
+    deltaRatio: deltaRatioSeries(bars),
   };
+}
+
+/**
+ * Bid/ask delta imbalance per bar: (ask − bid) / (ask + bid). Returns null
+ * for bars whose source data lacks the bid/ask split (plain `ohlcv` rows
+ * have `bar_volume_bid === null`) so the filter can distinguish "no data"
+ * from "balanced flow" (the latter would be 0). Total volume zero also
+ * yields null — there's no meaningful imbalance to report when nothing
+ * traded.
+ *
+ * Range is naturally [−1, +1]:
+ *   +1 = every contract lifted the ask (pure buy aggression)
+ *   −1 = every contract hit the bid  (pure sell aggression)
+ *    0 = exact balance
+ */
+function deltaRatioSeries(bars: ReplayBar[]): (number | null)[] {
+  const out: (number | null)[] = new Array(bars.length);
+  for (let i = 0; i < bars.length; i++) {
+    const bid = bars[i].bar_volume_bid;
+    const ask = bars[i].bar_volume_ask;
+    if (bid == null || ask == null) {
+      out[i] = null;
+      continue;
+    }
+    const total = bid + ask;
+    if (total <= 0) {
+      out[i] = null;
+      continue;
+    }
+    out[i] = (ask - bid) / total;
+  }
+  return out;
 }
 
 /** Per-bar context snapshot, stamped onto a synthetic zone's `ctx_*` fields
@@ -474,6 +528,11 @@ export interface ContextSnapshot {
    *  losing strength), near zero = flat. Drives the ADX-direction
    *  filter. Null when the lookback bar isn't available. */
   ctx_adx_slope: number | null;
+  /** Bid/ask delta imbalance at the entry bar — (ask − bid) / (ask + bid).
+   *  Range [−1, +1]; null when the source bar didn't carry a bid/ask split
+   *  (plain `ohlcv` granularity) or when total volume was zero. Drives the
+   *  delta-imbalance entry filter. */
+  ctx_delta_ratio: number | null;
 }
 
 /** Materialize the snapshot at one bar index. Each field gracefully falls
@@ -556,6 +615,7 @@ export function snapshotContext(
     ctx_volume_ratio: volumeRatio,
     ctx_rsi: Number.isFinite(rsi) ? rsi : null,
     ctx_adx_slope: Number.isFinite(adxSlope) ? adxSlope : null,
+    ctx_delta_ratio: ctx.deltaRatio[index] ?? null,
   };
 }
 
@@ -584,7 +644,10 @@ const SIGNAL_V1_FIELDS: StrategyParamField[] = [
     description: "If breaking a level set more than this many bars ago → reject (F3 stale level)" },
 ];
 
-function signalV1Events(bars: ReplayBar[], p: Record<string, number>): BacktestSignal[] {
+/** @internal Exported only for the parity test in scripts/parity-test.ts.
+ *  After the parity gate is locked in, this and the other *Events
+ *  functions can be deleted; the engine no longer calls them. */
+export function signalV1Events(bars: ReplayBar[], p: Record<string, number>): BacktestSignal[] {
   const lookback = Math.max(1, Math.floor(p.lookback));
   const atrPeriod = Math.max(2, Math.floor(p.atrPeriod));
   const atEdge = p.atEdgeThreshold;
@@ -690,7 +753,8 @@ const SIGNAL_V2_FIELDS: StrategyParamField[] = [
     description: "|close[start..end]| / range must be < this — confirms churn (not trend) inside the base" },
 ];
 
-function signalV2Events(bars: ReplayBar[], p: Record<string, number>): BacktestSignal[] {
+/** @internal Exported only for the parity test. */
+export function signalV2Events(bars: ReplayBar[], p: Record<string, number>): BacktestSignal[] {
   const lookback = Math.max(1, Math.floor(p.lookback));
   const atrPeriod = Math.max(2, Math.floor(p.atrPeriod));
   const atEdge = p.atEdgeThreshold;
@@ -856,7 +920,8 @@ const SIGNAL_V3_FIELDS: StrategyParamField[] = [
     description: "Trigger bar's |close - open| / (high - low) must be >= this — replaces V2's bare close>open trigger so wicky / doji bars are rejected even when their close direction agrees." },
 ];
 
-function signalV3Events(bars: ReplayBar[], p: Record<string, number>): BacktestSignal[] {
+/** @internal Exported only for the parity test. */
+export function signalV3Events(bars: ReplayBar[], p: Record<string, number>): BacktestSignal[] {
   const lookback = Math.max(1, Math.floor(p.lookback));
   const atrPeriod = Math.max(2, Math.floor(p.atrPeriod));
   const atEdge = p.atEdgeThreshold;
@@ -1018,7 +1083,8 @@ function signalV3Events(bars: ReplayBar[], p: Record<string, number>): BacktestS
 // lockstep — any future tweak to V2's gates is automatically inherited
 // here, and parity with NT8 (PresetSignals.GenerateV2Failed) only needs
 // the same wrapper.
-function signalV2FailedEvents(
+/** @internal Exported only for the parity test. */
+export function signalV2FailedEvents(
   bars: ReplayBar[],
   p: Record<string, number>
 ): BacktestSignal[] {
@@ -1099,7 +1165,8 @@ const FAILED_BREAK_V1_FIELDS: StrategyParamField[] = [
     description: "FLIPPED sign vs V2: |close[start..end]| / range must be >= this — fades want a trending approach into the level, not the tight churn V2 requires" },
 ];
 
-function failedBreakV1Events(bars: ReplayBar[], p: Record<string, number>): BacktestSignal[] {
+/** @internal Exported only for the parity test. */
+export function failedBreakV1Events(bars: ReplayBar[], p: Record<string, number>): BacktestSignal[] {
   const lookback = Math.max(1, Math.floor(p.lookback));
   const atrPeriod = Math.max(2, Math.floor(p.atrPeriod));
   const atEdge = p.atEdgeThreshold;
@@ -1243,53 +1310,84 @@ function failedBreakV1Events(bars: ReplayBar[], p: Record<string, number>): Back
 
 // ─── Strategy registry ──────────────────────────────────────────────────────
 //
-// New strategies plug in by appending an entry here. The dashboard reads the
-// list to populate the dropdown and auto-renders the parameter editor from
-// `paramFields`, so no UI changes are needed when adding a strategy.
+// As of the DSL migration: every entry here is BACKED BY a DSL template
+// from `built-in-strategies.ts`, evaluated via `strategy-evaluator.ts`. The
+// public interface (StrategyDef with paramFields + generateSignals) is
+// preserved so existing consumers — backtest-script's loadstrategy
+// machinery, the dashboard dropdown, the auto-trader's
+// signalsForPreset() — keep working unchanged. The legacy hardcoded
+// `*Events` JS implementations are gone; what runs at backtest time is
+// now `evaluateStrategyScript(parsed_template, paramOverrides, bars)`.
+// Parity with the legacy implementations is verified by
+// `scripts/parity-test.ts`.
 
-export const STRATEGIES: StrategyDef[] = [
-  {
-    id: "signal_v1",
-    label: "Signal v1 (range-break + pullback)",
-    description:
-      "Fires at recent-range edges with a small counter-trend pullback. Filters out flat momentum and re-tests of stale levels.",
-    paramFields: SIGNAL_V1_FIELDS,
-    generateSignals: signalV1Events,
+import {
+  BUILTIN_STRATEGY_TEMPLATES,
+  type ParamMeta,
+} from "./built-in-strategies";
+import {
+  parseStrategyScript,
+  evaluateStrategyScript,
+  buildLetBindings,
+  type Stmt,
+} from "./strategy-evaluator";
+
+/** Convert a template's paramMeta record into the StrategyParamField[]
+ *  shape the dashboard's auto-generated parameter editor expects. */
+function paramMetaToFields(meta: Record<string, ParamMeta>): StrategyParamField[] {
+  return Object.entries(meta).map(([key, m]) => ({
+    key,
+    label: m.label ?? key,
+    type: m.type ?? "float",
+    min: m.min ?? 0,
+    max: m.max ?? 1000,
+    step: m.step ?? 1,
+    default: m.default,
+    description: m.description,
+    examples: m.examples,
+  }));
+}
+
+/** Cache of parsed Stmt[] per template id. The DSL parser is fast but
+ *  not free — every backtest run would otherwise re-tokenize and re-AST
+ *  the same script. Caching here keeps the common case (running a
+ *  builtin) at zero parse cost after the first call. */
+const PARSED_TEMPLATE_CACHE = new Map<string, Stmt[]>();
+
+function parsedStmtsFor(templateId: string, script: string): Stmt[] {
+  let stmts = PARSED_TEMPLATE_CACHE.get(templateId);
+  if (!stmts) {
+    const parsed = parseStrategyScript(script);
+    if (parsed.errors.some((e) => e.severity === "error")) {
+      const msgs = parsed.errors
+        .filter((e) => e.severity === "error")
+        .map((e) => `line ${e.line}: ${e.message}`)
+        .join("; ");
+      throw new Error(
+        `built-in template "${templateId}" failed to parse — ${msgs}. This is a bug; the DSL parser was changed in a way that broke the shipped templates.`
+      );
+    }
+    stmts = parsed.stmts;
+    PARSED_TEMPLATE_CACHE.set(templateId, stmts);
+  }
+  return stmts;
+}
+
+export const STRATEGIES: StrategyDef[] = BUILTIN_STRATEGY_TEMPLATES.map((t) => ({
+  id: t.id,
+  label: t.label,
+  description: t.description,
+  paramFields: paramMetaToFields(t.paramMeta),
+  generateSignals: (bars: ReplayBar[], params: Record<string, number>): BacktestSignal[] => {
+    const stmts = parsedStmtsFor(t.id, t.script);
+    const { signals } = evaluateStrategyScript({
+      stmts,
+      paramOverrides: params,
+      bars,
+    });
+    return signals;
   },
-  {
-    id: "signal_v2",
-    label: "Signal v2 (cross-into-zone + lockout + base filter)",
-    description:
-      "V1 setup gates plus: fires only on the bar that crosses into the zone, per-direction lockout to prevent re-fires, and a base-quality filter on the lookback window.",
-    paramFields: SIGNAL_V2_FIELDS,
-    generateSignals: signalV2Events,
-  },
-  {
-    id: "signal_v3",
-    label: "Signal v3 (V2 + multi-bar acceptance + body/range trigger)",
-    description:
-      "V2 with two tightenings for fast/low-timeframe data: requires the in-zone position to hold for N consecutive bars before firing (replaces V2's single-bar cross), and the trigger bar's body must occupy a minimum fraction of its range (replaces V2's bare close>open).",
-    paramFields: SIGNAL_V3_FIELDS,
-    generateSignals: signalV3Events,
-  },
-  {
-    id: "signal_v2_failed",
-    label: "Signal v2 failed (inverse — fade the breakout)",
-    description:
-      "Identical gating to v2 (same params), but every signal's direction is flipped. Where v2 prints Long on an upside breakout this prints Short, betting the breakout fails.",
-    // Reuses V2's param schema verbatim — same knobs, same defaults.
-    paramFields: SIGNAL_V2_FIELDS,
-    generateSignals: signalV2FailedEvents,
-  },
-  {
-    id: "failed_break_v1",
-    label: "Failed Break v1 (fade-native: thrust + sweep + trending base)",
-    description:
-      "Fade-native rebuild of v2_failed. Replaces V2's counter-trend pullback with a same-direction thrust into the level, adds a wick-sweep gate (poke beyond the high/low), and flips the base filter to require a trending approach instead of a tight coil.",
-    paramFields: FAILED_BREAK_V1_FIELDS,
-    generateSignals: failedBreakV1Events,
-  },
-];
+}));
 
 /** Build a default-params dict for a strategy by reading its paramFields.
  *  Used by the dashboard when first selecting a strategy or to reset. */
@@ -1378,6 +1476,96 @@ function collectOverlayExprs(
   return out;
 }
 
+/** Substitute `bindings` into every Expr inside a `ScriptOverlay`. The
+ *  engine uses this to inline strategy-DSL `let` bindings into filter.if
+ *  / ontrade.print / rules.X / Optimize expressions before they reach
+ *  the per-trade evaluator (`script-expr.ts`'s EntryEvalCtx has no
+ *  let-binding lookup). Mirrors the four small helpers inside
+ *  backtest-script.ts (`applyBindingsTo{NumericValue,OptimizeSpec,
+ *  PrintDirective,FilterIf}`) but lives locally to dodge the import
+ *  cycle with backtest-script. The two implementations must stay in
+ *  sync — same reason as `collectOverlayExprs` above. */
+export function applyBindingsToOverlay(
+  overlay: import("./zone-simulator").ScriptOverlay,
+  bindings: Map<string, Expr>,
+): import("./zone-simulator").ScriptOverlay {
+  if (bindings.size === 0) return overlay;
+  const ab = (e: Expr): Expr => applyBindings(e, bindings);
+  const rewriteOptimizeSpec = (spec: OptimizeSpec): OptimizeSpec => {
+    if (spec.kind === "optimize-categorical") return spec;
+    return {
+      ...spec,
+      min: { source: spec.min.source, expr: ab(spec.min.expr) },
+      max: { source: spec.max.source, expr: ab(spec.max.expr) },
+      step:
+        spec.step === undefined
+          ? undefined
+          : { source: spec.step.source, expr: ab(spec.step.expr) },
+    };
+  };
+  const rewriteNumericValue = (nv: NumericValue): NumericValue => {
+    switch (nv.kind) {
+      case "literal":
+        return nv;
+      case "expr":
+        return { ...nv, expr: ab(nv.expr) };
+      case "optimize":
+        return { ...nv, spec: rewriteOptimizeSpec(nv.spec) };
+    }
+  };
+  const rewriteStmts = (
+    list: import("./backtest-script").FilterIfStatement[],
+  ): import("./backtest-script").FilterIfStatement[] =>
+    list.map((s) => {
+      switch (s.kind) {
+        case "assignment":
+          return { ...s, value: rewriteNumericValue(s.value) };
+        case "print":
+          return {
+            ...s,
+            directive: { ...s.directive, expr: ab(s.directive.expr) },
+          };
+        case "verdict":
+          return s;
+        case "nested":
+          return { ...s, directive: rewriteFilterIf(s.directive) };
+      }
+    });
+  const rewriteFilterIf = (
+    d: import("./backtest-script").FilterIfDirective,
+  ): import("./backtest-script").FilterIfDirective => ({
+    ...d,
+    cond: ab(d.cond),
+    ifTrue: rewriteStmts(d.ifTrue),
+    ifFalse: rewriteStmts(d.ifFalse),
+  });
+  const next: import("./zone-simulator").ScriptOverlay = { ...overlay };
+  if (overlay.numericOverrides) {
+    const r: Record<string, NumericValue> = {};
+    for (const path of Object.keys(overlay.numericOverrides)) {
+      r[path] = rewriteNumericValue(overlay.numericOverrides[path]);
+    }
+    next.numericOverrides = r;
+  }
+  if (overlay.tradePrints) {
+    next.tradePrints = overlay.tradePrints.map((p) => ({
+      ...p,
+      expr: ab(p.expr),
+    }));
+  }
+  if (overlay.optimizeOverrides) {
+    const r: Record<string, OptimizeSpec> = {};
+    for (const path of Object.keys(overlay.optimizeOverrides)) {
+      r[path] = rewriteOptimizeSpec(overlay.optimizeOverrides[path]);
+    }
+    next.optimizeOverrides = r;
+  }
+  if (overlay.filterIfs) {
+    next.filterIfs = overlay.filterIfs.map((d) => rewriteFilterIf(d));
+  }
+  return next;
+}
+
 export interface BacktestRunResult {
   trades: SimZoneResult[];
   /** Synthetic TradeZones — one per fired signal. Same shape as real zones so
@@ -1399,6 +1587,13 @@ export interface BacktestRunResult {
    *  window) are absent from the map and fall back to base points only,
    *  matching the simulator's null-tolerant behavior. */
   syntheticAtrByZoneId: Map<number, number>;
+  /** Per-zone tick context — one entry per synthetic zone, populated
+   *  only when the source session carried tick data. Tick-driven DSL
+   *  indicators (POC/VAH/VAL, vwap_tick, etc.) need this when the
+   *  dashboard re-runs `precomputeIndicators` post-filter. Empty map
+   *  for OHLCV / ohlcv_bidask sessions; downstream calls just receive
+   *  `undefined` for those zones and tick indicators degrade to NaN. */
+  syntheticTickCtxByZoneId: Map<number, TickContext>;
   /** Total signal count BEFORE the session-end walk-truncation drop. Useful
    *  for debugging "I see N triangles but only M trades in the table". */
   totalSignals: number;
@@ -1452,6 +1647,11 @@ function replayBarToZoneBar(
     high_since_entry: null,
     retrace_from_peak: null,
     created_at: bar.bar_time,
+    // Forward order-flow splits when present so DSL `delta`, `CVD()`,
+    // etc. can read them at the entry bar. ReplayBar carries
+    // bar_volume_bid / bar_volume_ask only on bid/ask-aware sessions.
+    bar_volume_bid: bar.bar_volume_bid,
+    bar_volume_ask: bar.bar_volume_ask,
   };
 }
 
@@ -1480,6 +1680,28 @@ export function runBacktestForSession(args: {
    *  threaded through unchanged here — this keeps engine code free of
    *  expression-engine knowledge except for the typed pass-through. */
   scriptOverlay?: import("./zone-simulator").ScriptOverlay | null;
+  /** Strategy DSL override — when the user authors `signal.long.if = …`
+   *  / `signal.short.if = …` in the script editor, the dashboard parses
+   *  the script, extracts the signal statements + their inferred params,
+   *  and passes them here. The engine then bypasses
+   *  `strategy.generateSignals()` and runs `evaluateStrategyScript`
+   *  directly. When absent, behavior is unchanged: `strategy.generateSignals`
+   *  produces the entries (which is itself DSL-backed for builtins). */
+  strategyOverride?: {
+    stmts: import("./strategy-evaluator").Stmt[];
+    paramOverrides: Record<string, number>;
+  } | null;
+  /** Optional tick-resolution data for the session. When provided,
+   *  tick-driven indicators (POC/VAH/VAL, vwap_tick, large_trade_count,
+   *  etc.) become available to the script DSL. `sessionTicks` is the
+   *  session-level ParsedTicks; `sessionTickRanges` is the packed
+   *  Int32Array produced by `aggregateTicksWithRanges` — half-open
+   *  `[start, end)` index pairs into `sessionTicks` for each session
+   *  bar. Length must equal `2 * bars.length`. Both arrive together or
+   *  not at all; passing only one is treated as "no tick data" and
+   *  tick-required indicators emit all-NaN. */
+  sessionTicks?: ParsedTicks | null;
+  sessionTickRanges?: Int32Array | null;
 }): BacktestRunResult {
   const {
     bars,
@@ -1492,7 +1714,16 @@ export function runBacktestForSession(args: {
     maxPreEntryBars = DEFAULT_PRE_ENTRY_BARS,
     indicatorConfig = DEFAULT_INDICATOR_CONFIG,
     scriptOverlay,
+    strategyOverride,
+    sessionTicks = null,
+    sessionTickRanges = null,
   } = args;
+  // Both tick fields must be present together for tick indicators to
+  // work; otherwise we fall back to all-NaN at the indicator layer.
+  const hasTicks =
+    sessionTicks != null &&
+    sessionTickRanges != null &&
+    sessionTickRanges.length === bars.length * 2;
 
   // Auto-size the pre-entry bar window when the script references
   // long-period indicators. Without this, `filter.if = close > EMA(200)`
@@ -1505,8 +1736,22 @@ export function runBacktestForSession(args: {
   // `maxPreEntryBars` arg becomes a FLOOR (still honored for the AI
   // export's setup-context slider), and the auto value is capped at
   // MAX_AUTO_PRE_ENTRY_BARS to bound memory.
-  const overlayExprs = scriptOverlay ? collectOverlayExprs(scriptOverlay) : [];
-  const requiredWarmup = scriptOverlay ? maxIndicatorPeriod(overlayExprs) : 0;
+  // Inline strategy-DSL `let` bindings into the overlay's expressions
+  // BEFORE warmup sizing or precompute. The entry-context evaluator
+  // (`script-expr.ts`) has no let-binding lookup, so a `filter.if =
+  // (someLet > 0, , )` would otherwise resolve `someLet` to NaN and
+  // reject every trade. Substituting at the AST level inlines the let's
+  // resolved body and lets `gatherRequiredSeries` see literal indicator
+  // args, which makes precompute correct.
+  const letBindings = strategyOverride
+    ? buildLetBindings(strategyOverride.stmts)
+    : new Map<string, Expr>();
+  const effectiveOverlay = scriptOverlay
+    ? applyBindingsToOverlay(scriptOverlay, letBindings)
+    : null;
+
+  const overlayExprs = effectiveOverlay ? collectOverlayExprs(effectiveOverlay) : [];
+  const requiredWarmup = effectiveOverlay ? maxIndicatorPeriod(overlayExprs) : 0;
   const effectivePreEntryBars = Math.min(
     MAX_AUTO_PRE_ENTRY_BARS,
     // +10 buffer absorbs the off-by-one between "first valid index" and
@@ -1515,6 +1760,8 @@ export function runBacktestForSession(args: {
     // is computed across the combined (pre + post) series.
     Math.max(maxPreEntryBars, requiredWarmup + 10)
   );
+  // Warnings push goes to the ORIGINAL overlay so the caller's reference
+  // sees them — `effectiveOverlay` is a copy and not visible upstream.
   if (scriptOverlay && requiredWarmup > MAX_AUTO_PRE_ENTRY_BARS) {
     scriptOverlay.warnings = scriptOverlay.warnings ?? [];
     scriptOverlay.warnings.push(
@@ -1529,11 +1776,40 @@ export function runBacktestForSession(args: {
       syntheticBarsByZoneId: new Map(),
       syntheticPreEntryBarsByZoneId: new Map(),
       syntheticAtrByZoneId: new Map(),
+      syntheticTickCtxByZoneId: new Map(),
       totalSignals: 0,
     };
   }
 
-  const signals = strategy.generateSignals(bars, params);
+  // The dashboard's editor is the single source of truth for signals.
+  // strategyOverride is built from the editor's script (auto-applied via
+  // the useEffect in backtest-dashboard.tsx). The legacy
+  // `strategy.generateSignals` fallback used to invoke stale built-in
+  // templates from `built-in-strategies.ts`, which silently shadowed the
+  // user's edits — removed because it caused dashboard-vs-NT8 strategy
+  // divergence (dashboard ran the template, NT8 ran the editor's script).
+  if (!strategyOverride) {
+    throw new Error(
+      "Backtest invoked without a strategyOverride. The dashboard must " +
+      "build the override from the editor's scriptText (see " +
+      "handleApplyScript in backtest-dashboard.tsx). Built-in template " +
+      "fallback was removed to prevent silent script divergence."
+    );
+  }
+  const signals = evaluateStrategyScript({
+    stmts: strategyOverride.stmts,
+    paramOverrides: strategyOverride.paramOverrides,
+    bars,
+    // Thread the session's TickContext so signal-generation scripts
+    // can reference tick-resolution indicators (POC, VAH, VAL,
+    // tick_imbalance, vwap_tick, …) and bid/ask-aware indicators.
+    // Already validated above via `hasTicks`: sessionTickRanges has
+    // length === bars.length * 2, exactly the invariant TickContext
+    // expects.
+    tickCtx: hasTicks
+      ? { ticks: sessionTicks!, barTickRanges: sessionTickRanges! }
+      : undefined,
+  }).signals;
 
   // Pre-compute every indicator series ONCE per session so the per-signal
   // ctx_* snapshot is just a constant-time array lookup. Way cheaper than
@@ -1548,6 +1824,13 @@ export function runBacktestForSession(args: {
   // ATR-adjust math has the lookup it expects. Without this the ± ATR
   // fields on SL/TP/Trail/BE silently no-op for backtest results.
   const syntheticAtrByZoneId = new Map<number, number>();
+  // Per-zone TickContext built from session ticks + per-bar ranges.
+  // Populated only when the session has tick data attached. The
+  // ParsedTicks stays shared across zones (same underlying typed
+  // arrays); each zone gets its own `barTickRanges` Int32Array sized
+  // to its (pre + post) bar window so `windowTickRange` indexes are
+  // zone-local and align with the zone's bar arrays.
+  const syntheticTickCtxByZoneId = new Map<number, TickContext>();
 
   signals.forEach((sig, sigIdx) => {
     const entryBar = bars[sig.barIndex];
@@ -1598,6 +1881,7 @@ export function runBacktestForSession(args: {
           ctx_volume_ratio: null,
           ctx_rsi: null,
           ctx_adx_slope: null,
+          ctx_delta_ratio: null,
         };
 
     // Build synthetic TradeZone matching the real-zone shape so downstream
@@ -1650,6 +1934,35 @@ export function runBacktestForSession(args: {
     syntheticZones.push(zone);
     syntheticBarsByZoneId.set(zoneId, zoneBars);
     syntheticPreEntryBarsByZoneId.set(zoneId, preBars);
+    // Build the zone-local tickRanges by copying the slice of session
+    // ranges that covers the zone's combined (pre + post) bar window.
+    // The order matches `precomputeIndicators`'s combined array
+    // (`[...sortedPre, ...sortedPost]`), so a zone bar at position k in
+    // the combined array maps to ranges[2*k..2*k+1]. Entry bar lives at
+    // position `preBars.length` in the combined array.
+    if (hasTicks) {
+      const combinedLen = preBars.length + walkLen;
+      const localRanges = new Int32Array(combinedLen * 2);
+      // Pre-entry bars first — they span session indices [preStart,
+      // sig.barIndex). Their order in `preBars` matches their session
+      // order (we pushed in ascending session index).
+      for (let k = 0; k < preBars.length; k++) {
+        const sessionIdx = preStart + k;
+        localRanges[k * 2] = sessionTickRanges![sessionIdx * 2];
+        localRanges[k * 2 + 1] = sessionTickRanges![sessionIdx * 2 + 1];
+      }
+      // Post-entry bars — session indices [sig.barIndex, walkEnd).
+      for (let k = 0; k < walkLen; k++) {
+        const sessionIdx = sig.barIndex + k;
+        const slot = (preBars.length + k) * 2;
+        localRanges[slot] = sessionTickRanges![sessionIdx * 2];
+        localRanges[slot + 1] = sessionTickRanges![sessionIdx * 2 + 1];
+      }
+      syntheticTickCtxByZoneId.set(zoneId, {
+        ticks: sessionTicks!,
+        barTickRanges: localRanges,
+      });
+    }
     // Only register an ATR entry when the indicator actually warmed up —
     // matches the risk simulator's `fetchZoneAtr` map convention where
     // missing entries fall back to base points only.
@@ -1667,7 +1980,7 @@ export function runBacktestForSession(args: {
   // expressions referencing indicator data, this just produces empty
   // per-zone maps — cheap.
   let overlayForSim: import("./zone-simulator").ScriptOverlay | null =
-    scriptOverlay ?? null;
+    effectiveOverlay ?? null;
   if (
     overlayForSim &&
     (overlayForSim.numericOverrides ||
@@ -1693,7 +2006,8 @@ export function runBacktestForSession(args: {
         syntheticZones,
         syntheticBarsByZoneId,
         overlayExprs,
-        syntheticPreEntryBarsByZoneId
+        syntheticPreEntryBarsByZoneId,
+        syntheticTickCtxByZoneId.size > 0 ? syntheticTickCtxByZoneId : undefined,
       ),
     };
   }
@@ -1739,6 +2053,7 @@ export function runBacktestForSession(args: {
     syntheticBarsByZoneId,
     syntheticPreEntryBarsByZoneId,
     syntheticAtrByZoneId,
+    syntheticTickCtxByZoneId,
     totalSignals: signals.length,
     optimizationHistory,
     optimizationWarnings,
@@ -1760,6 +2075,12 @@ export function runBacktestAcrossSessions(args: {
    *  per-session run so expressions/prints stay consistent across the
    *  multi-session concatenation. */
   scriptOverlay?: import("./zone-simulator").ScriptOverlay | null;
+  /** Strategy DSL override — see runBacktestForSession. Same statements
+   *  + paramOverrides apply to every session in the multi-session run. */
+  strategyOverride?: {
+    stmts: import("./strategy-evaluator").Stmt[];
+    paramOverrides: Record<string, number>;
+  } | null;
 }): BacktestRunResult {
   const {
     sessions,
@@ -1770,6 +2091,7 @@ export function runBacktestAcrossSessions(args: {
     maxPreEntryBars,
     indicatorConfig,
     scriptOverlay,
+    strategyOverride,
   } = args;
 
   const allTrades: SimZoneResult[] = [];
@@ -1777,6 +2099,7 @@ export function runBacktestAcrossSessions(args: {
   const allBars = new Map<number, TradeZoneBar[]>();
   const allPreEntryBars = new Map<number, TradeZoneBar[]>();
   const allAtr = new Map<number, number>();
+  const allTickCtx = new Map<number, TickContext>();
   let idOffset = 0;
   let totalSignals = 0;
 
@@ -1792,12 +2115,14 @@ export function runBacktestAcrossSessions(args: {
       maxPreEntryBars,
       indicatorConfig,
       scriptOverlay,
+      strategyOverride,
     });
     allTrades.push(...r.trades);
     allZones.push(...r.syntheticZones);
     for (const [k, v] of r.syntheticBarsByZoneId) allBars.set(k, v);
     for (const [k, v] of r.syntheticPreEntryBarsByZoneId) allPreEntryBars.set(k, v);
     for (const [k, v] of r.syntheticAtrByZoneId) allAtr.set(k, v);
+    for (const [k, v] of r.syntheticTickCtxByZoneId) allTickCtx.set(k, v);
     idOffset += r.syntheticZones.length;
     totalSignals += r.totalSignals;
   }
@@ -1814,6 +2139,7 @@ export function runBacktestAcrossSessions(args: {
     syntheticBarsByZoneId: allBars,
     syntheticPreEntryBarsByZoneId: allPreEntryBars,
     syntheticAtrByZoneId: allAtr,
+    syntheticTickCtxByZoneId: allTickCtx,
     totalSignals,
   };
 }

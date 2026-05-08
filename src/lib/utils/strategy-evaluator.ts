@@ -1,0 +1,1276 @@
+/**
+ * strategy-evaluator.ts — Per-bar evaluator for the user-authored strategy DSL.
+ *
+ * The legacy backtester ran a hardcoded `generateSignals(bars, params)` per
+ * strategy id. This module replaces that with a DSL: users write scripts
+ * that declare `let` bindings and `signal.long.if = …` / `signal.short.if = …`
+ * statements, and the evaluator walks bars producing the same
+ * `BacktestSignal[]` shape so the rest of the engine (synthetic-zone
+ * construction, `simulateAllZones`, summary stats) is unchanged.
+ *
+ * Pipeline:
+ *   1. parseStrategyScript(text) → { stmts, errors, paramRefs }
+ *      — Multi-line aware. Statements are `let`/`var`, `signal.{long,short}.if`,
+ *        or generic `path = expr` assignments (which the engine routes to
+ *        rules/filters overlays). `params.X = …` on the LHS is a parse error
+ *        because params are inferred and edited in the sidebar, not the script.
+ *   2. evaluateStrategyScript({ stmts, paramOverrides, bars }) → { signals, assigns }
+ *      — Walks bars 0..N-1. At each bar evaluates `signal.long.if` and
+ *        `signal.short.if`; on truthy emits a BacktestSignal AND records the
+ *        firing in firingsLong/firingsShort so `bars_since(signal.long)`
+ *        on a later bar can resolve correctly.
+ *
+ * Series & indexing:
+ *   - `high(N)` / `low(N)` return SeriesHandles — closures over the bar
+ *     array. Bare use coerces to the value at the current bar (`.at(0)`),
+ *     so `let x = high(20)` works. `high(20)[5]` = the rolling 20-bar
+ *     high evaluated 5 bars before the current bar.
+ *   - Bare OHLCV idents (`high`, `low`, `close`, `open`, `volume`) likewise
+ *     accept `[k]` indexing — `close[5]` is the close 5 bars ago.
+ *
+ * Stateful self-reference:
+ *   - `bars_since(signal.long)` resolves against the firings array — the
+ *     bar-distance to the most recent prior `signal.long.if` firing, or
+ *     +Infinity if none yet. This is what makes per-strategy cooldowns
+ *     expressible in the DSL.
+ *   - `any_bar_in(N, condition)` is a SPECIAL FORM (no eager arg eval):
+ *     for k in 0..N-1, build a fresh BarEvalCtx with bar shifted by k,
+ *     CLEAR the let cache (full re-eval per inner bar — confirmed user
+ *     decision), evaluate condition, OR-reduce.
+ *
+ * Why a separate evaluator instead of extending evaluate() in script-expr.ts:
+ *   - script-expr.ts evaluates against a static EntryEvalCtx (the entry bar
+ *     of a single trade). Strategy evaluation needs a per-bar walk with
+ *     mutable per-bar state (letCache, firings) and value types beyond
+ *     `number` (SeriesHandle). Keeping the two evaluators separate avoids
+ *     bloating the per-trade evaluator with strategy-only concerns.
+ *   - We REUSE the AST and parser from script-expr.ts; only the evaluation
+ *     layer is new.
+ */
+
+import type { ReplayBar } from "@/types/replay";
+import {
+  type Expr,
+  compile,
+  applyBindings,
+  EXPR_SYMBOLS,
+  // Indicator dispatch — single source of truth shared with the
+  // entry-context evaluator. Routing through these prevents the strategy
+  // DSL from drifting behind script-expr.ts again as new indicators are
+  // added (it has done so historically — bid/ask + tick indicators were
+  // invisible here until this delegation was wired in).
+  computeIndicatorSeries,
+  indicatorKeyForCall,
+  applyArgDefaults,
+  isKnownIndicator,
+  ZERO_ARG_INDICATORS,
+  FRACTIONAL_ARG_INDICATORS,
+  type TickContext,
+} from "./script-expr";
+import { ProfileCache } from "@/lib/indicators/tick-indicators";
+import type { IndicatorBar } from "@/lib/indicators/calculations";
+
+// ─── BacktestSignal — output shape preserved from the legacy engine ────────
+
+export interface BacktestSignal {
+  barIndex: number;
+  direction: "Long" | "Short";
+}
+
+// ─── Statement layer ──────────────────────────────────────────────────────
+
+export type Stmt =
+  | { kind: "let"; name: string; expr: Expr; line: number; source: string }
+  | { kind: "signal"; side: "long" | "short"; expr: Expr; line: number; source: string }
+  | { kind: "assign"; path: string; expr: Expr; line: number; source: string };
+
+export interface ParseError {
+  line: number;
+  message: string;
+  severity: "error" | "warning";
+}
+
+export interface ParsedStrategyScript {
+  stmts: Stmt[];
+  errors: ParseError[];
+  /** Every `params.X` referenced anywhere in the script. The dashboard
+   *  uses this list to drive the inferred-param sidebar. Stable across
+   *  re-parses (ordered by first appearance). */
+  paramRefs: string[];
+}
+
+// Reserved binding names that conflict with built-in idents — refuse `let`
+// declarations using these names. Mirrors the script-expr.ts conventions.
+const RESERVED_LET_NAMES = new Set<string>([
+  "open", "high", "low", "close", "volume",
+  "bar_index", "direction",
+  "range", "body", "upper_wick", "lower_wick", "typical", "median_price", "weighted_close",
+  "ticksPerPoint", "pointValue", "tickValue",
+  // Bid/ask order-flow scalars — reserved so a `let delta = …` doesn't
+  // shadow the bar-field resolver and silently change semantics.
+  "bar_volume_bid", "bar_volume_ask", "buy_volume", "sell_volume",
+  "delta", "delta_ratio", "buy_pressure",
+  "if", "then", "else",
+  "let", "var", "signal",
+  "params", // root namespace — declaring `let params = …` would be confusing
+]);
+
+/** Parse the strategy DSL. Multi-line continuation is supported: a logical
+ *  line continues across `\n` when (a) paren/bracket depth > 0, OR (b) the
+ *  previous non-comment, non-whitespace token on the line ends with a
+ *  binary operator / open-paren / open-bracket / `=` / unary-eligible
+ *  prefix. Comments use `//` or `#`. */
+export function parseStrategyScript(text: string): ParsedStrategyScript {
+  const errors: ParseError[] = [];
+  const stmts: Stmt[] = [];
+
+  // 1. Pre-pass: combine continuation lines into logical statements.
+  const logicalLines = combineContinuationLines(text);
+
+  // 2. Parse each logical line.
+  for (const ll of logicalLines) {
+    const trimmed = ll.text.trim();
+    if (trimmed === "") continue;
+
+    // `let <name> = <expr>` — also accept legacy `var` for back-compat.
+    const letMatch = trimmed.match(/^(let|var)\s+([A-Za-z_][A-Za-z0-9_]*)\s*=\s*([\s\S]+)$/);
+    if (letMatch) {
+      const [, , name, rhs] = letMatch;
+      if (RESERVED_LET_NAMES.has(name)) {
+        errors.push({
+          line: ll.line,
+          message: `let: name "${name}" collides with a reserved identifier — pick a different name`,
+          severity: "error",
+        });
+        continue;
+      }
+      const c = compile(rhs);
+      if (!c.ok) {
+        errors.push({ line: ll.line, message: `let ${name}: ${c.error}`, severity: "error" });
+        continue;
+      }
+      stmts.push({ kind: "let", name, expr: c.expr, line: ll.line, source: rhs.trim() });
+      continue;
+    }
+
+    // `signal.long.if = …` / `signal.short.if = …`
+    const sigMatch = trimmed.match(/^signal\.(long|short)\.if\s*=\s*([\s\S]+)$/);
+    if (sigMatch) {
+      const [, sideRaw, rhs] = sigMatch;
+      const side = sideRaw as "long" | "short";
+      const c = compile(rhs);
+      if (!c.ok) {
+        errors.push({
+          line: ll.line,
+          message: `signal.${side}.if: ${c.error}`,
+          severity: "error",
+        });
+        continue;
+      }
+      stmts.push({ kind: "signal", side, expr: c.expr, line: ll.line, source: rhs.trim() });
+      continue;
+    }
+
+    // Generic `path = expr` (e.g. `rules.stopLossPoints = 8`,
+    // `filters.atr.min = 1.2`, `loadstrategy = …`). Caller (the engine)
+    // routes these into the existing line-based DSL machinery.
+    const eqIdx = trimmed.indexOf("=");
+    if (eqIdx < 0) {
+      errors.push({
+        line: ll.line,
+        message: `expected "let X = …", "signal.long.if = …", "signal.short.if = …", or "path = …"`,
+        severity: "error",
+      });
+      continue;
+    }
+    const path = trimmed.slice(0, eqIdx).trim();
+    const rhs = trimmed.slice(eqIdx + 1).trim();
+    if (path === "") {
+      errors.push({ line: ll.line, message: "missing path before '='", severity: "error" });
+      continue;
+    }
+    // params.X on LHS is a parse error — params are inferred from RHS
+    // usage and edited in the sidebar.
+    if (path.startsWith("params.") || path === "params") {
+      errors.push({
+        line: ll.line,
+        message: `params are inferred from script usage and edited in the sidebar — remove this assignment`,
+        severity: "error",
+      });
+      continue;
+    }
+    const c = compile(rhs);
+    if (!c.ok) {
+      // Generic `path = expr` lines that don't compile as strategy
+      // expressions — e.g. `filter.if = (cond, , )` whose 3-arg form is
+      // valid line-based-DSL syntax but invalid as a single Expr. The
+      // line-based parser (`parseBacktestScript`) handles these. We
+      // skip silently here so the strategy override doesn't get
+      // disabled by line-based-DSL syntax we can't handle.
+      continue;
+    }
+    stmts.push({ kind: "assign", path, expr: c.expr, line: ll.line, source: rhs.trim() });
+  }
+
+  // 3. Inline `let` bindings — substitute earlier let-bindings into later
+  //    expressions so the evaluator sees a flat AST per stmt. Mirrors how
+  //    `parseBacktestScript` handles `var` bindings.
+  const bindings = new Map<string, Expr>();
+  const flat: Stmt[] = [];
+  for (const s of stmts) {
+    const substituted = applyBindings(s.expr, bindings);
+    if (s.kind === "let") {
+      bindings.set(s.name, substituted);
+      flat.push({ ...s, expr: substituted });
+    } else {
+      flat.push({ ...s, expr: substituted });
+    }
+  }
+
+  // 4. Walk every stmt's AST collecting params.X references (deduped,
+  //    ordered by first appearance).
+  const paramRefs: string[] = [];
+  const seen = new Set<string>();
+  for (const s of flat) {
+    walkParamsRefs(s.expr, (name) => {
+      if (!seen.has(name)) {
+        seen.add(name);
+        paramRefs.push(name);
+      }
+    });
+  }
+
+  return { stmts: flat, errors, paramRefs };
+}
+
+/** Combine continuation lines into single logical statements. Returns
+ *  one entry per logical line, with `line` pointing at the FIRST physical
+ *  line (used for error reporting). Comments are stripped at the
+ *  physical-line level so the continuation logic only sees code.
+ *
+ *  Continuation rules: a logical line continues across `\n` when ANY of
+ *    (a) paren/bracket depth > 0,
+ *    (b) the last non-whitespace token of the buffer ends with a binary
+ *        operator / comma / open bracket / `=`, OR
+ *    (c) the NEXT non-empty physical line begins with a binary operator
+ *        / comma / closing bracket. This is what lets users write
+ *
+ *            let is_base = range_in_atr >= min
+ *                       && range_in_atr <= max
+ *
+ *        without trailing operators on the previous line. */
+function combineContinuationLines(text: string): Array<{ line: number; text: string }> {
+  const physical = text.split(/\r?\n/).map((s, i) => ({
+    line: i + 1,
+    code: stripInlineComment(s),
+  }));
+
+  function nextNonEmpty(idx: number): string | null {
+    for (let j = idx + 1; j < physical.length; j++) {
+      const t = physical[j].code.trim();
+      if (t !== "") return t;
+    }
+    return null;
+  }
+
+  function startsWithContinuationOp(line: string): boolean {
+    const c = line[0];
+    const c2 = line.slice(0, 2);
+    if (c2 === "&&" || c2 === "||" || c2 === "==" || c2 === "!=" || c2 === ">=" || c2 === "<=") {
+      return true;
+    }
+    return "+-*/%^,<>)]".includes(c);
+  }
+
+  const out: Array<{ line: number; text: string }> = [];
+  let buf = "";
+  let bufLine = -1;
+  let depth = 0;
+
+  for (let i = 0; i < physical.length; i++) {
+    const lineNo = physical[i].line;
+    const stripped = physical[i].code;
+    if (stripped.trim() === "" && depth === 0 && buf === "") continue;
+
+    for (const c of stripped) {
+      if (c === "(" || c === "[") depth++;
+      else if (c === ")" || c === "]") depth = Math.max(0, depth - 1);
+    }
+
+    if (buf === "") {
+      bufLine = lineNo;
+      buf = stripped;
+    } else {
+      buf += " " + stripped.trim();
+    }
+
+    const tail = buf.replace(/\s+$/, "");
+    const lastChar = tail.slice(-1);
+    const lastTwo = tail.slice(-2);
+    const continuesByOperator =
+      lastTwo === "&&" ||
+      lastTwo === "||" ||
+      lastTwo === "==" ||
+      lastTwo === "!=" ||
+      lastTwo === ">=" ||
+      lastTwo === "<=" ||
+      "+-*/%^,<>=!([".includes(lastChar);
+
+    const next = nextNonEmpty(i);
+    const continuesByLookahead = next !== null && startsWithContinuationOp(next);
+
+    if (depth > 0 || continuesByOperator || continuesByLookahead) {
+      continue;
+    }
+
+    out.push({ line: bufLine, text: buf });
+    buf = "";
+    bufLine = -1;
+  }
+  if (buf.trim() !== "") {
+    out.push({ line: bufLine, text: buf });
+  }
+  return out;
+}
+
+/** Strip `//` and `#` line comments — but keep them inside string literals.
+ *  This DSL doesn't currently support strings; if we add them later the
+ *  scanner here needs to grow a quote-state. For now, naive split works. */
+function stripInlineComment(line: string): string {
+  // Find the first `//` or `#` not preceded by another non-space.
+  // We don't need to handle quoted strings yet.
+  const slashIdx = line.indexOf("//");
+  const hashIdx = line.indexOf("#");
+  let cutIdx = -1;
+  if (slashIdx >= 0 && hashIdx >= 0) cutIdx = Math.min(slashIdx, hashIdx);
+  else if (slashIdx >= 0) cutIdx = slashIdx;
+  else if (hashIdx >= 0) cutIdx = hashIdx;
+  return cutIdx >= 0 ? line.slice(0, cutIdx) : line;
+}
+
+function walkParamsRefs(expr: Expr, visit: (name: string) => void): void {
+  switch (expr.kind) {
+    case "ident":
+      if (expr.name.startsWith("params.")) visit(expr.name);
+      return;
+    case "num":
+      return;
+    case "call":
+      for (const a of expr.args) walkParamsRefs(a, visit);
+      return;
+    case "unary":
+      walkParamsRefs(expr.arg, visit);
+      return;
+    case "binop":
+      walkParamsRefs(expr.lhs, visit);
+      walkParamsRefs(expr.rhs, visit);
+      return;
+    case "if":
+      walkParamsRefs(expr.cond, visit);
+      walkParamsRefs(expr.then, visit);
+      walkParamsRefs(expr.else, visit);
+      return;
+    case "index":
+      walkParamsRefs(expr.base, visit);
+      walkParamsRefs(expr.offset, visit);
+      return;
+  }
+}
+
+// ─── SeriesHandle — closure-based series-returning value ──────────────────
+
+const SERIES_SENTINEL = Symbol("strategy-evaluator-series");
+
+interface SeriesHandle {
+  __series: typeof SERIES_SENTINEL;
+  /** Value at (current bar - k). For k=0 returns the series at the
+   *  current evaluation bar. NaN when the offset is out of range. */
+  at: (k: number) => number;
+}
+
+function makeSeries(at: (k: number) => number): SeriesHandle {
+  return { __series: SERIES_SENTINEL, at };
+}
+
+function isSeries(v: unknown): v is SeriesHandle {
+  return (
+    typeof v === "object" &&
+    v !== null &&
+    "__series" in v &&
+    (v as { __series: unknown }).__series === SERIES_SENTINEL
+  );
+}
+
+// ─── Per-bar evaluation context ────────────────────────────────────────────
+
+interface BarEvalCtx {
+  bars: ReplayBar[];
+  barIndex: number;
+  params: Record<string, number>;
+  firingsLong: number[];
+  firingsShort: number[];
+  /** Lazy-evaluated `let` bindings — keyed by name. Cleared at the start
+   *  of each top-level bar AND at each inner iteration of `any_bar_in`. */
+  letCache: Map<string, number | SeriesHandle>;
+  letDefs: Map<string, Expr>;
+  /** Indicator series cache — keyed by `${name}:${period}` (or just
+   *  `name` for zero-arg families). Lazily populated on first reference;
+   *  shared across all bars in the run since the underlying values don't
+   *  depend on the current bar index. */
+  indicatorCache: Map<string, number[]>;
+  /** Indicator-bar view of ReplayBar — built once per run, reused. */
+  indicatorBars: IndicatorBar[];
+  /** Rolling extremum series cache — keyed by `${fn}:${period}`. */
+  rollingCache: Map<string, number[]>;
+  /** Session-level tick context for tick-resolution indicators. Undefined
+   *  when the session has no ticks attached — tick indicators then emit
+   *  all-NaN via `computeIndicatorSeries` and predicates fail-closed. */
+  tickCtx?: TickContext;
+  /** Lazy volume-profile cache shared across POC/VAH/VAL/VA_width/
+   *  dist_to_POC calls on the same window. Built once per run when
+   *  `tickCtx` is present; null otherwise. */
+  profileCache?: ProfileCache | null;
+}
+
+// ─── Public API ────────────────────────────────────────────────────────────
+
+export interface EvaluateOptions {
+  stmts: Stmt[];
+  paramOverrides: Record<string, number>;
+  bars: ReplayBar[];
+  /** Optional minimum bar index. The evaluator skips bars before this
+   *  index — useful when the engine wants to ensure indicator warmup
+   *  has completed before signal evaluation begins. Default: 0. */
+  minBarIndex?: number;
+  /** Optional session-level tick context. When present, tick-resolution
+   *  indicators (POC, VAH, VAL, trades_at_bid, vwap_tick, …) compute
+   *  against ticks; absent, those indicators emit all-NaN gracefully
+   *  (matching the entry-context evaluator's null-as-fail discipline so
+   *  scripts still parse and evaluate cleanly without ticks). The pair
+   *  `(sessionTicks, sessionTickRanges)` from `runBacktestForSession`
+   *  satisfies this directly when `sessionTickRanges.length === bars.length * 2`. */
+  tickCtx?: TickContext;
+}
+
+export interface AssignOverlay {
+  path: string;
+  /** AST and source text — the engine routes these into the existing
+   *  numericOverrides / filter overlay machinery. Evaluated once at
+   *  the first bar; rules-level expressions that vary per-trade are
+   *  handled by the existing per-trade resolver. */
+  expr: Expr;
+  source: string;
+}
+
+export interface EvaluateResult {
+  signals: BacktestSignal[];
+  /** Non-signal `assign` statements (rules.X, filters.X) — passed back
+   *  to the engine for routing into the line-based DSL machinery. */
+  assigns: AssignOverlay[];
+  /** Pre-resolved `let` bindings — each entry's body has had every
+   *  earlier let already substituted in (apply-then-store discipline,
+   *  see `applyBindings` doc in script-expr.ts). The engine inlines
+   *  these into filter.if / ontrade.print / rules.X / Optimize exprs
+   *  via `applyBindings` so a `filter.if = (let_var > 0, , )` resolves
+   *  correctly even though the entry-context evaluator has no native
+   *  let-binding lookup. Empty when the script has no lets or no
+   *  strategy-DSL signal block. */
+  letBindings: Map<string, Expr>;
+}
+
+/** Build the resolved-let-bindings map for a parsed strategy script.
+ *  Walks `let` statements in declaration order; for each one, applies
+ *  the bindings collected so far to the body before storing — so the
+ *  resulting map is independent (no entry references another by name)
+ *  and can be consumed by `applyBindings(targetExpr, bindings)` at any
+ *  later point with no cycle risk. Mirrors how the line-based DSL
+ *  parser handles `var X = expr` shadowing. */
+export function buildLetBindings(stmts: Stmt[]): Map<string, Expr> {
+  const bindings = new Map<string, Expr>();
+  for (const s of stmts) {
+    if (s.kind !== "let") continue;
+    bindings.set(s.name, applyBindings(s.expr, bindings));
+  }
+  return bindings;
+}
+
+/** Run the parsed strategy script over the bar array, producing signals.
+ *  Pure: no global state, no I/O. */
+export function evaluateStrategyScript(opts: EvaluateOptions): EvaluateResult {
+  const { stmts, paramOverrides, bars } = opts;
+  const minBarIndex = opts.minBarIndex ?? 0;
+
+  // Partition statements. `letDefs` keeps the raw Expr per name (used
+  // by the lazy per-bar resolver in `resolveIdent`) while `letBindings`
+  // is the pre-resolved cycle-free map exported back to the engine for
+  // AST substitution into filter.if / ontrade.print / rules.X exprs.
+  const letDefs = new Map<string, Expr>();
+  let signalLong: Expr | null = null;
+  let signalShort: Expr | null = null;
+  const assigns: AssignOverlay[] = [];
+
+  for (const s of stmts) {
+    if (s.kind === "let") {
+      letDefs.set(s.name, s.expr);
+    } else if (s.kind === "signal") {
+      if (s.side === "long") signalLong = s.expr;
+      else signalShort = s.expr;
+    } else {
+      assigns.push({ path: s.path, expr: s.expr, source: s.source });
+    }
+  }
+
+  const letBindings = buildLetBindings(stmts);
+
+  if (!signalLong && !signalShort) {
+    return { signals: [], assigns, letBindings };
+  }
+
+  // Build the per-run shared state. Preserve bid/ask volumes so any
+  // bid/ask-aware indicator routed through `computeIndicatorSeries`
+  // sees the same fields the entry-context evaluator does.
+  const indicatorBars: IndicatorBar[] = bars.map((b) => ({
+    bar_time: b.bar_time,
+    bar_open: b.bar_open,
+    bar_high: b.bar_high,
+    bar_low: b.bar_low,
+    bar_close: b.bar_close,
+    bar_volume: b.bar_volume ?? 0,
+    bar_volume_bid: b.bar_volume_bid,
+    bar_volume_ask: b.bar_volume_ask,
+  }));
+
+  // Tick context threading. Build a single ProfileCache up front when
+  // ticks are attached — POC(20)/VAH(20)/VAL(20) share the underlying
+  // profile build via this cache. Null when there are no ticks; tick
+  // indicators then degrade to all-NaN inside `computeIndicatorSeries`.
+  const tickCtx = opts.tickCtx;
+  const profileCache = tickCtx ? new ProfileCache(bars.length, tickCtx) : null;
+
+  const ctx: BarEvalCtx = {
+    bars,
+    barIndex: 0,
+    params: paramOverrides,
+    firingsLong: [],
+    firingsShort: [],
+    letCache: new Map(),
+    letDefs,
+    indicatorCache: new Map(),
+    indicatorBars,
+    rollingCache: new Map(),
+    tickCtx,
+    profileCache,
+  };
+
+  const signals: BacktestSignal[] = [];
+
+  // Round-8 diagnostic — per-bar let-dump for parity drilling. Reads
+  // `localStorage.debugDiagDump` once at entry. When set to a JSON
+  // object `{fromTime: "HH:mm", toTime: "HH:mm", onDate?: "yyyy-MM-dd"}`
+  // and the bar's timestamp falls in the window, after both signal
+  // expressions evaluate we dump every let binding's value to the
+  // browser console with a structured `DUMP[dashboard] ...` line.
+  // Diff this against NT8's matching output (DslStrategyBase's
+  // ShouldDumpThisBar / DumpSignalSubConditions) to find the first
+  // diverging let. No-op in non-browser contexts (parity-prep, tests).
+  const diagDump = readDiagDumpConfig();
+  // Letnames in declaration order — Map preserves insertion order.
+  // Used for the dump only; the per-bar resolver still uses letDefs.
+  const letNames = Array.from(letDefs.keys());
+
+  for (let i = minBarIndex; i < bars.length; i++) {
+    ctx.barIndex = i;
+    ctx.letCache.clear();
+    let firedLong = false;
+    if (signalLong) {
+      const v = evalNumber(signalLong, ctx);
+      if (Number.isFinite(v) && v !== 0) {
+        signals.push({ barIndex: i, direction: "Long" });
+        ctx.firingsLong.push(i);
+        firedLong = true;
+      }
+    }
+    // A bar can't fire both directions — matches the legacy strategies'
+    // explicit `continue` after a long firing.
+    if (!firedLong && signalShort) {
+      ctx.letCache.clear();
+      const v = evalNumber(signalShort, ctx);
+      if (Number.isFinite(v) && v !== 0) {
+        signals.push({ barIndex: i, direction: "Short" });
+        ctx.firingsShort.push(i);
+      }
+    }
+
+    // Per-bar diag dump — fires after the signal eval so the lets are
+    // already cached. We force-evaluate every let in declaration order
+    // (signal eval may short-circuit before resolving every let) so the
+    // dashboard's dump is directly comparable to NT8's, which evaluates
+    // all lets unconditionally on every bar.
+    if (diagDump && barInDiagWindow(bars[i].bar_time, diagDump)) {
+      // Clear letCache and resolve each let fresh — gives us the live
+      // value at offset 0 with all dependencies primed.
+      ctx.letCache.clear();
+      const dump: Record<string, number> = {};
+      for (const n of letNames) {
+        const def = letDefs.get(n);
+        if (!def) continue;
+        const val = evalValue(def, ctx);
+        const num = typeof val === "number" ? val : val.at(0);
+        dump[n] = num;
+        ctx.letCache.set(n, val);
+      }
+      const bar = bars[i];
+      // Normalize the timestamp to "yyyy-MM-ddTHH:mm:ss" — the first
+      // 19 chars of an ISO string. Drops fractional seconds and TZ
+      // offset so the diff tool can join exactly against NT8's
+      // ToString("yyyy-MM-ddTHH:mm:ss") output.
+      const tNorm = bar.bar_time.slice(0, 19);
+      const parts: string[] = [`bar=${i}`, `t=${tNorm}`, `close=${bar.bar_close}`];
+      for (const n of letNames) parts.push(`let.${n}=${dump[n]}`);
+      // eslint-disable-next-line no-console
+      console.log(`DUMP[dashboard] ${parts.join(" ")}`);
+    }
+  }
+
+  return { signals, assigns, letBindings };
+}
+
+/** Read the per-bar diag-dump config from localStorage. Used by the
+ *  round-8 parity drill — diff dashboard vs NT8 let-by-let on selected
+ *  bars to find the first diverging sub-component of a signal AND-chain.
+ *
+ *  The config shape is `{fromTime: "HH:mm", toTime: "HH:mm", onDate?: "yyyy-MM-dd"}`.
+ *  Set via devtools: `localStorage.setItem('debugDiagDump', JSON.stringify({fromTime: '07:55', toTime: '08:35', onDate: '2026-01-02'}))`.
+ *
+ *  Returns null when localStorage is unavailable (Node / SSR / tests),
+ *  the key is missing, or the JSON is malformed. The caller treats null
+ *  as "dump disabled" — zero overhead beyond a `=== null` check per bar. */
+function readDiagDumpConfig(): { fromMin: number; toMin: number; onDate: string | null } | null {
+  if (typeof window === "undefined") return null;
+  try {
+    const raw = window.localStorage?.getItem("debugDiagDump");
+    if (!raw) return null;
+    const cfg = JSON.parse(raw) as { fromTime?: string; toTime?: string; onDate?: string };
+    if (!cfg.fromTime || !cfg.toTime) return null;
+    const fromMin = parseHmm(cfg.fromTime);
+    const toMin = parseHmm(cfg.toTime);
+    if (fromMin < 0 || toMin < 0) return null;
+    return { fromMin, toMin, onDate: cfg.onDate ?? null };
+  } catch {
+    return null;
+  }
+}
+
+/** Parse "HH:mm" into minutes since midnight, or -1 on malformed input. */
+function parseHmm(hm: string): number {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(hm.trim());
+  if (!m) return -1;
+  const h = parseInt(m[1], 10);
+  const mi = parseInt(m[2], 10);
+  if (!Number.isFinite(h) || !Number.isFinite(mi)) return -1;
+  return h * 60 + mi;
+}
+
+/** Does the given bar_time fall in the configured diag window?
+ *  Wrap-around (fromMin > toMin) is supported and matches the time-
+ *  filter semantics in DslStrategyBase.TimeFilterPasses.
+ *
+ *  We parse `bar_time` as a STRING (not a Date) — pulling yyyy-MM-dd
+ *  from the first 10 chars and HH:mm from chars 11..16. This matches
+ *  exactly what the user sees in the dashboard's CSV (where bar_time
+ *  is rendered verbatim) and avoids TZ ambiguity that would otherwise
+ *  shift HH:mm depending on whether bar_time has a Z suffix or naive
+ *  local TZ. NT8's matching dump uses the same yyyy-MM-dd / HH:mm
+ *  format from `Time[0].ToString("...")`, so the two windows align. */
+function barInDiagWindow(
+  barTime: string,
+  cfg: { fromMin: number; toMin: number; onDate: string | null }
+): boolean {
+  if (cfg.onDate) {
+    if (barTime.slice(0, 10) !== cfg.onDate) return false;
+  }
+  // bar_time format: "yyyy-MM-ddTHH:mm:ss..." — chars 11..13 are HH,
+  // 14..16 are mm. Defensive parseInt accepts leading zeros.
+  const hh = parseInt(barTime.slice(11, 13), 10);
+  const mm = parseInt(barTime.slice(14, 16), 10);
+  if (!Number.isFinite(hh) || !Number.isFinite(mm)) return false;
+  const min = hh * 60 + mm;
+  if (cfg.fromMin <= cfg.toMin) return min >= cfg.fromMin && min <= cfg.toMin;
+  return min >= cfg.fromMin || min <= cfg.toMin;
+}
+
+// ─── Evaluation core ───────────────────────────────────────────────────────
+
+/** Evaluate an Expr to a number, coercing SeriesHandle to .at(0). */
+function evalNumber(expr: Expr, ctx: BarEvalCtx): number {
+  const v = evalValue(expr, ctx);
+  if (typeof v === "number") return v;
+  // SeriesHandle implicit-at-0 — `let x = high(20)` reads the rolling
+  // high at the current bar.
+  return v.at(0);
+}
+
+/** Evaluate to either number or SeriesHandle. Most callers want
+ *  `evalNumber`; `evalValue` is used by the index-node path which
+ *  needs to recognize series. */
+function evalValue(expr: Expr, ctx: BarEvalCtx): number | SeriesHandle {
+  switch (expr.kind) {
+    case "num":
+      return expr.value;
+    case "ident":
+      return resolveIdent(expr.name, ctx);
+    case "unary": {
+      const v = evalNumber(expr.arg, ctx);
+      if (expr.op === "-") return -v;
+      if (expr.op === "+") return v;
+      // Logical NOT
+      if (Number.isNaN(v)) return NaN;
+      return v === 0 ? 1 : 0;
+    }
+    case "binop": {
+      // Short-circuit logicals — same NaN-as-false discipline as
+      // script-expr.ts's evaluator.
+      if (expr.op === "&&") {
+        const a = evalNumber(expr.lhs, ctx);
+        if (!Number.isFinite(a) || a === 0) return 0;
+        const b = evalNumber(expr.rhs, ctx);
+        return Number.isFinite(b) && b !== 0 ? 1 : 0;
+      }
+      if (expr.op === "||") {
+        const a = evalNumber(expr.lhs, ctx);
+        if (Number.isFinite(a) && a !== 0) return 1;
+        const b = evalNumber(expr.rhs, ctx);
+        return Number.isFinite(b) && b !== 0 ? 1 : 0;
+      }
+      const a = evalNumber(expr.lhs, ctx);
+      const b = evalNumber(expr.rhs, ctx);
+      switch (expr.op) {
+        case "+": return a + b;
+        case "-": return a - b;
+        case "*": return a * b;
+        case "/": return b === 0 ? NaN : a / b;
+        case "%": return b === 0 ? NaN : a % b;
+        case "^": return Math.pow(a, b);
+        case ">": return Number.isNaN(a) || Number.isNaN(b) ? NaN : a > b ? 1 : 0;
+        case "<": return Number.isNaN(a) || Number.isNaN(b) ? NaN : a < b ? 1 : 0;
+        case ">=": return Number.isNaN(a) || Number.isNaN(b) ? NaN : a >= b ? 1 : 0;
+        case "<=": return Number.isNaN(a) || Number.isNaN(b) ? NaN : a <= b ? 1 : 0;
+        case "==": return Number.isNaN(a) || Number.isNaN(b) ? NaN : a === b ? 1 : 0;
+        case "!=": return Number.isNaN(a) || Number.isNaN(b) ? NaN : a !== b ? 1 : 0;
+      }
+      return NaN;
+    }
+    case "if": {
+      const c = evalNumber(expr.cond, ctx);
+      if (Number.isNaN(c)) return NaN;
+      return c !== 0 ? evalNumber(expr.then, ctx) : evalNumber(expr.else, ctx);
+    }
+    case "call":
+      return evalCall(expr.name, expr.args, ctx);
+    case "index":
+      return evalIndex(expr.base, expr.offset, ctx);
+  }
+}
+
+function resolveIdent(name: string, ctx: BarEvalCtx): number | SeriesHandle {
+  // 1. params.X
+  if (name.startsWith("params.")) {
+    const key = name.slice("params.".length);
+    const v = ctx.params[key];
+    return typeof v === "number" ? v : NaN;
+  }
+  // 2. signal.long / signal.short — sentinel idents only meaningful inside
+  //    bars_since(...). Bare references return NaN (caller's NaN-as-fail
+  //    discipline kicks in).
+  if (name === "signal.long" || name === "signal.short") {
+    return NaN;
+  }
+  // 3. `let` bindings — lazily evaluate and cache per bar.
+  if (ctx.letDefs.has(name)) {
+    const cached = ctx.letCache.get(name);
+    if (cached !== undefined) return cached;
+    const def = ctx.letDefs.get(name)!;
+    const v = evalValue(def, ctx);
+    ctx.letCache.set(name, v);
+    return v;
+  }
+  // 4. Current-bar OHLCV scalars.
+  const bar = ctx.bars[ctx.barIndex];
+  if (!bar) return NaN;
+  switch (name) {
+    case "open": return bar.bar_open;
+    case "high": return bar.bar_high;
+    case "low": return bar.bar_low;
+    case "close": return bar.bar_close;
+    case "volume": return bar.bar_volume ?? NaN;
+    case "bar_index": return ctx.barIndex;
+    case "range": return bar.bar_high - bar.bar_low;
+    case "body": return bar.bar_close - bar.bar_open;
+    case "upper_wick": return bar.bar_high - Math.max(bar.bar_open, bar.bar_close);
+    case "lower_wick": return Math.min(bar.bar_open, bar.bar_close) - bar.bar_low;
+    case "typical": return (bar.bar_high + bar.bar_low + bar.bar_close) / 3;
+    case "median_price": return (bar.bar_high + bar.bar_low) / 2;
+    case "weighted_close": return (bar.bar_high + bar.bar_low + 2 * bar.bar_close) / 4;
+    // Bid/ask order-flow scalars. NaN when the source granularity
+    // didn't supply them (plain `ohlcv`), so predicates fail-closed —
+    // matches the entry-context evaluator at script-expr.ts:856-877.
+    case "bar_volume_bid":
+      return bar.bar_volume_bid == null ? NaN : bar.bar_volume_bid;
+    case "bar_volume_ask":
+      return bar.bar_volume_ask == null ? NaN : bar.bar_volume_ask;
+    case "buy_volume":
+      return bar.bar_volume_ask == null ? NaN : bar.bar_volume_ask;
+    case "sell_volume":
+      return bar.bar_volume_bid == null ? NaN : bar.bar_volume_bid;
+    case "delta": {
+      if (bar.bar_volume_bid == null || bar.bar_volume_ask == null) return NaN;
+      return bar.bar_volume_ask - bar.bar_volume_bid;
+    }
+    case "delta_ratio": {
+      if (bar.bar_volume_bid == null || bar.bar_volume_ask == null) return NaN;
+      const total = bar.bar_volume_bid + bar.bar_volume_ask;
+      if (total <= 0) return NaN;
+      return (bar.bar_volume_ask - bar.bar_volume_bid) / total;
+    }
+    case "buy_pressure": {
+      if (
+        bar.bar_volume_ask == null ||
+        bar.bar_volume == null ||
+        !Number.isFinite(bar.bar_volume) ||
+        bar.bar_volume <= 0
+      ) {
+        return NaN;
+      }
+      return bar.bar_volume_ask / bar.bar_volume;
+    }
+  }
+  // 5. Bare-name indicator aliases (ATR, EMA20, ADX14, RSI14, etc.).
+  const aliasResolved = resolveBareIndicator(name, ctx);
+  if (aliasResolved !== null) return aliasResolved;
+  return NaN;
+}
+
+function resolveBareIndicator(name: string, ctx: BarEvalCtx): number | null {
+  // ATR / ATR14 → ATR(14). Period-suffixed forms recognized via regex.
+  if (name === "ATR" || name === "ATR14") return getIndicator("ATR", 14, ctx);
+  if (name === "ADX" || name === "ADX14") return getIndicator("ADX", 14, ctx);
+  if (name === "RSI" || name === "RSI14") return getIndicator("RSI", 14, ctx);
+  const m = name.match(/^(ATR|EMA|SMA|ADX|RSI)(\d+)$/);
+  if (m) {
+    const period = parseInt(m[2], 10);
+    if (Number.isFinite(period) && period > 0) {
+      return getIndicator(m[1], period, ctx);
+    }
+  }
+  return null;
+}
+
+function evalCall(name: string, args: Expr[], ctx: BarEvalCtx): number | SeriesHandle {
+  // ── Special forms (no eager arg eval) ───────────────────────────────
+  if (name === "any_bar_in") return evalAnyBarIn(args, ctx);
+  if (name === "bars_since") return evalBarsSince(args, ctx);
+
+  // ── Series-returning helpers ─────────────────────────────────────────
+  if (name === "high") return rollingExtremumSeries("high", args, ctx);
+  if (name === "low") return rollingExtremumSeries("low", args, ctx);
+
+  // ── Bar-distance helpers ────────────────────────────────────────────
+  // bars_since_high(N): bars elapsed since the highest bar.high in the
+  // last N bars (current bar EXCLUDED). Match the legacy v1 strategies'
+  // `i - highIdx` computation, where highIdx is the argmax of the
+  // forward-iterated window — first occurrence wins on ties.
+  if (name === "bars_since_high" || name === "bars_since_low") {
+    if (args.length !== 1) return NaN;
+    const period = Math.round(evalNumber(args[0], ctx));
+    if (!Number.isFinite(period) || period <= 0) return NaN;
+    const fn = name === "bars_since_high" ? "high" : "low";
+    const key = `bs_${fn}:${period}`;
+    let series = ctx.rollingCache.get(key);
+    if (!series) {
+      series = computeBarsSinceExtremum(ctx.bars, period, fn);
+      ctx.rollingCache.set(key, series);
+    }
+    if (ctx.barIndex < 0 || ctx.barIndex >= series.length) return NaN;
+    const v = series[ctx.barIndex];
+    return Number.isFinite(v) ? v : NaN;
+  }
+
+  // cross_up(a, b): true if the value of `a` was less than `b` on the
+  // PREVIOUS bar AND is greater than or equal to `b` on the CURRENT bar.
+  // Matches the conventional TradingView/PineScript semantics.
+  if (name === "cross_up" || name === "cross_down") {
+    if (args.length !== 2) return NaN;
+    // Evaluate at current bar.
+    const aNow = evalNumber(args[0], ctx);
+    const bNow = evalNumber(args[1], ctx);
+    // Evaluate at previous bar — shift the ctx and re-eval. Clear letCache
+    // because lets at bar i-1 may differ from bar i.
+    if (ctx.barIndex < 1) return 0;
+    const prevCtx: BarEvalCtx = {
+      ...ctx,
+      barIndex: ctx.barIndex - 1,
+      letCache: new Map(),
+    };
+    const aPrev = evalNumber(args[0], prevCtx);
+    const bPrev = evalNumber(args[1], prevCtx);
+    if (
+      !Number.isFinite(aNow) || !Number.isFinite(bNow) ||
+      !Number.isFinite(aPrev) || !Number.isFinite(bPrev)
+    ) {
+      return NaN;
+    }
+    if (name === "cross_up") {
+      return aPrev < bPrev && aNow >= bNow ? 1 : 0;
+    }
+    return aPrev > bPrev && aNow <= bNow ? 1 : 0;
+  }
+
+  // ── Math passthroughs (evaluate args, apply Math.X) ──────────────────
+  switch (name) {
+    case "abs": return Math.abs(evalNumber(args[0], ctx));
+    case "min": return Math.min(...args.map((a) => evalNumber(a, ctx)));
+    case "max": return Math.max(...args.map((a) => evalNumber(a, ctx)));
+    case "floor": return Math.floor(evalNumber(args[0], ctx));
+    case "ceil": return Math.ceil(evalNumber(args[0], ctx));
+    case "round": return Math.round(evalNumber(args[0], ctx));
+    case "sqrt": return Math.sqrt(evalNumber(args[0], ctx));
+    case "log": return Math.log(evalNumber(args[0], ctx));
+    case "exp": return Math.exp(evalNumber(args[0], ctx));
+    case "pow": return Math.pow(evalNumber(args[0], ctx), evalNumber(args[1], ctx));
+  }
+
+  // ── Indicator function calls — delegate to the canonical dispatch
+  //    shared with the entry-context evaluator. Covers ATR/EMA/SMA/ADX/
+  //    RSI plus the entire extended library (BB_*, MACD_*, Stoch_*,
+  //    Keltner_*, Supertrend, PSAR, Ichimoku_*, Aroon_*, Vortex*, DI*,
+  //    UO, Fisher, Choppiness, Ulcer, KVO, ForceIndex, EMV, Zscore,
+  //    LR*, R2, VWAP, OBV, AD, TR, NVI, PVI, AO, CVD) AND the new
+  //    tick-resolution indicators (POC/VAH/VAL/VA_width/dist_to_POC,
+  //    trades_at_bid, trades_at_ask, tick_imbalance, tick_count,
+  //    mean_trade_size, large_trade_count, vwap_tick).
+  //
+  // Zero-arg families (OBV, AD, TR, CVD, AO, NVI, PVI) take no period;
+  // route them with an empty args array. All others go through the
+  // standard "evaluate args, reject non-finite/non-positive, round
+  // unless fractional" pipeline that mirrors evalCallEntry in
+  // script-expr.ts (lines 1100-1118).
+  if (ZERO_ARG_INDICATORS.has(name)) {
+    return getIndicatorAt(name, [], ctx);
+  }
+  if (isKnownIndicator(name)) {
+    const allowFractional = FRACTIONAL_ARG_INDICATORS.has(name);
+    const evaluated: number[] = [];
+    for (const a of args) {
+      const v = evalNumber(a, ctx);
+      if (!Number.isFinite(v) || v <= 0) return NaN;
+      evaluated.push(allowFractional ? v : Math.round(v));
+    }
+    return getIndicatorAt(name, evaluated, ctx);
+  }
+
+  return NaN;
+}
+
+function evalIndex(base: Expr, offset: Expr, ctx: BarEvalCtx): number {
+  const k = Math.round(evalNumber(offset, ctx));
+  if (!Number.isFinite(k) || k < 0) return NaN;
+  // If base evaluates to a SeriesHandle, just call .at(k).
+  // Otherwise re-evaluate base in a context shifted by k bars (with a
+  // cleared letCache, since lets are per-bar). This handles bare OHLCV
+  // idents (`close[5]`), shifted indicator calls (`ATR(14)[5]`), and
+  // arbitrary expressions.
+  // Try the SeriesHandle path first by evaluating base in the current ctx.
+  const baseValue = evalValue(base, ctx);
+  if (isSeries(baseValue)) return baseValue.at(k);
+  // Scalar — re-evaluate at shifted bar.
+  if (ctx.barIndex - k < 0) return NaN;
+  const shiftedCtx: BarEvalCtx = {
+    ...ctx,
+    barIndex: ctx.barIndex - k,
+    letCache: new Map(),
+  };
+  return evalNumber(base, shiftedCtx);
+}
+
+// ─── Special forms ────────────────────────────────────────────────────────
+
+function evalAnyBarIn(args: Expr[], ctx: BarEvalCtx): number {
+  if (args.length !== 2) return NaN;
+  const N = Math.round(evalNumber(args[0], ctx));
+  if (!Number.isFinite(N) || N <= 0) return 0;
+  // For each k in 0..N-1, evaluate the condition at bar (barIndex - k)
+  // with a cleared letCache (full re-eval per inner bar — confirmed
+  // user decision). OR-reduce.
+  for (let k = 0; k < N; k++) {
+    const innerBar = ctx.barIndex - k;
+    if (innerBar < 0) break;
+    const innerCtx: BarEvalCtx = {
+      ...ctx,
+      barIndex: innerBar,
+      letCache: new Map(),
+    };
+    const v = evalNumber(args[1], innerCtx);
+    if (Number.isFinite(v) && v !== 0) return 1;
+  }
+  return 0;
+}
+
+function evalBarsSince(args: Expr[], ctx: BarEvalCtx): number {
+  if (args.length !== 1) return NaN;
+  const arg = args[0];
+  // Fast path — `bars_since(signal.long)` / `bars_since(signal.short)`.
+  if (arg.kind === "ident" && (arg.name === "signal.long" || arg.name === "signal.short")) {
+    const firings = arg.name === "signal.long" ? ctx.firingsLong : ctx.firingsShort;
+    if (firings.length === 0) return Number.POSITIVE_INFINITY;
+    const last = firings[firings.length - 1];
+    return ctx.barIndex - last;
+  }
+  // Generic: walk back from current bar until the condition was true.
+  // Cap at the array length to avoid pathological loops on never-true
+  // conditions.
+  for (let k = 0; k < ctx.bars.length; k++) {
+    const innerBar = ctx.barIndex - k;
+    if (innerBar < 0) break;
+    const innerCtx: BarEvalCtx = {
+      ...ctx,
+      barIndex: innerBar,
+      letCache: new Map(),
+    };
+    const v = evalNumber(arg, innerCtx);
+    if (Number.isFinite(v) && v !== 0) return k;
+  }
+  return Number.POSITIVE_INFINITY;
+}
+
+// ─── Series-returning helpers ─────────────────────────────────────────────
+
+/** Build a SeriesHandle for the rolling `period`-bar high or low,
+ *  EXCLUDING the current bar. Matches the legacy strategies' inner-loop
+ *  convention: `for j in (i-period..i-1): max(bars[j].high)`. The
+ *  precomputed array is cached on ctx.rollingCache. */
+function rollingExtremumSeries(
+  fn: "high" | "low",
+  args: Expr[],
+  ctx: BarEvalCtx
+): SeriesHandle {
+  if (args.length !== 1) {
+    return makeSeries(() => NaN);
+  }
+  // Period must be constant — evaluate at current bar (a let-binding-
+  // expressed period is fine because lets are resolved with current
+  // values). If the period is dynamic across bars, we'd need a different
+  // approach; that's a documented limitation.
+  const period = Math.round(evalNumber(args[0], ctx));
+  if (!Number.isFinite(period) || period <= 0) {
+    return makeSeries(() => NaN);
+  }
+  const key = `${fn}:${period}`;
+  let series = ctx.rollingCache.get(key);
+  if (!series) {
+    series = computeRollingExtremum(ctx.bars, period, fn);
+    ctx.rollingCache.set(key, series);
+  }
+  const seriesRef = series;
+  return makeSeries((k) => {
+    const idx = ctx.barIndex - k;
+    if (idx < 0 || idx >= seriesRef.length) return NaN;
+    const v = seriesRef[idx];
+    return Number.isFinite(v) ? v : NaN;
+  });
+}
+
+function computeRollingExtremum(
+  bars: ReplayBar[],
+  period: number,
+  fn: "high" | "low"
+): number[] {
+  const out = new Array<number>(bars.length).fill(NaN);
+  // out[i] = max/min of bars[i-period..i-1]. Naive O(N*P) — fine for
+  // typical lookbacks (5-200 bars) over moderate session sizes. Could
+  // be O(N) with a monotonic deque if profiling demands.
+  for (let i = period; i < bars.length; i++) {
+    if (fn === "high") {
+      let m = -Infinity;
+      for (let j = i - period; j < i; j++) {
+        const h = bars[j].bar_high;
+        if (h > m) m = h;
+      }
+      out[i] = m === -Infinity ? NaN : m;
+    } else {
+      let m = Infinity;
+      for (let j = i - period; j < i; j++) {
+        const l = bars[j].bar_low;
+        if (l < m) m = l;
+      }
+      out[i] = m === Infinity ? NaN : m;
+    }
+  }
+  return out;
+}
+
+/** Compute, for each bar i, the bar-distance back to the argmax/argmin
+ *  of bars[i-period..i-1]. Mirrors the legacy v1 strategies' inner-loop
+ *  convention: forward iteration with strict `>` / `<` comparison, so
+ *  ties go to the FIRST occurrence (= the LARGEST distance). NaN for
+ *  i < period (warmup). */
+function computeBarsSinceExtremum(
+  bars: ReplayBar[],
+  period: number,
+  fn: "high" | "low"
+): number[] {
+  const out = new Array<number>(bars.length).fill(NaN);
+  for (let i = period; i < bars.length; i++) {
+    let argIdx = i - period;
+    let m = fn === "high" ? bars[argIdx].bar_high : bars[argIdx].bar_low;
+    for (let j = i - period + 1; j < i; j++) {
+      const v = fn === "high" ? bars[j].bar_high : bars[j].bar_low;
+      if (fn === "high" ? v > m : v < m) {
+        m = v;
+        argIdx = j;
+      }
+    }
+    out[i] = i - argIdx;
+  }
+  return out;
+}
+
+// ─── Indicator dispatch ────────────────────────────────────────────────────
+
+/** Single-period entry point used by `resolveBareIndicator` for the
+ *  legacy bare aliases (`ATR`, `ATR14`, `EMA20`, `RSI14`, …). Forwards
+ *  to `getIndicatorAt` which handles all argument shapes. */
+function getIndicator(name: string, period: number, ctx: BarEvalCtx): number {
+  return getIndicatorAt(name, [period], ctx);
+}
+
+/** Resolve any indicator call against the per-run cache, computing the
+ *  full series on first request and indexing into it at the current bar.
+ *  The dispatch goes through `computeIndicatorSeries` from script-expr.ts
+ *  so the strategy DSL stays in lock-step with the entry-context DSL —
+ *  every named indicator there works here, including the tick-resolution
+ *  ones when `ctx.tickCtx` is populated. Cache key matches what the
+ *  entry-context evaluator builds via `indicatorKeyForCall`, so a future
+ *  shared cache (or precompute reuse) is straightforward. */
+function getIndicatorAt(
+  name: string,
+  rawArgs: number[],
+  ctx: BarEvalCtx,
+): number {
+  const args = applyArgDefaults(name, rawArgs);
+  const key = indicatorKeyForCall(name, args);
+  if (!key) return NaN;
+  let series = ctx.indicatorCache.get(key);
+  if (!series) {
+    const computed = computeIndicatorSeries(
+      name,
+      args,
+      ctx.indicatorBars,
+      ctx.tickCtx,
+      ctx.profileCache,
+    );
+    if (!computed) return NaN;
+    series = computed;
+    ctx.indicatorCache.set(key, series);
+  }
+  if (ctx.barIndex < 0 || ctx.barIndex >= series.length) return NaN;
+  const v = series[ctx.barIndex];
+  return typeof v === "number" && Number.isFinite(v) ? v : NaN;
+}
+
+// ─── Symbol catalog (for the editor) ──────────────────────────────────────
+
+/** Strategy-DSL-only symbols added on top of EXPR_SYMBOLS. The editor
+ *  merges these with EXPR_SYMBOLS for hover/autocomplete in strategy
+ *  scripts. */
+export const STRATEGY_SYMBOLS = [
+  ...EXPR_SYMBOLS,
+  {
+    name: "high",
+    kind: "call" as const,
+    signature: "high(N)",
+    description: "Rolling N-bar HIGH (max of bar.high over the last N bars, EXCLUDING the current bar). Returns a series — use `[k]` to look back, e.g. `high(20)[5]` is the 20-bar high evaluated 5 bars ago. Bare use coerces to the current-bar value.",
+    context: "entry" as const,
+  },
+  {
+    name: "low",
+    kind: "call" as const,
+    signature: "low(N)",
+    description: "Rolling N-bar LOW (min of bar.low over the last N bars, EXCLUDING the current bar). Returns a series — use `[k]` to look back. Bare use coerces to the current-bar value.",
+    context: "entry" as const,
+  },
+  {
+    name: "any_bar_in",
+    kind: "call" as const,
+    signature: "any_bar_in(N, condition)",
+    description: "True (1) if `condition` was true on ANY of the last N bars (current bar inclusive). The condition is evaluated with a fresh context per inner bar — `let` bindings, OHLCV, and indicator calls all rebind to the inner bar.",
+    context: "entry" as const,
+  },
+  {
+    name: "bars_since",
+    kind: "call" as const,
+    signature: "bars_since(condition)",
+    description: "Bars elapsed since `condition` was last true. Special case: `bars_since(signal.long)` / `bars_since(signal.short)` returns the distance to the most recent prior firing of THIS strategy's long/short signal. Returns +Infinity if the condition has never been true.",
+    context: "entry" as const,
+  },
+  {
+    name: "cross_up",
+    kind: "call" as const,
+    signature: "cross_up(a, b)",
+    description: "True (1) if `a` crossed up through `b` on the current bar — i.e. `a < b` on the previous bar AND `a >= b` on the current bar. Returns 0/1 or NaN if any input is missing.",
+    context: "entry" as const,
+  },
+  {
+    name: "cross_down",
+    kind: "call" as const,
+    signature: "cross_down(a, b)",
+    description: "True (1) if `a` crossed down through `b` on the current bar.",
+    context: "entry" as const,
+  },
+  {
+    name: "signal.long",
+    kind: "ident" as const,
+    description: "Sentinel identifier referring to the firings of this strategy's long signal. Only meaningful inside `bars_since(signal.long)`.",
+    context: "entry" as const,
+  },
+  {
+    name: "signal.short",
+    kind: "ident" as const,
+    description: "Sentinel identifier referring to the firings of this strategy's short signal. Only meaningful inside `bars_since(signal.short)`.",
+    context: "entry" as const,
+  },
+  {
+    name: "let",
+    kind: "operator" as const,
+    signature: "let name = expr",
+    description: "Bind a value to a name for use later in the script. Bindings are inlined at parse time AND lazily evaluated per bar — references rebind at each bar, so `let atr = ATR(14)` reads the current-bar ATR. Inside `any_bar_in`, lets re-evaluate at the inner bar.",
+    context: "entry" as const,
+  },
+  {
+    name: "signal.long.if",
+    kind: "operator" as const,
+    signature: "signal.long.if = <bool expression>",
+    description: "Defines when the strategy fires a LONG signal. Evaluated at every bar; truthy result fires (and records the firing for `bars_since(signal.long)`).",
+    context: "entry" as const,
+  },
+  {
+    name: "signal.short.if",
+    kind: "operator" as const,
+    signature: "signal.short.if = <bool expression>",
+    description: "Defines when the strategy fires a SHORT signal. A bar that fires LONG cannot also fire SHORT (long takes precedence — same convention as the legacy hardcoded strategies).",
+    context: "entry" as const,
+  },
+  {
+    name: ",",
+    kind: "operator" as const,
+    signature: "a, b, c",
+    description: "Sugar for `&&` at the same precedence — useful for vertical-stacking many gates. `a, b, c || d, e, f` parses as `(a && b && c) || (d && e && f)`. Inside function-call arg lists (`min(a, b)`), `,` keeps separator meaning.",
+    context: "entry" as const,
+  },
+  {
+    name: "[",
+    kind: "operator" as const,
+    signature: "expr[N]",
+    description: "Postfix index — look back N bars on a series-producing expression. `high(20)[5]` is the 20-bar high evaluated 5 bars ago. Bare OHLCV idents support indexing too: `close[5]` is the close 5 bars ago.",
+    context: "entry" as const,
+  },
+];

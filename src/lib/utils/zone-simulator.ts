@@ -1166,8 +1166,17 @@ function evaluateAllFilterIfs(
   const prints = new Map<string, number>();
   let verdict: "pass" | "reject" = "pass";
   let firstRejectIdx = -1;
+  // Direction of the current candidate trade — used to skip scoped
+  // directives that don't apply to this side. zone.direction is the
+  // canonical "Long" / "Short" string set by the strategy.
+  const isLong = ctx.zone.direction === "Long";
   for (let i = 0; i < directives.length; i++) {
     const d = directives[i];
+    // Per-direction filters auto-pass on the wrong side. The directive
+    // is silently skipped — no cond evaluation, no side effects, no
+    // rejection counted against this index.
+    if (d.scope === "long" && !isLong) continue;
+    if (d.scope === "short" && isLong) continue;
     const r = evaluateFilterIfDirective(d, ctx, warnings);
     for (const [k, v] of r.ruleOverrides) ruleOverrides.set(k, v);
     for (const [k, v] of r.prints) prints.set(k, v);

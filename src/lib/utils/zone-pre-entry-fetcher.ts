@@ -23,7 +23,13 @@
  */
 
 import { TradeZone, TradeZoneBar } from "@/types/trade-zone";
-import { createClient } from "@/lib/supabase/client";
+import { getClientStore, type Mode } from "@/lib/store";
+
+function activeMode(): Mode {
+  if (typeof window === "undefined") return "cloud";
+  const w = window as unknown as { __tradeDashMode?: Mode };
+  return w.__tradeDashMode ?? "cloud";
+}
 
 /** A row from replay_sessions — only the columns we use */
 interface ReplaySessionRow {
@@ -63,7 +69,7 @@ export async function fetchZonePreEntryBars(
   const result = new Map<number, TradeZoneBar[]>();
   if (zones.length === 0) return result;
 
-  const supabase = createClient();
+  const store = getClientStore(activeMode());
 
   // ─── Step 1: pull candidate replay sessions ─────────────────────────
   const instruments = new Set<string>();
@@ -76,19 +82,17 @@ export async function fetchZonePreEntryBars(
   }
   if (instruments.size === 0) return result;
 
-  const { data: sessionRows, error: sessionErr } = await supabase
-    .from("replay_sessions")
-    .select("id, instrument, timeframe, start_time, end_time")
-    .in("instrument", Array.from(instruments))
-    .in("timeframe", Array.from(timeframes));
-
-  if (sessionErr || !sessionRows) {
+  let sessions: ReplaySessionRow[];
+  try {
+    sessions = (await store.replay.listSessionsByInstrumentsAndTimeframes(
+      Array.from(instruments),
+      Array.from(timeframes)
+    )) as ReplaySessionRow[];
+  } catch (err) {
     // Soft-fail: chart should still render without pre-entry context
-    console.warn("[zone-pre-entry-fetcher] failed to load replay_sessions:", sessionErr);
+    console.warn("[zone-pre-entry-fetcher] failed to load replay_sessions:", err);
     return result;
   }
-
-  const sessions = sessionRows as ReplaySessionRow[];
 
   // ─── Step 2: match each zone to its containing session ──────────────
   interface ZoneMatch {
@@ -128,30 +132,29 @@ export async function fetchZonePreEntryBars(
       if (m.zone.start_time > latestStart) latestStart = m.zone.start_time;
     }
 
-    // Paginate to bypass Postgrest's 1000-row default (same pattern used by
-    // SimulatorPanel and zone-extension-fetcher).
-    const PAGE_SIZE = 1000;
+    // The store layer hides backend pagination. We pull bars in
+    // [epoch, latestStart) — the time range repo method takes inclusive
+    // bounds, so we use a tiny epoch start; the per-zone slice below
+    // re-filters strictly < zoneStart.
     let allBars: ReplayBarRow[] = [];
-    let offset = 0;
-    let hasMore = true;
-
-    while (hasMore) {
-      const { data, error: barsErr } = await supabase
-        .from("replay_bars")
-        .select("session_id, bar_time, bar_open, bar_high, bar_low, bar_close, bar_volume")
-        .eq("session_id", sessionId)
-        .lt("bar_time", latestStart)
-        .order("bar_time", { ascending: true })
-        .range(offset, offset + PAGE_SIZE - 1);
-
-      if (barsErr) {
-        console.warn("[zone-pre-entry-fetcher] failed to load replay_bars:", barsErr);
-        break;
-      }
-      const rows = (data as ReplayBarRow[]) ?? [];
-      allBars = allBars.concat(rows);
-      hasMore = rows.length === PAGE_SIZE;
-      offset += PAGE_SIZE;
+    try {
+      const rows = await store.replay.listBarsForSessionInTimeRange(
+        sessionId,
+        new Date(0).toISOString(),
+        latestStart
+      );
+      // Project to the columns this fetcher needs.
+      allBars = rows.map((r) => ({
+        session_id: r.session_id,
+        bar_time: r.bar_time,
+        bar_open: r.bar_open,
+        bar_high: r.bar_high,
+        bar_low: r.bar_low,
+        bar_close: r.bar_close,
+        bar_volume: r.bar_volume,
+      }));
+    } catch (err) {
+      console.warn("[zone-pre-entry-fetcher] failed to load replay_bars:", err);
     }
 
     // ─── Step 4: per-zone slice ───────────────────────────────────────

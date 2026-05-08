@@ -35,29 +35,17 @@
  *     and apply any future migration shim before returning to the caller.
  */
 
-import type { SupabaseClient } from "@supabase/supabase-js";
-import { createClient } from "@/lib/supabase/client";
+import { getClientStore, type Mode } from "@/lib/store";
 import { SimRules } from "./zone-simulator";
 import { PresetFilters } from "./backtest-presets";
 
-/** Snake-cased column names match the table layout in the matching
- *  migration (`backtest_dashboard_state`). */
-const TABLE = "backtest_dashboard_state";
-const ROW_ID = "singleton";
-
-/** Module-level singleton Supabase client.
- *
- *  `createBrowserClient` is meant to be reused — every call instantiates
- *  fresh auth/realtime stacks. The dashboard fires `pushDashboardState`
- *  on every settled input change, so without this cache we'd rebuild
- *  the client (and its websocket plumbing) hundreds of times per
- *  session, adding GC pressure and incidental main-thread work that
- *  showed up as variable-change lag. SSR-safe: the lazy getter only
- *  runs the constructor in the browser. */
-let cachedClient: SupabaseClient | null = null;
-function getClient(): SupabaseClient {
-  if (!cachedClient) cachedClient = createClient() as unknown as SupabaseClient;
-  return cachedClient;
+/** Read the active mode from the window-level global the ModeProvider
+ *  publishes on mount. Lets this plain util module pick the right
+ *  backend without converting to a hook. */
+function activeMode(): Mode {
+  if (typeof window === "undefined") return "cloud";
+  const w = window as unknown as { __tradeDashMode?: Mode };
+  return w.__tradeDashMode ?? "cloud";
 }
 
 /** Hard-disable flag flipped on a 4xx that means "table missing / RLS
@@ -127,14 +115,6 @@ export function generateClientId(): string {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 10)}`;
 }
 
-/** Snake_case row shape for upserts. Matches the migration columns. */
-interface DashboardStateRow {
-  id: string;
-  state: DashboardSyncState;
-  client_id: string | null;
-  updated_at?: string;
-}
-
 /**
  * Pull the singleton row and return its decoded state. Returns null if
  * the row is missing or the state is empty (`{}`) — callers should
@@ -145,41 +125,25 @@ export async function loadDashboardState(): Promise<DashboardSyncState | null> {
   if (typeof window === "undefined") return null;
   if (syncDisabled) return null;
   try {
-    const supabase = getClient();
-    const { data, error } = await supabase
-      .from(TABLE)
-      .select("state")
-      .eq("id", ROW_ID)
-      .maybeSingle();
-    if (error) {
-      // Missing table / not exposed via PostgREST → trip the disable
-      // flag so subsequent pushes don't keep slamming the network.
-      // 42P01 = relation does not exist; PGRST205 = schema cache miss.
-      const code = (error as { code?: string }).code ?? "";
-      if (code === "42P01" || code === "PGRST205") {
-        tripSyncDisabled(`load failed (${code}): ${error.message}`);
-      } else {
-        console.warn("[dashboard-sync] load failed:", error.message);
-      }
-      return null;
-    }
-    if (!data) return null;
-    const state = (data as { state: unknown }).state;
-    if (!state || typeof state !== "object") return null;
-    // Empty-object guard: a freshly-seeded singleton row holds {}, and
-    // we don't want to apply that as "version: undefined" garbage.
-    if (Object.keys(state as Record<string, unknown>).length === 0) return null;
-    return state as DashboardSyncState;
+    const store = getClientStore(activeMode());
+    return await store.dashboardState.load();
   } catch (err) {
-    console.warn("[dashboard-sync] load threw:", err);
+    // Missing table / not exposed via PostgREST → trip the disable
+    // flag so subsequent pushes don't keep slamming the network.
+    const message = err instanceof Error ? err.message : String(err);
+    if (message.includes("42P01") || message.includes("PGRST205")) {
+      tripSyncDisabled(`load failed: ${message}`);
+    } else {
+      console.warn("[dashboard-sync] load failed:", message);
+    }
     return null;
   }
 }
 
 /**
  * Upsert the singleton row with the new snapshot. Stamps the calling
- * `clientId` into `client_id` so the realtime payload fans out with
- * enough info for other tabs (and this tab) to recognize the source.
+ * `clientId` so the realtime payload fans out with enough info for
+ * other tabs (and this tab) to recognize the source.
  *
  * Fire-and-forget pattern: callers don't surface errors to the UI
  * since the local state already reflects the user's edit; the next
@@ -192,37 +156,22 @@ export async function pushDashboardState(
   if (typeof window === "undefined") return;
   if (syncDisabled) return;
   try {
-    const supabase = getClient();
-    const row: DashboardStateRow = {
-      id: ROW_ID,
-      state,
-      client_id: clientId,
-      updated_at: new Date().toISOString(),
-    };
-    const { error } = await supabase
-      .from(TABLE)
-      .upsert(row, { onConflict: "id" });
-    if (error) {
-      const code = (error as { code?: string }).code ?? "";
-      if (code === "42P01" || code === "PGRST205") {
-        tripSyncDisabled(`upsert failed (${code}): ${error.message}`);
-      } else {
-        console.warn("[dashboard-sync] upsert failed:", error.message);
-      }
-    }
+    const store = getClientStore(activeMode());
+    await store.dashboardState.push(state, clientId);
   } catch (err) {
-    console.warn("[dashboard-sync] upsert threw:", err);
+    const message = err instanceof Error ? err.message : String(err);
+    if (message.includes("42P01") || message.includes("PGRST205")) {
+      tripSyncDisabled(`upsert failed: ${message}`);
+    } else {
+      console.warn("[dashboard-sync] upsert failed:", message);
+    }
   }
 }
 
 /**
- * Subscribe to realtime UPDATE/INSERT events on the singleton row.
- * Calls `onUpdate(state)` whenever a DIFFERENT client (matched by
- * `client_id`) writes. Same-client echoes are filtered out so we
- * don't loop our own write back into our own state.
- *
- * Returns an unsubscribe function for useEffect cleanup. Idempotent —
- * removing the channel multiple times is harmless.
+ * Subscribe to realtime UPDATE events on the singleton row. Calls
+ * `onUpdate(state)` whenever a DIFFERENT client writes (echo-suppressed
+ * by the underlying repo). Returns an unsubscribe function.
  */
 export function subscribeToDashboardState(
   clientId: string,
@@ -230,44 +179,14 @@ export function subscribeToDashboardState(
 ): () => void {
   if (typeof window === "undefined") return () => {};
   if (syncDisabled) return () => {};
-  const supabase = getClient();
-  const channel = supabase
-    .channel("backtest-dashboard-state-realtime")
-    .on(
-      "postgres_changes",
-      {
-        // UPDATE only — INSERTs come from us seeding the singleton row,
-        // and DELETEs aren't expected. Narrowing the event mask cuts
-        // some realtime-side dispatch on every change.
-        event: "UPDATE",
-        schema: "public",
-        table: TABLE,
-        filter: `id=eq.${ROW_ID}`,
-      },
-      (payload) => {
-        const row = payload.new as DashboardStateRow | null;
-        if (!row || !row.state) return;
-        // Echo-suppress: skip writes we made ourselves.
-        if (row.client_id && row.client_id === clientId) return;
-        // Defensive shape guard — apply the same empty-state filter as
-        // loadDashboardState so a stray reset to {} doesn't blank UI.
-        if (
-          typeof row.state !== "object" ||
-          Object.keys(row.state as unknown as Record<string, unknown>).length === 0
-        ) {
-          return;
-        }
-        onUpdate(row.state as DashboardSyncState);
-      }
-    )
-    .subscribe((status, err) => {
-      if (err) console.warn("[dashboard-sync] subscribe error:", err);
-    });
-  return () => {
-    try {
-      supabase.removeChannel(channel);
-    } catch {
-      // ignore — channel teardown errors shouldn't fail unmount.
+  const store = getClientStore(activeMode());
+  return store.dashboardState.subscribe(clientId, (state) => {
+    if (
+      typeof state !== "object" ||
+      Object.keys(state as unknown as Record<string, unknown>).length === 0
+    ) {
+      return;
     }
-  };
+    onUpdate(state);
+  });
 }

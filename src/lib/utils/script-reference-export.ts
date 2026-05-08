@@ -34,7 +34,12 @@ import {
   serializeBacktestScript,
   type ScriptSchemaEntry,
 } from "./backtest-script";
-import { EXPR_SYMBOLS, EXPR_OPERATORS, SUMMARY_SYMBOLS } from "./script-expr";
+import {
+  EXPR_SYMBOLS,
+  EXPR_OPERATORS,
+  SUMMARY_SYMBOLS,
+  type ExampleEntry,
+} from "./script-expr";
 
 // ─── Formatters ─────────────────────────────────────────────────────────────
 
@@ -66,6 +71,48 @@ function md(text: string): string {
   return text.replace(/\|/g, "\\|").replace(/\n/g, " ");
 }
 
+/** Collect every worked example from a list of entries (schema rows or
+ *  expression symbols), tagging each with the entry's headline so an AI
+ *  reading the markdown still knows which example belongs to which
+ *  symbol/path. Skips entries without examples — returns an empty list
+ *  if nobody has any, so the caller can omit the whole "Examples for
+ *  this section" block when there's nothing to show.
+ *
+ *  Stays as a separate Markdown block (NOT crammed into a table cell)
+ *  because Markdown tables can't hold multi-line content — pipes get
+ *  escaped fine, but newlines collapse and the layout breaks. */
+function collectExamples(
+  entries: { headline: string; examples?: ExampleEntry[] }[]
+): { headline: string; ex: ExampleEntry }[] {
+  const out: { headline: string; ex: ExampleEntry }[] = [];
+  for (const e of entries) {
+    if (!e.examples) continue;
+    for (const ex of e.examples) out.push({ headline: e.headline, ex });
+  }
+  return out;
+}
+
+/** Render a section's worked examples as a markdown sub-block. Empty
+ *  string when there are no examples — caller can append unconditionally. */
+function formatExamplesBlock(
+  entries: { headline: string; examples?: ExampleEntry[] }[]
+): string {
+  const all = collectExamples(entries);
+  if (all.length === 0) return "";
+  const lines: string[] = [];
+  lines.push("**Examples for this section:**");
+  lines.push("");
+  for (const { headline, ex } of all) {
+    // Escape pipes so this still renders cleanly even if the snippet
+    // contains literal `|` characters (rare in the DSL but possible).
+    const snip = ex.snippet.replace(/\|/g, "\\|");
+    const scen = ex.scenario.replace(/\|/g, "\\|");
+    lines.push(`- \`${snip}\` — *${scen}*  _(${headline})_`);
+  }
+  lines.push("");
+  return lines.join("\n");
+}
+
 // ─── Section blocks ─────────────────────────────────────────────────────────
 
 /** Preamble — explains the DSL to the AI model in plain prose plus a
@@ -90,6 +137,27 @@ You are likely an AI reading this because a user has asked you to write or edit 
 7. **Never emit \`loadstrategy\` AFTER \`params.*\` lines you want to keep** — \`loadstrategy\` is hoisted to the top of execution and resets every \`params.*\` field to that strategy's defaults. Use it ONLY as the first non-comment line when switching strategies.
 8. **Numeric \`rules.*\` fields accept full expressions**, not just literals. Examples: \`rules.stopLossPoints = ATR * 1.5\`, \`rules.trailingStopPoints = max(ticks(4), ATR * 0.5)\`.
 9. **Use \`Optimize.X.Y(...)\` on \`rules.*\` numeric fields** when the user wants tuning rather than a fixed value. See the Optimize Directive section.
+10. **Match indicators to the available data granularity** — see the next section. Order-flow and tick-resolution indicators silently return NaN on plain OHLCV sessions, which makes filter.if conditions reject every trade. If the user asks for a strategy using POC / CVD / delta etc., remind them the session must be tick or tick_bidask granularity.
+
+## Session granularity & data dependencies
+
+Replay sessions can be sourced at four data resolutions. The session's \`granularity\` field determines which DSL identifiers and indicators return real values:
+
+| Granularity | OHLCV | bar_volume_bid / bar_volume_ask | Tick stream |
+|---|:-:|:-:|:-:|
+| \`ohlcv\` | yes | NO | NO |
+| \`ohlcv_bidask\` | yes | yes | NO |
+| \`tick\` | yes (re-aggregated) | NO (no side attribution) | yes (no side info) |
+| \`tick_bidask\` | yes (re-aggregated) | yes | yes (with side info) |
+
+Symbol families and their data requirements:
+
+- **Standard indicators** (ATR, EMA, RSI, MACD, Keltner, PSAR, Ichimoku, Aroon, Vortex, Choppiness, Zscore, LRSlope, VWAP(N), KVO, ForceIndex, etc.) — work on ANY granularity. Pure OHLCV math.
+- **Order-flow bar fields** (\`bar_volume_bid\`, \`bar_volume_ask\`, \`buy_volume\`, \`sell_volume\`, \`delta\`, \`delta_ratio\`, \`buy_pressure\`) and **cumulative delta** (\`CVD()\`) — require \`ohlcv_bidask\` or \`tick_bidask\`. Return NaN on plain \`ohlcv\` / \`tick\`.
+- **Volume profile** (\`POC(N)\`, \`VAH(N)\`, \`VAL(N)\`, \`VA_width(N)\`, \`dist_to_POC(N)\`) — require \`tick\` or \`tick_bidask\` (the profile is built from raw trade prices). Computed over a rolling N-bar window. NaN otherwise.
+- **Tick microstructure** (\`trades_at_bid(N)\`, \`trades_at_ask(N)\`, \`tick_imbalance(N)\`, \`tick_count(N)\`, \`mean_trade_size(N)\`, \`large_trade_count(N, threshold)\`, \`vwap_tick(N)\`) — require \`tick\` or \`tick_bidask\`. The bid/ask-attribution variants need \`tick_bidask\` specifically; without side info, \`trades_at_bid\` / \`trades_at_ask\` / \`tick_imbalance\` return all-zero counts.
+
+The dashboard exposes the active granularity in the session picker; assume the user's selected sessions support the indicators you reference unless they explicitly mention OHLCV-only data.
 
 ## Grammar
 
@@ -140,6 +208,11 @@ function buildSchemaSection(): string {
 
   let lastSection = "";
   let buffer: string[] = [];
+  // Collect entries per-section so we can emit a "Examples for this
+  // section" block right after each table — keeps each example
+  // adjacent to the schema rows it belongs to without breaking the
+  // table layout.
+  let sectionEntries: ScriptSchemaEntry[] = [];
 
   const flushSection = () => {
     if (buffer.length === 0) return;
@@ -149,7 +222,14 @@ function buildSchemaSection(): string {
     lines.push("|---|---|---|---|---|---|");
     for (const row of buffer) lines.push(row);
     lines.push("");
+    const exBlock = formatExamplesBlock(
+      sectionEntries.map((e) => ({ headline: e.path, examples: e.examples }))
+    );
+    if (exBlock) {
+      lines.push(exBlock);
+    }
     buffer = [];
+    sectionEntries = [];
   };
 
   for (const entry of SCRIPT_SCHEMA) {
@@ -173,6 +253,7 @@ function buildSchemaSection(): string {
     buffer.push(
       `| \`${entry.path}\` | ${entry.type} | \`${formatDefault(entry)}\` | ${rangeOrOptions} | ${strategies} | ${md(entry.description)} |`
     );
+    sectionEntries.push(entry);
   }
   flushSection();
 
@@ -194,6 +275,16 @@ function buildExpressionSection(): string {
   lines.push("rules.stopLossPoints = ATR * 1.5");
   lines.push("rules.trailingStopPoints = max(ticks(4), ATR * 0.5)");
   lines.push("rules.takeProfitPoints = (high - low) * 2");
+  lines.push("");
+  lines.push("# Order-flow gating (requires ohlcv_bidask / tick_bidask):");
+  lines.push("filter.if = delta_ratio > 0.2 && CVD > 0   // longs only on buy-aggression");
+  lines.push("");
+  lines.push("# Volume-profile context (requires tick / tick_bidask):");
+  lines.push("filter.if = close > VAL(20) && close < VAH(20)  // trade only inside value");
+  lines.push("rules.takeProfitPoints = abs(close - POC(20))   // target is the POC");
+  lines.push("");
+  lines.push("# Tick microstructure (requires tick / tick_bidask):");
+  lines.push("filter.if = large_trade_count(5, 50) >= 3       // saw recent block prints");
   lines.push("```");
   lines.push("");
 
@@ -217,17 +308,26 @@ function buildExpressionSection(): string {
       lines.push(`| \`${s.signature ?? s.name}\` | ${md(s.description)} |`);
     }
     lines.push("");
+    const exBlock = formatExamplesBlock(
+      rows.map((s) => ({
+        headline: s.signature ?? s.name,
+        examples: s.examples,
+      }))
+    );
+    if (exBlock) {
+      lines.push(exBlock);
+    }
   };
 
   renderTable(
     "Identifiers (bare names)",
     idents,
-    "Used without parentheses. Resolve to either a fixed-period indicator (e.g. ATR14, EMA200) or a field on the current entry bar (open, high, low, close, volume, bar_index, direction)."
+    "Used without parentheses. Three flavors: (a) fixed-period indicator aliases (e.g. ATR14, EMA200, RSI), (b) fields on the current entry bar (open, high, low, close, volume, bar_index, direction, plus bar-shape scalars range/body/typical/median_price/weighted_close), (c) order-flow bar fields and cumulative oscillators (bar_volume_bid, bar_volume_ask, buy_volume, sell_volume, delta, delta_ratio, buy_pressure, CVD, OBV, AD, AO, NVI, PVI, TR). Order-flow fields and CVD require ohlcv_bidask / tick_bidask granularity; otherwise NaN."
   );
   renderTable(
     "Function calls",
     calls,
-    "Parametric forms. The bare-suffix shortcuts (EMA20, EMA50, EMA200, ATR14, ADX14) are equivalent to calling these with the corresponding period."
+    "Parametric forms. The bare-suffix shortcuts (EMA20, EMA50, EMA200, ATR14, ADX14) are equivalent to calling these with the corresponding period. Volume-profile and tick-microstructure calls (POC, VAH, VAL, VA_width, dist_to_POC, trades_at_bid/ask, tick_imbalance, tick_count, mean_trade_size, large_trade_count, vwap_tick) compute over a rolling N-bar window and REQUIRE a tick / tick_bidask session — they return NaN on plain OHLCV."
   );
   renderTable(
     "Math passthroughs",
@@ -265,50 +365,72 @@ function buildSummarySection(): string {
     lines.push(`| \`${s.name}\` | ${md(s.description)} |`);
   }
   lines.push("");
+  const exBlock = formatExamplesBlock(
+    SUMMARY_SYMBOLS.map((s) => ({ headline: s.name, examples: s.examples }))
+  );
+  if (exBlock) {
+    lines.push(exBlock);
+  }
   return lines.join("\n");
 }
 
 /** The Optimize directive — hand-written narrative because the syntax
  *  is recursive enough that a flat symbol table doesn't capture it. */
 function buildOptimizeSection(): string {
-  return `## Optimize directive — online TPE tuning on \`rules.*\` numeric fields
+  return `## Optimize directive — let the dashboard pick numbers for you
 
-Replace a literal value with \`Optimize.<Objective>.<LookbackUnit>(lookback, min, max[, step])\` to have the dashboard search for the best value as the backtest runs. Uses a Tree-structured Parzen Estimator over the lookback window.
+Instead of writing a fixed value for a \`rules.*\` number, write \`Optimize.<Objective>.<LookbackUnit>(lookback, min, max[, step])\` and the dashboard will search for the best value WHILE the backtest runs. After enough trades happen to fill the window, every new trade triggers a quick search and uses the winner.
 
 ### Numeric form
 
 \`\`\`
-rules.stopLossPoints = Optimize.DailyEV.trades(30, 10, 40)
-rules.timedExitBars  = Optimize.Sharpe.bars(500, 5, 50, 1)
+rules.stopLossPoints     = Optimize.DailyEV.trades(30, 10, 40)
+rules.timedExitBars      = Optimize.Sharpe.bars(500, 5, 50, 1)
 rules.trailingStopPoints = Optimize.MinDrawdown.trades(50, ticks(4), ATR * 2)
 \`\`\`
 
-- \`lookback\` is the rolling window the optimizer scores candidates over.
-- \`min\` / \`max\` define the search range. Both can be expressions (\`ATR\`, \`ticks(4)\`, \`EMA20 * 0.1\`) — they are re-evaluated per trade.
-- \`step\` (optional) snaps the search grid for integer-like fields.
+- \`lookback\` — how far back the dashboard looks when judging which value is winning.
+- \`min\` / \`max\` — the smallest and biggest values to try. Can be expressions (\`ATR\`, \`ticks(4)\`, \`EMA20 * 0.1\`) — re-checked at each trade.
+- \`step\` (optional) — only try values in this jump size (good for integer-like fields).
 
-### Categorical form (parsed but NOT yet executed in this build)
+### Categorical form (coming soon)
 
 \`\`\`
 filters.trend.ema20 = Optimize.WinRate.trades(30, (with, against))
 \`\`\`
 
-### Objectives
+For non-numeric settings, list the choices in parentheses. The parser reads this today, but actually picking the choice at runtime isn't wired up yet — only number-Optimize on \`rules.*\` runs in this build.
 
-\`DailyEV\`, \`EV\`, \`Sharpe\`, \`MinDrawdown\`, \`WinRate\`, \`ProfitFactor\`. \`MinDrawdown\` is internally maximized as \`-maxDrawdown\` so smaller drawdowns score higher. \`ProfitFactor\` with no losers is capped at a large finite value to keep the math stable.
+### Objectives — what \"best\" means
 
-### Lookback units
+| Objective | Meaning |
+|---|---|
+| \`DailyEV\` | Most points per trading day. |
+| \`EV\` | Most points per trade. |
+| \`Sharpe\` | Smoothest, most consistent returns. |
+| \`MinDrawdown\` | Smallest worst-day pain. |
+| \`WinRate\` | Highest percentage of winners. |
+| \`ProfitFactor\` | Total wins ÷ total losses. |
 
-\`trades\` (count-based — last N completed trades), or one of \`bars\` / \`minutes\` / \`seconds\` / \`hours\` (time-based). Until the lookback fills, the field uses its literal default (warmup phase).
+### Lookback units — what \"window\" means
+
+\`trades\` counts completed trades (e.g. last 30 trades). \`bars\`, \`minutes\`, \`seconds\`, \`hours\` are time-based. While the window is still filling, the field uses its starting default (warmup phase).
 
 ### \`OptimizeAll\`
 
 \`\`\`
-OptimizeAll = false   # default — each Optimize directive runs independently
-OptimizeAll = true    # joint TPE search over all directives' multi-dim space
+OptimizeAll = false   # default — each Optimize line tunes on its own
+OptimizeAll = true    # all Optimize lines tune together as a team
 \`\`\`
 
-When \`true\`, every \`Optimize.*\` directive in the script must agree on the same objective.
+When \`true\`, every \`Optimize.*\` line in the script must measure the same thing (same objective).
+
+### \`Warmup\`
+
+\`\`\`
+Warmup = true    # default — keep the early warmup trades in your final stats
+Warmup = false   # hide warmup trades; final stats only count optimized ones
+\`\`\`
 
 `;
 }
@@ -320,18 +442,18 @@ When \`true\`, every \`Optimize.*\` directive in the script must agree on the sa
 function buildFilterIfSection(): string {
   return `## \`filter.if\` directive — conditional gating with action statements
 
-Per-trade conditional filter. Multiple \`filter.if\` lines AND together — every directive must produce a "pass" verdict for the trade to fire. Evaluated at the entry bar against the same context as \`ontrade.print\` (bar fields, indicators, tick helpers).
+Decides whether each trade should fire. If you have multiple \`filter.if\` lines, they ALL have to agree before the trade goes through. Each one is checked at the moment of entry, against indicators, bar fields, and tick helpers.
 
-### Single-arg form (gate only)
+### Single-arg form — just a yes/no gate
 
 \`\`\`
 filter.if = ATR(14) > 0.5
 filter.if = ADX > 25 && close > EMA20
 \`\`\`
 
-The expression must be a boolean (use comparisons \`> < >= <= == !=\` and logicals \`&& || !\`). Trade passes when the result is finite & non-zero. NaN (missing data, divide-by-zero) → fail.
+Write a yes/no expression using comparisons (\`> < >= <= == !=\`) and logicals (\`&& || !\`). The trade passes when the answer is yes. If the answer is "unknown" (because of missing data), the trade is rejected — fail-safe by default.
 
-### 3-arg form (with action statements)
+### 3-arg form — different actions for each branch
 
 \`\`\`
 filter.if = (cond, if_true_actions, if_false_actions)
@@ -339,9 +461,9 @@ filter.if = (cond, if_true_actions)              # if_false omitted = default re
 filter.if = (cond, , if_false_actions)           # if_true omitted = default pass
 \`\`\`
 
-**Verdict semantics — important:**
-- Slot omitted/empty → default verdict (true → pass, false → reject).
-- Slot defined → defining a slot REPLACES the default. Implicit verdict becomes PASS unless the slot contains an explicit \`reject\`. To preserve "reject and print on failure", you MUST write \`reject\` in the slot:
+**Important rule about empty slots:**
+- Empty slot → default verdict applies (true → pass, false → reject).
+- Filled slot → REPLACES the default. The implicit verdict becomes PASS unless the slot contains an explicit \`reject\`. So if you want to "reject AND print a message on failure", you MUST write \`reject\` in the slot:
 
 \`\`\`
 filter.if = (volume(14) > 100, , print("weak vol"); reject)
