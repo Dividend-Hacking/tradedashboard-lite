@@ -168,16 +168,30 @@ export async function POST(req: NextRequest) {
     );
   }
 
+  // Pick the right deploy script for the host OS. Mac/Linux run the bash
+  // script; Windows shells out to PowerShell with -ExecutionPolicy Bypass
+  // so an unsigned .ps1 still runs without asking the user to relax
+  // their global execution policy. Both scripts are equivalent in
+  // behavior — they just speak different shells.
+  const isWin = process.platform === "win32";
+  const deployCmd = isWin
+    ? "powershell -ExecutionPolicy Bypass -File .\\deploy-nt8.ps1"
+    : "./deploy-nt8.sh";
+  const manualDeployHint = isWin
+    ? "cd ninjatrader; .\\deploy-nt8.ps1"
+    : "cd ninjatrader && ./deploy-nt8.sh";
+
   // Optional auto-deploy step. Off by default — deploying takes a couple
   // seconds and the user might want to batch multiple preset conversions
-  // before pushing to the VM. When opted in, run deploy-nt8.sh and bubble
-  // up its stdout/stderr so the UI can surface any rsync issues.
+  // before pushing. When opted in, run the platform-appropriate deploy
+  // script and bubble up its stdout/stderr so the UI can surface any
+  // copy issues.
   let deployOutput: string | null = null;
   let deployError: string | null = null;
   if (body.deploy) {
     try {
       const { stdout, stderr } = await execAsync(
-        "./deploy-nt8.sh",
+        deployCmd,
         { cwd: path.join(repoRoot, "ninjatrader") }
       );
       deployOutput = stdout + (stderr ? `\n${stderr}` : "");
@@ -198,7 +212,7 @@ export async function POST(req: NextRequest) {
     nextSteps: body.deploy
       ? deployError
         ? [
-            "Deploy failed — check deployError. Run `cd ninjatrader && ./deploy-nt8.sh` manually.",
+            `Deploy failed — check deployError. Run \`${manualDeployHint}\` manually.`,
             "Press F5 in NT8 NinjaScript Editor to compile.",
             `Pick "${className}" in NT8 Strategy Analyzer.`,
           ]
@@ -207,7 +221,7 @@ export async function POST(req: NextRequest) {
             `Pick "${className}" in NT8 Strategy Analyzer.`,
           ]
       : [
-          "Run `cd ninjatrader && ./deploy-nt8.sh`",
+          `Run \`${manualDeployHint}\``,
           "Press F5 in NT8 NinjaScript Editor to compile.",
           `Pick "${className}" in NT8 Strategy Analyzer.`,
         ],
