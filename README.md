@@ -21,9 +21,19 @@ Supabase project required. Cloud mode (Supabase) is opt-in via the
 
 ## Prerequisites
 
-- Node.js 20+
-- (Optional) NinjaTrader 8 on a Windows machine — required for live
-  streaming, automated execution, and tick-data downloads.
+- Node.js 20+ (https://nodejs.org).
+- C++ build tools (only because `better-sqlite3` is a native module):
+  - **Windows**: install **Visual Studio Build Tools** with the
+    *Desktop development with C++* workload selected
+    (https://visualstudio.microsoft.com/downloads/, scroll down to
+    "Tools for Visual Studio"). The older `windows-build-tools` npm
+    package is deprecated and no longer works on Node 18+.
+  - **macOS**: `xcode-select --install`.
+- (Optional) NinjaTrader 8 — required for live streaming, automated
+  execution, and tick-data downloads. **Launch NT8 once and let it
+  finish its first compile** before deploying our AddOns: NT8 only
+  creates the `Documents\NinjaTrader 8\bin\Custom\` subfolders during
+  that initial run, and the deploy step writes into them.
 - (Optional) A free Supabase project — only if you want to share state
   across machines.
 
@@ -62,15 +72,33 @@ This copies every AddOn, Indicator, DrawingTool, Strategy, and preset
 JSON into the NT8 user folder via Parallels' shared `Documents`. After
 it finishes, press **F5** in the NinjaScript Editor to compile.
 
-**Windows (running NT8 natively):** copy these into
-`Documents\NinjaTrader 8\bin\Custom\`:
+**Windows (running NT8 natively):**
 
-- `ninjatrader/AddOns/*.cs` and `ninjatrader/AddOns/mode.example.json`
+```powershell
+cd ninjatrader
+.\deploy-nt8.ps1
+```
+
+Same behavior as the Mac script — copies everything into
+`%USERPROFILE%\Documents\NinjaTrader 8\bin\Custom\` and seeds
+`mode.json` on first run. If PowerShell blocks the script with an
+execution-policy error, run it once with:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\deploy-nt8.ps1
+```
+
+After it finishes, press **F5** in the NinjaScript Editor to compile.
+
+**Manual fallback (Windows, if you'd rather not run the script):** copy
+these into `Documents\NinjaTrader 8\bin\Custom\`:
+
+- `ninjatrader\AddOns\*.cs` and `ninjatrader\AddOns\mode.example.json`
   → `bin\Custom\AddOns\` (rename `mode.example.json` to `mode.json`)
-- `ninjatrader/Indicators/*.cs` → `bin\Custom\Indicators\`
-- `ninjatrader/DrawingTools/*.cs` → `bin\Custom\DrawingTools\`
-- `ninjatrader/strategies/*.cs` → `bin\Custom\Strategies\`
-- `ninjatrader/strategies/presets/*.json` → `bin\Custom\presets\`
+- `ninjatrader\Indicators\*.cs` → `bin\Custom\Indicators\`
+- `ninjatrader\DrawingTools\*.cs` → `bin\Custom\DrawingTools\`
+- `ninjatrader\strategies\*.cs` → `bin\Custom\Strategies\`
+- `ninjatrader\strategies\presets\*.json` → `bin\Custom\presets\`
 
 Then press **F5** in the NinjaScript Editor to compile.
 
@@ -78,16 +106,23 @@ Then press **F5** in the NinjaScript Editor to compile.
 
 The NT8 AddOns poll `mode.json` every 15 s for the dashboard URL.
 
-1. Find the dashboard's reachable IP from NT8:
-   - Mac/Parallels: usually `http://10.211.55.2:3000` (the Parallels
-     Shared host gateway).
-   - Windows: `http://localhost:3000` if the dashboard runs on the same
-     box; otherwise the dashboard host's LAN IP.
+1. Find the dashboard's reachable URL from NT8:
+   - **Same Windows PC for both NT8 and the dashboard** — paste
+     `http://localhost:3000`.
+   - **Mac/Parallels** — usually `http://10.211.55.2:3000` (the
+     Parallels Shared host gateway).
+   - **Separate machines on a LAN** — the dashboard host's LAN IP, e.g.
+     `http://192.168.1.50:3000`. The dev server already binds
+     `0.0.0.0:3000`, so LAN access works without extra config (just
+     allow port 3000 through the firewall).
 2. Open `/settings` in the dashboard, paste the URL into the
    "NT8 endpoint" field, and click Save. The dashboard mirrors
    `mode.json` to NT8 automatically; AddOns pick up the new URL within
    ~15 s.
-3. NT8's Output tab will show the AddOns connecting and streaming.
+3. **Verify**: in NT8 → Control Center → New → NinjaScript Output. You
+   should see log lines from `ModeConfig` / `LiveBridge` /
+   `DataExporter` reporting the endpoint they read. Once those show
+   your URL, the link is live.
 
 ## Cloud mode (opt-in, optional)
 
@@ -159,6 +194,7 @@ scripts/
 
 ninjatrader/
   deploy-nt8.sh        Mac/Parallels one-shot deploy
+  deploy-nt8.ps1       Windows PowerShell one-shot deploy
   AddOns/              LiveBridge, DslRuntime, ModeConfig, etc.
   Indicators/          Custom NT8 indicators
   DrawingTools/        Custom NT8 drawing tools
@@ -178,14 +214,25 @@ backtests/
   `~/.tradedashboard/local.db` is unwritable — verify your home
   directory is writable.
 - **Native module error on `npm install`** (`better-sqlite3` build
-  failure) → install your platform's C++ build tools
-  (`xcode-select --install` on macOS;
-  `npm install --global windows-build-tools` on Windows) and retry.
+  failure) → install C++ build tools as described under
+  [Prerequisites](#prerequisites), delete `node_modules` and
+  `package-lock.json`, then re-run `npm install`. On Windows, restart
+  PowerShell after installing Build Tools so `cl.exe` is on PATH.
+- **`.\deploy-nt8.ps1` blocked with "running scripts is disabled on
+  this system"** → run it once with `powershell -ExecutionPolicy
+  Bypass -File .\deploy-nt8.ps1`, or set per-user policy with
+  `Set-ExecutionPolicy -Scope CurrentUser RemoteSigned`.
+- **`deploy-nt8.sh` / `deploy-nt8.ps1` errors with "NinjaTrader custom
+  folders not found"** → NT8 hasn't been compiled at least once. Open
+  NT8 → NinjaScript Editor → F5, then re-run the script. (Mac users
+  also confirm Parallels Documents mirroring is enabled.)
 - **NT8 AddOns can't reach the dashboard** → confirm the URL in
   `/settings` matches what NT8 can reach. From the NT8 box, open the
-  URL in a browser; if it doesn't load, check firewall rules. The dev
-  server binds `0.0.0.0:3000` so LAN/VM access works out of the box.
-- **`./deploy-nt8.sh` errors with "NinjaTrader custom folders not
-  found"** → either Parallels Documents mirroring is off or NT8 hasn't
-  been compiled at least once. Open NT8 → NinjaScript Editor → F5 once
-  to create the folders, then re-run the script.
+  URL in a browser; if it doesn't load, check Windows Firewall (allow
+  inbound on port 3000) or your router. The dev server binds
+  `0.0.0.0:3000` so LAN/VM access works once the firewall lets it
+  through.
+- **NT8 Output tab is silent after a deploy** → AddOns weren't loaded.
+  Make sure F5 compiled cleanly (Output tab shows no red errors). If a
+  recompile fails because NT8 is still holding old DLLs, close all NT8
+  charts/strategies, recompile, reopen.
