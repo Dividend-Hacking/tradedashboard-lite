@@ -91,6 +91,7 @@ import {
   type BacktestRunResult,
   type IndicatorConfig,
   DEFAULT_INDICATOR_CONFIG,
+  MAX_AUTO_PRE_ENTRY_BARS,
 } from "@/lib/utils/backtest-engine";
 import {
   DEFAULT_OPTIMIZE_CONFIG,
@@ -101,16 +102,6 @@ import {
 import {
   runOptimizeChunked,
   runAtrAdjustOptimizeChunked,
-  runTimeOptimizeChunked,
-  optimizeAdxInWorker,
-  optimizeAtrInWorker,
-  optimizeTrendInWorker,
-  optimizeBollingerInWorker,
-  optimizeRsiInWorker,
-  optimizeBbWidthInWorker,
-  optimizeMaDistanceInWorker,
-  optimizeVolumeInWorker,
-  optimizeAdxTrendInWorker,
   runStrategyParamOptimizeInWorker,
 } from "@/lib/utils/optimizer-worker-runner";
 import { OptimizeConfigModal } from "./optimize-config-modal";
@@ -178,10 +169,8 @@ import {
 import {
   BacktestPreset,
   PresetFilters,
+  DEFAULT_PRESET_FILTERS,
   BollingerPos,
-  MaType,
-  MaDistanceMode,
-  AdxTrendMode,
   TimeWindow,
   loadPresets,
   createPreset,
@@ -276,6 +265,75 @@ function resolveParamsForPersistence(
     resolved[key] = crossDefault ?? 0;
   }
   return resolved;
+}
+
+/**
+ * Convert the parser's `BacktestConfig.filters` shape into the
+ * `PresetFilters` shape the simulator pipeline (contextFilteredZones /
+ * timeFilteredZones) and persistence layer expect.
+ *
+ * Two shape differences to bridge:
+ *   1. `time.windows` is `string[]` ("HH:MM-HH:MM") on BacktestConfig but
+ *      `TimeWindow[]` ({from,to}) on PresetFilters.
+ *   2. `trend.ema20`/`ema200` keys on BacktestConfig become
+ *      `trend.ema20Mode`/`ema200Mode` on PresetFilters.
+ *
+ * Every other sub-block is a straight spread over `DEFAULT_PRESET_FILTERS`
+ * so partial scripts (omitted blocks) inherit defaults instead of `undefined`.
+ *
+ * Pulled out of the component because it's pure — and so handleApplyScript
+ * can call it once per Apply (no re-parse, no double work). The previous
+ * useMemo-on-appliedScriptText version had to re-parse the entire script
+ * every Apply, doubling the per-edit cost.
+ */
+function convertCfgFiltersToPresetFilters(
+  cfgFilters: BacktestConfig["filters"] | undefined
+): PresetFilters {
+  if (!cfgFilters) return DEFAULT_PRESET_FILTERS;
+  const f = cfgFilters;
+  const parsedWindows: TimeWindow[] = [];
+  if (Array.isArray(f.time?.windows)) {
+    for (const raw of f.time.windows) {
+      if (typeof raw !== "string") continue;
+      const dashIdx = raw.indexOf("-");
+      if (dashIdx <= 0) continue;
+      const from = raw.slice(0, dashIdx).trim();
+      const to = raw.slice(dashIdx + 1).trim();
+      if (from && to) parsedWindows.push({ from, to });
+    }
+  }
+  const windows = parsedWindows.length > 0
+    ? parsedWindows
+    : DEFAULT_PRESET_FILTERS.time.windows.map((w) => ({ from: w.from, to: w.to }));
+
+  type TrendMode = "any" | "with" | "against";
+  return {
+    time: {
+      enabled: f.time?.enabled ?? DEFAULT_PRESET_FILTERS.time.enabled,
+      from: f.time?.from ?? windows[0]?.from ?? DEFAULT_PRESET_FILTERS.time.from,
+      to: f.time?.to ?? windows[0]?.to ?? DEFAULT_PRESET_FILTERS.time.to,
+      windows,
+    },
+    adx: { ...DEFAULT_PRESET_FILTERS.adx, ...(f.adx ?? {}) },
+    atr: { ...DEFAULT_PRESET_FILTERS.atr, ...(f.atr ?? {}) },
+    trend: {
+      ...DEFAULT_PRESET_FILTERS.trend,
+      enabled: f.trend?.enabled ?? DEFAULT_PRESET_FILTERS.trend.enabled,
+      ema20Mode: (f.trend?.ema20 as TrendMode | undefined) ?? DEFAULT_PRESET_FILTERS.trend.ema20Mode,
+      ema200Mode: (f.trend?.ema200 as TrendMode | undefined) ?? DEFAULT_PRESET_FILTERS.trend.ema200Mode,
+      fastPeriod: f.trend?.fastPeriod ?? DEFAULT_PRESET_FILTERS.trend.fastPeriod,
+      fastType: f.trend?.fastType ?? DEFAULT_PRESET_FILTERS.trend.fastType,
+      slowPeriod: f.trend?.slowPeriod ?? DEFAULT_PRESET_FILTERS.trend.slowPeriod,
+      slowType: f.trend?.slowType ?? DEFAULT_PRESET_FILTERS.trend.slowType,
+    },
+    bollinger: { ...DEFAULT_PRESET_FILTERS.bollinger, ...(f.bollinger ?? {}) },
+    bbWidth: { ...DEFAULT_PRESET_FILTERS.bbWidth, ...(f.bbWidth ?? {}) },
+    maDistance: { ...DEFAULT_PRESET_FILTERS.maDistance, ...(f.maDistance ?? {}) },
+    volume: { ...DEFAULT_PRESET_FILTERS.volume, ...(f.volume ?? {}) },
+    rsi: { ...DEFAULT_PRESET_FILTERS.rsi, ...(f.rsi ?? {}) },
+    adxTrend: { ...DEFAULT_PRESET_FILTERS.adxTrend, ...(f.adxTrend ?? {}) },
+    delta: { ...DEFAULT_PRESET_FILTERS.delta, ...(f.delta ?? {}) },
+  };
 }
 
 export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
@@ -451,116 +509,90 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
   const [monteCarloRunning, setMonteCarloRunning] =
     useState<MonteCarloHorizon | null>(null);
 
-  // ─── Time-of-day filter ──────────────────────────────────────────
-  // Same shape as the risk simulator's time filter — narrow synthetic
-  // signals to those whose entry bar falls within [timeFrom, timeTo]
-  // (HH:MM, supports wrap across midnight). Applied AFTER the backtest
-  // engine fires signals, so toggling time on/off doesn't re-run the
-  // strategy generator (free) — it only re-runs the cheap simulator pass
-  // over the surviving synthetic zones.
-  const [timeFilterEnabled, setTimeFilterEnabled] = useState(false);
-  // Multi-window time filter — each window is OR'd against the others
-  // (bar passes when its time falls in ANY window). Default to a single
-  // 09:30–16:00 RTH window so existing presets behave the same; users
-  // add more rows via the "+ Add window" button.
-  const [timeWindows, setTimeWindows] = useState<TimeWindow[]>([
-    { from: "09:30", to: "16:00" },
-  ]);
-  // Defensive view of windows[0] for the legacy preset shape (`from`/`to`
-  // are kept on PresetFilters for backwards compat). Reading these
-  // through derived values means we never have to keep timeFrom/timeTo
-  // state in sync separately.
+  // ─── Filter state — derived from the applied script ──────────────
+  // The DSL editor is the single source of truth. `appliedFilters` is
+  // populated by `handleApplyScript` after it parses the editor — the
+  // converted PresetFilters block is committed via setAppliedFilters so
+  // we don't re-parse the script in a memo on every render. The per-
+  // field consts below destructure it for the simulator pipeline
+  // (`contextFilteredZones` / `timeFilteredZones`) and for persistence
+  // (`currentFilters`, NT8 export, auto-trader sync). On first mount
+  // before any Apply has run, `DEFAULT_PRESET_FILTERS` provides every
+  // default — same values the deleted UI useStates used to seed.
+  //
+  // `appliedScriptText` is hoisted here too (originally lived next to
+  // the rest of the script editor state) so handleSavePreset and
+  // dashboardSnapshot — both declared above the script-editor state —
+  // can read the snapshot directly.
+  const [appliedScriptText, setAppliedScriptText] = useState<string>("");
+  const [appliedFilters, setAppliedFilters] = useState<PresetFilters>(
+    DEFAULT_PRESET_FILTERS
+  );
+  type TrendMode = "any" | "with" | "against";
+
+  const timeFilterEnabled = appliedFilters.time.enabled;
+  const timeWindows = appliedFilters.time.windows;
   const timeFrom = timeWindows[0]?.from ?? "09:30";
   const timeTo = timeWindows[0]?.to ?? "16:00";
 
-  // ─── Context filters (ADX / ATR / Trend / Bollinger) ─────────────
-  // Same shape and defaults as the risk simulator's context filters. They
-  // read the ctx_* fields the backtest engine now stamps onto each
-  // synthetic zone — so toggling them on filters out signals whose
-  // entry-bar indicator state doesn't match. Each filter is independent
-  // and starts OFF; defaults on enable are the widest possible range so
-  // users narrow from there. Zones with NULL values for the relevant
-  // ctx_* field are dropped (strict: if you ask to filter by X, you can't
-  // keep rows without X).
-  const [adxFilterEnabled, setAdxFilterEnabled] = useState(false);
-  const [adxMin, setAdxMin] = useState(0);
-  const [adxMax, setAdxMax] = useState(100);
-  // Configurable Wilder ADX period — was hardcoded 14, now user-tunable.
-  const [adxPeriod, setAdxPeriod] = useState(14);
+  const adxFilterEnabled = appliedFilters.adx.enabled;
+  const adxMin = appliedFilters.adx.min;
+  const adxMax = appliedFilters.adx.max;
+  const adxPeriod = appliedFilters.adx.period;
 
-  const [atrFilterEnabled, setAtrFilterEnabled] = useState(false);
-  const [atrMin, setAtrMin] = useState(0);
-  const [atrMax, setAtrMax] = useState(100);
-  // Configurable Wilder ATR period — drives BOTH this filter AND the
-  // ± ATR adjustment math on SL/TP/Trail/BE in zone-simulator.
-  const [atrPeriod, setAtrPeriod] = useState(14);
+  const atrFilterEnabled = appliedFilters.atr.enabled;
+  const atrMin = appliedFilters.atr.min;
+  const atrMax = appliedFilters.atr.max;
+  const atrPeriod = appliedFilters.atr.period;
 
-  type TrendMode = "any" | "with" | "against";
-  const [trendFilterEnabled, setTrendFilterEnabled] = useState(false);
-  const [ema20Mode, setEma20Mode] = useState<TrendMode>("with");
-  const [ema200Mode, setEma200Mode] = useState<TrendMode>("any");
-  // Configurable trend-MA periods + types. Default 20/200 EMA preserves
-  // legacy behavior; users can swap to e.g. EMA(9)/SMA(50).
-  const [trendFastPeriod, setTrendFastPeriod] = useState(20);
-  const [trendFastType, setTrendFastType] = useState<MaType>("ema");
-  const [trendSlowPeriod, setTrendSlowPeriod] = useState(200);
-  const [trendSlowType, setTrendSlowType] = useState<MaType>("ema");
+  const trendFilterEnabled = appliedFilters.trend.enabled;
+  const ema20Mode = appliedFilters.trend.ema20Mode as TrendMode;
+  const ema200Mode = appliedFilters.trend.ema200Mode as TrendMode;
+  const trendFastPeriod = appliedFilters.trend.fastPeriod;
+  const trendFastType = appliedFilters.trend.fastType;
+  const trendSlowPeriod = appliedFilters.trend.slowPeriod;
+  const trendSlowType = appliedFilters.trend.slowType;
 
-  const [bollingerFilterEnabled, setBollingerFilterEnabled] = useState(false);
-  const [bollingerAllowed, setBollingerAllowed] = useState<Set<string>>(
-    () => new Set(["above_upper", "inside", "below_lower"])
+  const bollingerFilterEnabled = appliedFilters.bollinger.enabled;
+  // Set is recomputed when the underlying array reference changes (i.e.
+  // the appliedFilters memo recomputed). The Set is what
+  // `contextFilteredZones` calls `.has()` on.
+  const bollingerAllowed = useMemo(
+    () => new Set<string>(appliedFilters.bollinger.allowed),
+    [appliedFilters.bollinger.allowed]
   );
-  // Configurable BB period + stddev multiplier. Default 20/2 preserves
-  // the legacy hardcoded behavior. Shared with the BB-width filter
-  // below — one tuning, two filters.
-  const [bollingerPeriod, setBollingerPeriod] = useState(20);
-  const [bollingerStdDev, setBollingerStdDev] = useState(2);
+  const bollingerPeriod = appliedFilters.bollinger.period;
+  const bollingerStdDev = appliedFilters.bollinger.stdDev;
 
-  // ─── New filter: Bollinger band-width range ──────────────────────
-  const [bbWidthFilterEnabled, setBbWidthFilterEnabled] = useState(false);
-  const [bbWidthMin, setBbWidthMin] = useState(0);
-  const [bbWidthMax, setBbWidthMax] = useState(1000);
+  const bbWidthFilterEnabled = appliedFilters.bbWidth.enabled;
+  const bbWidthMin = appliedFilters.bbWidth.min;
+  const bbWidthMax = appliedFilters.bbWidth.max;
 
-  // ─── New filter: distance from a configurable MA, in ATR units ──
-  const [maDistanceFilterEnabled, setMaDistanceFilterEnabled] = useState(false);
-  const [maDistancePeriod, setMaDistancePeriod] = useState(50);
-  const [maDistanceType, setMaDistanceType] = useState<MaType>("ema");
-  const [maDistanceMode, setMaDistanceMode] =
-    useState<MaDistanceMode>("absolute");
-  const [maDistanceMin, setMaDistanceMin] = useState(0);
-  const [maDistanceMax, setMaDistanceMax] = useState(5);
+  const maDistanceFilterEnabled = appliedFilters.maDistance.enabled;
+  const maDistancePeriod = appliedFilters.maDistance.period;
+  const maDistanceType = appliedFilters.maDistance.type;
+  const maDistanceMode = appliedFilters.maDistance.mode;
+  const maDistanceMin = appliedFilters.maDistance.min;
+  const maDistanceMax = appliedFilters.maDistance.max;
 
-  // ─── New filter: bar volume / N-bar avg ratio ──────────────────
-  const [volumeFilterEnabled, setVolumeFilterEnabled] = useState(false);
-  const [volumeMaPeriod, setVolumeMaPeriod] = useState(20);
-  const [volumeMinRatio, setVolumeMinRatio] = useState(0);
-  const [volumeMaxRatio, setVolumeMaxRatio] = useState(100);
+  const volumeFilterEnabled = appliedFilters.volume.enabled;
+  const volumeMaPeriod = appliedFilters.volume.period;
+  const volumeMinRatio = appliedFilters.volume.minRatio;
+  const volumeMaxRatio = appliedFilters.volume.maxRatio;
 
-  // ─── New filter: Wilder RSI in [min, max] ──────────────────────
-  const [rsiFilterEnabled, setRsiFilterEnabled] = useState(false);
-  const [rsiPeriod, setRsiPeriod] = useState(14);
-  const [rsiMin, setRsiMin] = useState(0);
-  const [rsiMax, setRsiMax] = useState(100);
+  const rsiFilterEnabled = appliedFilters.rsi.enabled;
+  const rsiPeriod = appliedFilters.rsi.period;
+  const rsiMin = appliedFilters.rsi.min;
+  const rsiMax = appliedFilters.rsi.max;
 
-  // ─── New filter: ADX direction (rising/falling/flat) ───────────
-  // Slope is stamped onto each synthetic zone at signal time using
-  // adxSlopeLookback in IndicatorConfig. The mode + flatThreshold
-  // can be tuned without re-running the backtest; lookback changes
-  // invalidate the cache same as adxPeriod.
-  const [adxTrendFilterEnabled, setAdxTrendFilterEnabled] = useState(false);
-  const [adxTrendMode, setAdxTrendMode] = useState<AdxTrendMode>("rising");
-  const [adxTrendLookback, setAdxTrendLookback] = useState(5);
-  const [adxTrendFlatThreshold, setAdxTrendFlatThreshold] = useState(1);
+  const adxTrendFilterEnabled = appliedFilters.adxTrend.enabled;
+  const adxTrendMode = appliedFilters.adxTrend.mode;
+  const adxTrendLookback = appliedFilters.adxTrend.lookback;
+  const adxTrendFlatThreshold = appliedFilters.adxTrend.flatThreshold;
 
-  // ─── New filter: bid/ask delta imbalance ──────────────────────
-  // Gates trades on (ask − bid) / (ask + bid) at the entry bar — only
-  // meaningful for sessions whose source bars carry a bid/ask split
-  // (tick / tick_bidask after aggregation, or ohlcv_bidask). On plain
-  // OHLCV sessions ctx_delta_ratio is null and every trade is rejected
-  // when this filter is on; that's the deliberate fail-closed default.
-  const [deltaFilterEnabled, setDeltaFilterEnabled] = useState(false);
-  const [deltaMin, setDeltaMin] = useState(-1);
-  const [deltaMax, setDeltaMax] = useState(1);
+  const deltaFilterEnabled = appliedFilters.delta.enabled;
+  const deltaMin = appliedFilters.delta.min;
+  const deltaMax = appliedFilters.delta.max;
 
   // ─── Indicator config bundle ─────────────────────────────────────
   // Aggregates every indicator-period knob the filters expose so the
@@ -598,11 +630,6 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
       adxTrendLookback,
     ]
   );
-
-  // ─── Context optimizer busy flag ─────────────────────────────────
-  // The four context optimizers (ADX/ATR/Trend/Bollinger) each spawn a
-  // worker. Gate them on a single shared flag so two can't run at once.
-  const [contextOptimizing, setContextOptimizing] = useState(false);
 
   // ─── Toast (optimizer feedback) ──────────────────────────────────
   // Inline feedback when a context optimizer can't find a candidate that
@@ -646,134 +673,14 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
     return () => window.removeEventListener(PRESETS_CHANGED_EVENT, refresh);
   }, []);
 
-  // Snapshot the dashboard's current filter state into the preset shape.
-  // Pulled into a memo so saving a preset is one allocation, and so the
-  // "current state" is consistent across save/update calls fired in the
-  // same render. The Set→Array conversion for bollinger.allowed is the
-  // only non-trivial bit — sets don't round-trip through JSON.
-  const currentFilters = useMemo<PresetFilters>(
-    () => ({
-      time: {
-        enabled: timeFilterEnabled,
-        // Windows are the canonical multi-window source. from/to mirror
-        // windows[0] for backwards-compat consumers (auto-trader summary,
-        // simulator-panel state load).
-        from: timeFrom,
-        to: timeTo,
-        windows: timeWindows.map((w) => ({ from: w.from, to: w.to })),
-      },
-      adx: {
-        enabled: adxFilterEnabled,
-        min: adxMin,
-        max: adxMax,
-        period: adxPeriod,
-      },
-      atr: {
-        enabled: atrFilterEnabled,
-        min: atrMin,
-        max: atrMax,
-        period: atrPeriod,
-      },
-      trend: {
-        enabled: trendFilterEnabled,
-        ema20Mode,
-        ema200Mode,
-        fastPeriod: trendFastPeriod,
-        fastType: trendFastType,
-        slowPeriod: trendSlowPeriod,
-        slowType: trendSlowType,
-      },
-      bollinger: {
-        enabled: bollingerFilterEnabled,
-        allowed: Array.from(bollingerAllowed) as BollingerPos[],
-        period: bollingerPeriod,
-        stdDev: bollingerStdDev,
-      },
-      bbWidth: {
-        enabled: bbWidthFilterEnabled,
-        min: bbWidthMin,
-        max: bbWidthMax,
-      },
-      maDistance: {
-        enabled: maDistanceFilterEnabled,
-        period: maDistancePeriod,
-        type: maDistanceType,
-        mode: maDistanceMode,
-        min: maDistanceMin,
-        max: maDistanceMax,
-      },
-      volume: {
-        enabled: volumeFilterEnabled,
-        period: volumeMaPeriod,
-        minRatio: volumeMinRatio,
-        maxRatio: volumeMaxRatio,
-      },
-      rsi: {
-        enabled: rsiFilterEnabled,
-        period: rsiPeriod,
-        min: rsiMin,
-        max: rsiMax,
-      },
-      adxTrend: {
-        enabled: adxTrendFilterEnabled,
-        mode: adxTrendMode,
-        lookback: adxTrendLookback,
-        flatThreshold: adxTrendFlatThreshold,
-      },
-      delta: {
-        enabled: deltaFilterEnabled,
-        min: deltaMin,
-        max: deltaMax,
-      },
-    }),
-    [
-      timeFilterEnabled,
-      timeWindows,
-      adxFilterEnabled,
-      adxMin,
-      adxMax,
-      adxPeriod,
-      atrFilterEnabled,
-      atrMin,
-      atrMax,
-      atrPeriod,
-      trendFilterEnabled,
-      ema20Mode,
-      ema200Mode,
-      trendFastPeriod,
-      trendFastType,
-      trendSlowPeriod,
-      trendSlowType,
-      bollingerFilterEnabled,
-      bollingerAllowed,
-      bollingerPeriod,
-      bollingerStdDev,
-      bbWidthFilterEnabled,
-      bbWidthMin,
-      bbWidthMax,
-      maDistanceFilterEnabled,
-      maDistancePeriod,
-      maDistanceType,
-      maDistanceMode,
-      maDistanceMin,
-      maDistanceMax,
-      volumeFilterEnabled,
-      volumeMaPeriod,
-      volumeMinRatio,
-      volumeMaxRatio,
-      rsiFilterEnabled,
-      rsiPeriod,
-      rsiMin,
-      rsiMax,
-      adxTrendFilterEnabled,
-      adxTrendMode,
-      adxTrendLookback,
-      adxTrendFlatThreshold,
-      deltaFilterEnabled,
-      deltaMin,
-      deltaMax,
-    ]
-  );
+  // Pass-through of `appliedFilters` for downstream persistence consumers
+  // (`handleSavePreset` / `handleUpdatePreset` / `dashboardSnapshot`).
+  // `appliedFilters` is already in PresetFilters shape, sourced from the
+  // parsed editor script — saving a preset captures exactly what the user
+  // last applied. Old saves that were written from the deleted UI mode
+  // remain loadable via `normalizePresetForLoad`; their `filters` block
+  // becomes inert (the script field is the source of truth on load).
+  const currentFilters = appliedFilters;
 
   /** Apply a saved preset to every relevant piece of dashboard state.
    *  normalizePresetForLoad fills in any fields that didn't exist when
@@ -817,69 +724,11 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
     setRules(safe.rules);
     setRulesVersion((v) => v + 1);
 
-    setTimeFilterEnabled(safe.filters.time.enabled);
-    // normalizePresetForLoad guarantees `windows` is non-empty (older
-    // saves get migrated from from/to). Deep-copy so the preset's
-    // stored array isn't aliased into editable dashboard state.
-    setTimeWindows(
-      safe.filters.time.windows.map((w) => ({ from: w.from, to: w.to }))
-    );
-
-    setAdxFilterEnabled(safe.filters.adx.enabled);
-    setAdxMin(safe.filters.adx.min);
-    setAdxMax(safe.filters.adx.max);
-    setAdxPeriod(safe.filters.adx.period);
-
-    setAtrFilterEnabled(safe.filters.atr.enabled);
-    setAtrMin(safe.filters.atr.min);
-    setAtrMax(safe.filters.atr.max);
-    setAtrPeriod(safe.filters.atr.period);
-
-    setTrendFilterEnabled(safe.filters.trend.enabled);
-    setEma20Mode(safe.filters.trend.ema20Mode);
-    setEma200Mode(safe.filters.trend.ema200Mode);
-    setTrendFastPeriod(safe.filters.trend.fastPeriod);
-    setTrendFastType(safe.filters.trend.fastType);
-    setTrendSlowPeriod(safe.filters.trend.slowPeriod);
-    setTrendSlowType(safe.filters.trend.slowType);
-
-    setBollingerFilterEnabled(safe.filters.bollinger.enabled);
-    setBollingerAllowed(new Set(safe.filters.bollinger.allowed));
-    setBollingerPeriod(safe.filters.bollinger.period);
-    setBollingerStdDev(safe.filters.bollinger.stdDev);
-
-    // New filter sub-objects — normalize-for-load already filled in
-    // defaults if the saved preset predates these fields, so it's safe
-    // to read each branch unconditionally here.
-    setBbWidthFilterEnabled(safe.filters.bbWidth.enabled);
-    setBbWidthMin(safe.filters.bbWidth.min);
-    setBbWidthMax(safe.filters.bbWidth.max);
-
-    setMaDistanceFilterEnabled(safe.filters.maDistance.enabled);
-    setMaDistancePeriod(safe.filters.maDistance.period);
-    setMaDistanceType(safe.filters.maDistance.type);
-    setMaDistanceMode(safe.filters.maDistance.mode);
-    setMaDistanceMin(safe.filters.maDistance.min);
-    setMaDistanceMax(safe.filters.maDistance.max);
-
-    setVolumeFilterEnabled(safe.filters.volume.enabled);
-    setVolumeMaPeriod(safe.filters.volume.period);
-    setVolumeMinRatio(safe.filters.volume.minRatio);
-    setVolumeMaxRatio(safe.filters.volume.maxRatio);
-
-    setRsiFilterEnabled(safe.filters.rsi.enabled);
-    setRsiPeriod(safe.filters.rsi.period);
-    setRsiMin(safe.filters.rsi.min);
-    setRsiMax(safe.filters.rsi.max);
-
-    setAdxTrendFilterEnabled(safe.filters.adxTrend.enabled);
-    setAdxTrendMode(safe.filters.adxTrend.mode);
-    setAdxTrendLookback(safe.filters.adxTrend.lookback);
-    setAdxTrendFlatThreshold(safe.filters.adxTrend.flatThreshold);
-
-    setDeltaFilterEnabled(safe.filters.delta.enabled);
-    setDeltaMin(safe.filters.delta.min);
-    setDeltaMax(safe.filters.delta.max);
+    // Filter values flow from the preset's `script` field (parsed and
+    // applied automatically by handleApplyScript on the next debounce).
+    // The legacy `safe.filters.X` block is kept on the preset shape for
+    // backwards compat with old saves but no longer drives any UI state
+    // — the simulator reads filters from the parsed applied script.
 
     // Round-4 fix: restore script + paramMeta. Older presets predate
     // these fields — guard with explicit checks so loading them doesn't
@@ -1074,68 +923,12 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
     setRules(safe.rules);
     setRulesVersion((v) => v + 1);
 
-    // Time-of-day filter — windows is the canonical representation;
-    // deep-copy so the remote payload's array isn't aliased into
-    // editable dashboard state.
-    setTimeFilterEnabled(safe.filters.time.enabled);
-    setTimeWindows(
-      safe.filters.time.windows.map((w) => ({ from: w.from, to: w.to }))
-    );
-
-    // Per-filter setter chain — mirrors handleLoadPreset 1:1. Keep
-    // these in sync when adding new filter fields.
-    setAdxFilterEnabled(safe.filters.adx.enabled);
-    setAdxMin(safe.filters.adx.min);
-    setAdxMax(safe.filters.adx.max);
-    setAdxPeriod(safe.filters.adx.period);
-
-    setAtrFilterEnabled(safe.filters.atr.enabled);
-    setAtrMin(safe.filters.atr.min);
-    setAtrMax(safe.filters.atr.max);
-    setAtrPeriod(safe.filters.atr.period);
-
-    setTrendFilterEnabled(safe.filters.trend.enabled);
-    setEma20Mode(safe.filters.trend.ema20Mode);
-    setEma200Mode(safe.filters.trend.ema200Mode);
-    setTrendFastPeriod(safe.filters.trend.fastPeriod);
-    setTrendFastType(safe.filters.trend.fastType);
-    setTrendSlowPeriod(safe.filters.trend.slowPeriod);
-    setTrendSlowType(safe.filters.trend.slowType);
-
-    setBollingerFilterEnabled(safe.filters.bollinger.enabled);
-    setBollingerAllowed(new Set(safe.filters.bollinger.allowed));
-    setBollingerPeriod(safe.filters.bollinger.period);
-    setBollingerStdDev(safe.filters.bollinger.stdDev);
-
-    setBbWidthFilterEnabled(safe.filters.bbWidth.enabled);
-    setBbWidthMin(safe.filters.bbWidth.min);
-    setBbWidthMax(safe.filters.bbWidth.max);
-
-    setMaDistanceFilterEnabled(safe.filters.maDistance.enabled);
-    setMaDistancePeriod(safe.filters.maDistance.period);
-    setMaDistanceType(safe.filters.maDistance.type);
-    setMaDistanceMode(safe.filters.maDistance.mode);
-    setMaDistanceMin(safe.filters.maDistance.min);
-    setMaDistanceMax(safe.filters.maDistance.max);
-
-    setVolumeFilterEnabled(safe.filters.volume.enabled);
-    setVolumeMaPeriod(safe.filters.volume.period);
-    setVolumeMinRatio(safe.filters.volume.minRatio);
-    setVolumeMaxRatio(safe.filters.volume.maxRatio);
-
-    setRsiFilterEnabled(safe.filters.rsi.enabled);
-    setRsiPeriod(safe.filters.rsi.period);
-    setRsiMin(safe.filters.rsi.min);
-    setRsiMax(safe.filters.rsi.max);
-
-    setAdxTrendFilterEnabled(safe.filters.adxTrend.enabled);
-    setAdxTrendMode(safe.filters.adxTrend.mode);
-    setAdxTrendLookback(safe.filters.adxTrend.lookback);
-    setAdxTrendFlatThreshold(safe.filters.adxTrend.flatThreshold);
-
-    setDeltaFilterEnabled(safe.filters.delta.enabled);
-    setDeltaMin(safe.filters.delta.min);
-    setDeltaMax(safe.filters.delta.max);
+    // Filter values are no longer applied directly from the remote
+    // snapshot — they ride along on the parsed applied script (which
+    // the cross-tab payload carries via the script field on the
+    // accompanying preset / draft sync). The legacy `safe.filters` block
+    // is retained on the wire for backwards compat with old peers but
+    // does not flow into any local state here.
   }, []);
 
   /** Snapshot every synced dashboard input. Memoized on its inputs so
@@ -1240,26 +1033,9 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
     return () => clearTimeout(t);
   }, [dashboardSnapshot, clientId]);
 
-  // ─── UI ↔ Script mode toggle ─────────────────────────────────────
-  // Two ways to drive the dashboard config:
-  //   - "ui"     — the original click-through controls (strategy picker,
-  //                rules editor, filter bars). Default.
-  //   - "script" — a single text editor where every config field becomes
-  //                a `path = value` line. Same state lives underneath in
-  //                both modes; the script editor's "Apply" button writes
-  //                back through the same setters the UI uses.
-  // Day selection, presets, exports, and results live OUTSIDE this gate
-  // — they're equally useful regardless of how the user is editing the
-  // config. The split mirrors the BacktestPreset shape (strategy + params
-  // + rules + filters), since that's exactly the slice the script DSL
-  // covers. State is declared here (before the script bridge callbacks
-  // that consume the setters) so block-scoped TDZ rules stay happy.
-  const [mode, setMode] = useState<"ui" | "script">("script");
-
   // ── Script-mode "View" sub-toggle ──────────────────────────────────
-  // Within script mode the user picks between two views of the LEFT
-  // column:
-  //   - "ui"    — the existing click-through controls (presets, day
+  // The dashboard's left column has two views:
+  //   - "ui"    — the click-through controls (presets, day
   //               picker, results, stat cards). Default.
   //   - "chart" — a TradingView lightweight-charts candlestick chart
   //               of the stitched bars from every selected session,
@@ -1323,12 +1099,11 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
     }
   }, [showSignalsLayer, showTradesLayer]);
 
-  // The script editor is fully controlled via this string. It is NOT
-  // automatically kept in sync with UI-side state — the user has to click
-  // "Apply" to push changes from script→UI, or "Sync from UI" to pull the
-  // current state back into the editor. That asymmetry is intentional:
-  // re-serializing the script on every UI change would clobber the user's
-  // in-progress edits and reorder/reformat their personal layout.
+  // The script editor is fully controlled via this string. The editor
+  // is the single source of truth — there is no parallel UI state to
+  // sync to/from. Edits debounce through `handleApplyScript`, which
+  // re-parses the script and updates `appliedScriptText` so the run
+  // pipeline (and the derived `appliedFilters` memo) re-evaluates.
   //
   // Initial value is hydrated synchronously from the localStorage cache
   // managed by `script-editor-state.ts`. On the server (SSR) the cache
@@ -1346,14 +1121,9 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
   // edits take priority over a server copy that turned out to be newer
   // than the stale cached draft.
   const scriptUserEditedRef = useRef(false);
-  // Snapshot of `scriptText` taken at Apply/Run time. The backtest run
-  // memos read THIS — never the live `scriptText` — so typing in the
-  // editor doesn't invalidate the run memos on every keystroke. Without
-  // this split, each debounced editor emit recreated `runResult`'s
-  // aggregator arrays/Maps (cache hits returned the same `result`
-  // object, but the outer memo still rebuilt its arrays), cascading
-  // re-renders into the chart and trade table mid-typing.
-  const [appliedScriptText, setAppliedScriptText] = useState<string>("");
+  // `appliedScriptText` is declared earlier in the component (above the
+  // filter-derivation memo) — it's the snapshot the run pipeline freezes
+  // at Apply time so live typing doesn't invalidate run memos.
   // Per-key value overrides for inferred params.X references in the
   // strategy DSL. The script-strategy panel renders one input per
   // params.X reference and writes here. The run path overlays these on
@@ -1655,6 +1425,40 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
     [scriptApplied]
   );
 
+  /** Stable handlers for the BacktestScriptStrategyPanel call site below.
+   *  Hoisted out of inline-arrow form so the memoized panel can shallow-
+   *  compare its callback props and skip re-renders during fast typing.
+   *
+   *  `handleScriptParamChange` uses only the setter, so deps = [].
+   *  `handleLoadStrategyTemplate` reads the prior `scriptText` through the
+   *  functional setter form (`setScriptText(prev => …)`) instead of
+   *  closing over `scriptText` directly — keeping its identity stable
+   *  across keystrokes (the previous inline arrow closed over `scriptText`
+   *  and got a fresh identity every render, defeating the memo). */
+  const handleScriptParamChange = useCallback((key: string, value: number) => {
+    setScriptParams((prev) => ({ ...prev, [key]: value }));
+  }, []);
+  const handleLoadStrategyTemplate = useCallback((tpl: StrategyTemplate) => {
+    setScriptText((prev) => {
+      const sep =
+        prev.trim() === ""
+          ? ""
+          : `\n\n// ── existing script preserved below ──\n`;
+      return tpl.script + sep + prev;
+    });
+    // Seed paramMeta + scriptParams with the template's defaults. The
+    // user's previously-tuned scriptParams for matching keys are
+    // preserved (preference > template default).
+    setScriptParamMeta((prev) => ({ ...tpl.paramMeta, ...prev }));
+    setScriptParams((prev) => {
+      const next = { ...prev };
+      for (const [k, m] of Object.entries(tpl.paramMeta)) {
+        if (next[k] === undefined) next[k] = m.default;
+      }
+      return next;
+    });
+  }, []);
+
   // ─── Script ↔ dashboard-state bridge ──────────────────────────────
   // Snapshot every script-controllable piece of state into a single
   // BacktestConfig object. Used to seed the editor on first toggle into
@@ -1795,11 +1599,11 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
     deltaMax,
   ]);
 
-  /** Pull the dashboard's current state into the editor. The user can
-   *  click "Sync from UI" any time they want to discard their script edits
-   *  and re-derive a script from whatever the click-through controls
-   *  currently say. Also runs automatically the first time the user enters
-   *  Script mode so the editor doesn't open empty. */
+  /** Seed the editor with a script derived from the dashboard's current
+   *  state. Runs once on first mount when no draft has been hydrated, so
+   *  the editor doesn't open empty. The "Sync from UI" button that used
+   *  to expose this manually is gone — the editor is now the single
+   *  source of truth and there is no separate UI state to sync from. */
   const syncScriptFromState = useCallback(() => {
     const snapshot = buildConfigSnapshot();
     const text = serializeBacktestScript(snapshot);
@@ -1986,6 +1790,10 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
     // editor reads) — the run pipeline stays pinned to whatever was
     // applied here until the user clicks Run again.
     setAppliedScriptText(textForParse);
+    // Commit the converted-from-cfg filter block. Single parse per Apply
+    // — the simulator reads from `appliedFilters` (state) instead of
+    // re-parsing the script in a memo on every render.
+    setAppliedFilters(convertCfgFiltersToPresetFilters(cfg.filters));
 
     // ── Script v2: capture overlay artifacts ────────────────────────
     // numericOverrides drive per-trade rule evaluation; summaryPrints /
@@ -2113,109 +1921,12 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
       setRulesVersion((v) => v + 1);
     }
 
-    if (cfg.filters?.time) {
-      const t = cfg.filters.time;
-      if (t.enabled !== undefined) setTimeFilterEnabled(t.enabled);
-      // Multi-window is the source of truth — when the script writes
-      // `filters.time.windows`, parse "HH:MM-HH:MM" entries and replace
-      // the whole list. When only legacy from/to are written, update
-      // windows[0] in-place so the dashboard renders the change.
-      if (t.windows !== undefined) {
-        const parsed: TimeWindow[] = [];
-        for (const raw of t.windows) {
-          if (typeof raw !== "string") continue;
-          const dashIdx = raw.indexOf("-");
-          if (dashIdx <= 0) continue;
-          const from = raw.slice(0, dashIdx).trim();
-          const to = raw.slice(dashIdx + 1).trim();
-          if (from && to) parsed.push({ from, to });
-        }
-        if (parsed.length > 0) setTimeWindows(parsed);
-      } else if (t.from !== undefined || t.to !== undefined) {
-        setTimeWindows((prev) => {
-          const first = prev[0] ?? { from: "09:30", to: "16:00" };
-          const next = [...prev];
-          next[0] = {
-            from: t.from ?? first.from,
-            to: t.to ?? first.to,
-          };
-          return next;
-        });
-      }
-    }
-    if (cfg.filters?.adx) {
-      const a = cfg.filters.adx;
-      if (a.enabled !== undefined) setAdxFilterEnabled(a.enabled);
-      if (a.min !== undefined) setAdxMin(a.min);
-      if (a.max !== undefined) setAdxMax(a.max);
-      if (a.period !== undefined) setAdxPeriod(a.period);
-    }
-    if (cfg.filters?.atr) {
-      const a = cfg.filters.atr;
-      if (a.enabled !== undefined) setAtrFilterEnabled(a.enabled);
-      if (a.min !== undefined) setAtrMin(a.min);
-      if (a.max !== undefined) setAtrMax(a.max);
-      if (a.period !== undefined) setAtrPeriod(a.period);
-    }
-    if (cfg.filters?.trend) {
-      const t = cfg.filters.trend;
-      if (t.enabled !== undefined) setTrendFilterEnabled(t.enabled);
-      if (t.ema20 !== undefined) setEma20Mode(t.ema20);
-      if (t.ema200 !== undefined) setEma200Mode(t.ema200);
-      if (t.fastPeriod !== undefined) setTrendFastPeriod(t.fastPeriod);
-      if (t.fastType !== undefined) setTrendFastType(t.fastType);
-      if (t.slowPeriod !== undefined) setTrendSlowPeriod(t.slowPeriod);
-      if (t.slowType !== undefined) setTrendSlowType(t.slowType);
-    }
-    if (cfg.filters?.bollinger) {
-      const b = cfg.filters.bollinger;
-      if (b.enabled !== undefined) setBollingerFilterEnabled(b.enabled);
-      if (b.allowed !== undefined) setBollingerAllowed(new Set(b.allowed));
-      if (b.period !== undefined) setBollingerPeriod(b.period);
-      if (b.stdDev !== undefined) setBollingerStdDev(b.stdDev);
-    }
-    if (cfg.filters?.bbWidth) {
-      const b = cfg.filters.bbWidth;
-      if (b.enabled !== undefined) setBbWidthFilterEnabled(b.enabled);
-      if (b.min !== undefined) setBbWidthMin(b.min);
-      if (b.max !== undefined) setBbWidthMax(b.max);
-    }
-    if (cfg.filters?.maDistance) {
-      const m = cfg.filters.maDistance;
-      if (m.enabled !== undefined) setMaDistanceFilterEnabled(m.enabled);
-      if (m.period !== undefined) setMaDistancePeriod(m.period);
-      if (m.type !== undefined) setMaDistanceType(m.type);
-      if (m.mode !== undefined) setMaDistanceMode(m.mode);
-      if (m.min !== undefined) setMaDistanceMin(m.min);
-      if (m.max !== undefined) setMaDistanceMax(m.max);
-    }
-    if (cfg.filters?.volume) {
-      const v = cfg.filters.volume;
-      if (v.enabled !== undefined) setVolumeFilterEnabled(v.enabled);
-      if (v.period !== undefined) setVolumeMaPeriod(v.period);
-      if (v.minRatio !== undefined) setVolumeMinRatio(v.minRatio);
-      if (v.maxRatio !== undefined) setVolumeMaxRatio(v.maxRatio);
-    }
-    if (cfg.filters?.rsi) {
-      const r = cfg.filters.rsi;
-      if (r.enabled !== undefined) setRsiFilterEnabled(r.enabled);
-      if (r.period !== undefined) setRsiPeriod(r.period);
-      if (r.min !== undefined) setRsiMin(r.min);
-      if (r.max !== undefined) setRsiMax(r.max);
-    }
-    if (cfg.filters?.adxTrend) {
-      const a = cfg.filters.adxTrend;
-      if (a.enabled !== undefined) setAdxTrendFilterEnabled(a.enabled);
-      if (a.mode !== undefined) setAdxTrendMode(a.mode);
-      if (a.lookback !== undefined) setAdxTrendLookback(a.lookback);
-      if (a.flatThreshold !== undefined) setAdxTrendFlatThreshold(a.flatThreshold);
-    }
-    if (cfg.filters?.delta) {
-      const d = cfg.filters.delta;
-      if (d.enabled !== undefined) setDeltaFilterEnabled(d.enabled);
-      if (d.min !== undefined) setDeltaMin(d.min);
-      if (d.max !== undefined) setDeltaMax(d.max);
-    }
+    // Filter values used to be plumbed from the parsed cfg.filters into
+    // a useState chain (setAdxFilterEnabled, setBollingerAllowed, ...).
+    // That bridge is gone — `appliedFilters` now reads cfg.filters
+    // directly off the parsed `appliedScriptText`. The filter values
+    // visible to `contextFilteredZones` / `currentFilters` update as
+    // soon as `setAppliedScriptText(textForParse)` (above) commits.
 
     // Banner feedback. We count "applied lines" as anything that didn't
     // raise a hard error — warnings are still applied, so a row that
@@ -2241,25 +1952,18 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
     }
   }, [scriptText, strategyId, showToast]);
 
-  // ─── Auto-apply script on edit ───────────────────────────────────
-  // The editor is the single source of truth for the strategy. Whenever
-  // `scriptText` changes (load preset, type in editor, sync from disk,
-  // SSE echo, etc.), automatically run handleApplyScript so the runtime
-  // memos / strategyOverride track the editor verbatim. Eliminates the
-  // "I edited the script but the dashboard is running the previously-
-  // applied version" footgun.
+  // Edits to `scriptText` no longer auto-trigger a parse + Apply. The
+  // user explicitly drives Apply via the Run button (handleRun calls
+  // handleApplyScript inside a double-rAF). This was a deliberate change
+  // so typing in the editor is cheap — the previous debounced auto-apply
+  // ran the full parse + backtest pipeline 250ms after every keystroke
+  // burst, which made larger scripts feel sluggish.
   //
-  // Debounced 250ms so a sustained typing burst doesn't hammer the
-  // parser. parseStrategyScript is called once when the user pauses.
-  // Skipping when scriptText is empty avoids running on first mount
-  // before the localStorage / Supabase / disk hydration completes.
-  useEffect(() => {
-    if (!scriptText) return;
-    const t = setTimeout(() => {
-      handleApplyScript();
-    }, 250);
-    return () => clearTimeout(t);
-  }, [scriptText, handleApplyScript]);
+  // Side note for downstream readers: `appliedScriptText` therefore stays
+  // pinned to the LAST RUN state until the next Run. NT8 export ("TO NT8"
+  // in BacktestPresetsPanel) reads the LIVE `scriptText` (via
+  // `liveScript`), not `appliedScriptText`, so it always exports what the
+  // editor currently shows regardless of Apply state.
 
   /** Run handler — wraps handleApplyScript with a loading-state flip
    *  so the user sees visible feedback while the (synchronous)
@@ -2408,15 +2112,6 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
     DEFAULT_ATR_ADJUST_OPTIMIZE_CONFIG
   );
 
-  // ─── Time optimization state ──────────────────────────────────────
-  // Mirrors the risk simulator: a min-window-size modal opens first, then
-  // runTimeOptimizeChunked sweeps every contiguous 30-min window over the
-  // currently-loaded synthetic zones and applies the best one (by avg
-  // points/trade) back into the time filter inputs.
-  const [optimizingTime, setOptimizingTime] = useState(false);
-  const [optimizeTimeProgress, setOptimizeTimeProgress] = useState<number | null>(null);
-  const [showTimeOptModal, setShowTimeOptModal] = useState(false);
-  const timeCancelRef = useRef(false);
 
   // ─── Export modal state (AI JSON export) ──────────────────────────
   // CSV export is triggered immediately on click; the AI export needs a
@@ -2472,21 +2167,20 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
     return () => {
       cancelRef.current = true;
       atrCancelRef.current = true;
-      timeCancelRef.current = true;
       paramOptCancelRef.current = true;
     };
   }, []);
 
-  // First time the user enters Script mode, seed the editor with the
-  // current dashboard state so they're not staring at an empty box. We use
-  // a ref to make this a one-shot — subsequent toggles back to Script
-  // preserve whatever the user had typed.
+  // On first mount, if no draft has been hydrated yet, seed the editor
+  // with the dashboard's current state so it isn't empty. The
+  // `scriptInitialized` ref is set true by `loadScriptDraft` when a
+  // saved draft was loaded, which short-circuits this seed.
   useEffect(() => {
-    if (mode === "script" && !scriptInitialized.current) {
+    if (!scriptInitialized.current) {
       scriptInitialized.current = true;
       syncScriptFromState();
     }
-  }, [mode, syncScriptFromState]);
+  }, [syncScriptFromState]);
 
   // ── Supabase sync for the script draft ────────────────────────────────
   // On mount, reconcile the localStorage cache (already used to seed
@@ -2875,7 +2569,17 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
   const backtestCacheRef = useRef(
     new Map<
       number,
-      { configKey: string; bars: ReplayBar[]; result: BacktestRunResult }
+      {
+        configKey: string;
+        bars: ReplayBar[];
+        /** id of the chronologically-prior session whose tail was used as
+         *  warmup history. -1 when this is the first session of the run.
+         *  Part of the cache key because changing which sessions are
+         *  selected re-shuffles "prior" relationships and must invalidate
+         *  cached results that were warmed from a different prior. */
+        priorSessionId: number;
+        result: BacktestRunResult;
+      }
     >()
   );
 
@@ -2890,6 +2594,14 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
       .filter(
         (x): x is { id: number; instrument: string; bars: ReplayBar[] } => x !== null
       );
+
+    // Sort chronologically by first bar's timestamp so each session's
+    // "prior" sibling is the one that actually precedes it on the wall
+    // clock. Set insertion order (the default) is selection order, which
+    // would corrupt the per-session warmup splice below.
+    ready.sort((a, b) =>
+      (a.bars[0]?.bar_time ?? "").localeCompare(b.bars[0]?.bar_time ?? "")
+    );
 
     if (ready.length === 0) {
       return {
@@ -3078,6 +2790,7 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
     const allZones: TradeZone[] = [];
     const allBars = new Map<number, TradeZoneBar[]>();
     const allPreEntryBars = new Map<number, TradeZoneBar[]>();
+    const allIndicatorPreEntryBars = new Map<number, TradeZoneBar[]>();
     const allAtr = new Map<number, number>();
     const allTickCtx = new Map<number, TickContext>();
     let totalSignals = 0;
@@ -3093,14 +2806,39 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
     const allOptimizationWarnings: string[] = [];
 
     const cache = backtestCacheRef.current;
-    for (const s of ready) {
+    // Engine requires a strategyOverride (built-in template fallback was
+    // removed). When the editor is empty, mid-edit, or holding a parse
+    // error, `strategyOverrideForRun` stays null — skip the per-session
+    // run loop and return empty results so the dashboard renders with
+    // 0 trades instead of throwing. The next valid Apply will rebuild
+    // the override and the memo will re-run.
+    const ranSessions = strategyOverrideForRun ? ready : [];
+    for (let sIdx = 0; sIdx < ranSessions.length; sIdx++) {
+      const s = ranSessions[sIdx];
+      // Pull the prior chronological session's bar tail as warmup for the
+      // signal evaluator, so ATR(14)/ADX(14)/rolling-* are valid at bar 0
+      // of THIS session (matches NT8's continuous Calculate.OnBarClose
+      // feed). The very first session of the run has no prior — accept
+      // a cold start there. Slice cap mirrors the engine's auto-warmup
+      // ceiling; the engine further trims to the script's required window.
+      const prior = sIdx > 0 ? ranSessions[sIdx - 1] : null;
+      const priorBars = prior ? prior.bars.slice(-MAX_AUTO_PRE_ENTRY_BARS) : [];
+      const priorSessionId = prior?.id ?? -1;
+
       const cached = cache.get(s.id);
       let result: BacktestRunResult;
-      // Both the config AND the bars reference must match to reuse a
+      // Config, bars, AND prior-session id must all match to reuse a
       // cached result. The bars-identity check catches tick-aggregation
-      // timeframe swaps, which change the bar set without touching any
-      // config field.
-      if (cached && cached.configKey === configKey && cached.bars === s.bars) {
+      // timeframe swaps. The priorSessionId check invalidates when the
+      // user changes which sessions are selected — the same session may
+      // now have a different "prior" sibling, which means a different
+      // warmup history and potentially different signals.
+      if (
+        cached &&
+        cached.configKey === configKey &&
+        cached.bars === s.bars &&
+        cached.priorSessionId === priorSessionId
+      ) {
         result = cached.result;
       } else {
         // Tick-resolution data — present only for sessions sourced from
@@ -3124,8 +2862,9 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
           strategyOverride: strategyOverrideForRun,
           sessionTicks,
           sessionTickRanges,
+          priorBars,
         });
-        cache.set(s.id, { configKey, bars: s.bars, result });
+        cache.set(s.id, { configKey, bars: s.bars, priorSessionId, result });
       }
 
       allTrades.push(...result.trades);
@@ -3133,6 +2872,8 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
       for (const [k, v] of result.syntheticBarsByZoneId) allBars.set(k, v);
       for (const [k, v] of result.syntheticPreEntryBarsByZoneId)
         allPreEntryBars.set(k, v);
+      for (const [k, v] of result.syntheticIndicatorPreEntryBarsByZoneId)
+        allIndicatorPreEntryBars.set(k, v);
       for (const [k, v] of result.syntheticAtrByZoneId) allAtr.set(k, v);
       for (const [k, v] of result.syntheticTickCtxByZoneId) allTickCtx.set(k, v);
       totalSignals += result.totalSignals;
@@ -3229,6 +2970,7 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
       syntheticZones: dedupedZones,
       syntheticBarsByZoneId: allBars,
       syntheticPreEntryBarsByZoneId: allPreEntryBars,
+      syntheticIndicatorPreEntryBarsByZoneId: allIndicatorPreEntryBars,
       syntheticAtrByZoneId: allAtr,
       syntheticTickCtxByZoneId: allTickCtx,
       totalSignals,
@@ -3543,7 +3285,11 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
           timeFilteredZones,
           runResult.syntheticBarsByZoneId,
           collectOverlayExprs(overlayForFilterSim),
-          runResult.syntheticPreEntryBarsByZoneId,
+          // Use the warmed indicator pre-entry map (drawn from combinedBars,
+          // capped at MAX_AUTO_PRE_ENTRY_BARS) so filter.if's Wilder ATR/ADX
+          // converge to NT8's continuous-state values. The session-local
+          // syntheticPreEntryBarsByZoneId is reserved for AI export.
+          runResult.syntheticIndicatorPreEntryBarsByZoneId,
           runResult.syntheticTickCtxByZoneId.size > 0
             ? runResult.syntheticTickCtxByZoneId
             : undefined,
@@ -3758,7 +3504,11 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
           timeFilteredZones,
           runResult.syntheticBarsByZoneId,
           collectOverlayExprs(overlayForFilterSim),
-          runResult.syntheticPreEntryBarsByZoneId,
+          // Use the warmed indicator pre-entry map (drawn from combinedBars,
+          // capped at MAX_AUTO_PRE_ENTRY_BARS) so filter.if's Wilder ATR/ADX
+          // converge to NT8's continuous-state values. The session-local
+          // syntheticPreEntryBarsByZoneId is reserved for AI export.
+          runResult.syntheticIndicatorPreEntryBarsByZoneId,
           runResult.syntheticTickCtxByZoneId.size > 0
             ? runResult.syntheticTickCtxByZoneId
             : undefined,
@@ -4204,8 +3954,9 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
         exprs,
         // Pre-entry bars warm up ATR/EMA/ADX so the value at bar_index 0
         // is real — the summary-print average across entries would
-        // otherwise be NaN-poisoned.
-        runResult.syntheticPreEntryBarsByZoneId,
+        // otherwise be NaN-poisoned. Use the warmed indicator pre-entry
+        // map so Wilder smoothers converge to NT8 values cross-session.
+        runResult.syntheticIndicatorPreEntryBarsByZoneId,
         runResult.syntheticTickCtxByZoneId.size > 0
           ? runResult.syntheticTickCtxByZoneId
           : undefined,
@@ -4472,9 +4223,7 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
   const canOptimize =
     trades.length > 0 &&
     !optimizing &&
-    !optimizingAtr &&
-    !optimizingTime &&
-    !contextOptimizing;
+    !optimizingAtr;
 
   const openOptimizeModal = useCallback(() => {
     if (!canOptimize) return;
@@ -4557,503 +4306,6 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
     ]
   );
 
-  // ─── Context-filter optimizers ────────────────────────────────────
-  // Each "Optimize X" button builds a base pool that includes every OTHER
-  // currently-active filter (so narrowing is additive), then hands the
-  // pool to the corresponding worker-backed optimizer. The min-trades
-  // floor (20, enforced inside the optimizer) gates against lucky
-  // micro-subsets.
-  const parseTimeMinutes = useCallback((t: string) => {
-    const [h, m] = t.split(":").map(Number);
-    return (h || 0) * 60 + (m || 0);
-  }, []);
-
-  // Build a pool with every enabled filter applied EXCEPT the one named.
-  // Mirrors `buildBasePool` in simulator-panel.tsx so backtest and
-  // simulator agree on the additive-narrowing semantics.
-  const buildBasePool = useCallback(
-    (
-      exclude:
-        | "adx"
-        | "atr"
-        | "trend"
-        | "bollinger"
-        | "bbWidth"
-        | "maDistance"
-        | "volume"
-        | "rsi"
-        | "adxTrend"
-        | "delta"
-    ) => {
-      let pool = runResult.syntheticZones;
-      if (adxFilterEnabled && exclude !== "adx") {
-        pool = pool.filter(
-          (z) => z.ctx_adx14 != null && z.ctx_adx14 >= adxMin && z.ctx_adx14 <= adxMax
-        );
-      }
-      if (atrFilterEnabled && exclude !== "atr") {
-        pool = pool.filter(
-          (z) => z.ctx_atr14 != null && z.ctx_atr14 >= atrMin && z.ctx_atr14 <= atrMax
-        );
-      }
-      if (trendFilterEnabled && exclude !== "trend") {
-        pool = pool.filter((z) => {
-          const isLong = z.direction === "Long";
-          if (ema20Mode !== "any") {
-            if (z.ctx_price_vs_ema20 == null) return false;
-            const isWith =
-              (isLong && z.ctx_price_vs_ema20 === "above") ||
-              (!isLong && z.ctx_price_vs_ema20 === "below");
-            if (ema20Mode === "with" && !isWith) return false;
-            if (ema20Mode === "against" && isWith) return false;
-          }
-          if (ema200Mode !== "any") {
-            if (z.ctx_price_vs_ema200 == null) return false;
-            const isWith =
-              (isLong && z.ctx_price_vs_ema200 === "above") ||
-              (!isLong && z.ctx_price_vs_ema200 === "below");
-            if (ema200Mode === "with" && !isWith) return false;
-            if (ema200Mode === "against" && isWith) return false;
-          }
-          return true;
-        });
-      }
-      if (bollingerFilterEnabled && exclude !== "bollinger") {
-        pool = pool.filter(
-          (z) =>
-            z.ctx_bollinger_pos != null && bollingerAllowed.has(z.ctx_bollinger_pos)
-        );
-      }
-      if (bbWidthFilterEnabled && exclude !== "bbWidth") {
-        pool = pool.filter((z) => {
-          const bw = z.ctx_bollinger_bw ?? null;
-          if (bw == null) return false;
-          return bw >= bbWidthMin && bw <= bbWidthMax;
-        });
-      }
-      if (maDistanceFilterEnabled && exclude !== "maDistance") {
-        pool = pool.filter((z) => {
-          const d = z.ctx_ma_distance_atr ?? null;
-          if (d == null) return false;
-          if (maDistanceMode === "absolute") {
-            const ad = Math.abs(d);
-            return ad >= maDistanceMin && ad <= maDistanceMax;
-          }
-          if (maDistanceMode === "above") {
-            if (d < 0) return false;
-            return d >= maDistanceMin && d <= maDistanceMax;
-          }
-          if (d > 0) return false;
-          const ad = Math.abs(d);
-          return ad >= maDistanceMin && ad <= maDistanceMax;
-        });
-      }
-      if (volumeFilterEnabled && exclude !== "volume") {
-        pool = pool.filter((z) => {
-          const r = z.ctx_volume_ratio ?? null;
-          if (r == null) return false;
-          return r >= volumeMinRatio && r <= volumeMaxRatio;
-        });
-      }
-      if (rsiFilterEnabled && exclude !== "rsi") {
-        pool = pool.filter(
-          (z) => z.ctx_rsi != null && z.ctx_rsi >= rsiMin && z.ctx_rsi <= rsiMax
-        );
-      }
-      if (
-        adxTrendFilterEnabled &&
-        adxTrendMode !== "any" &&
-        exclude !== "adxTrend"
-      ) {
-        const thresh = Math.abs(adxTrendFlatThreshold);
-        pool = pool.filter((z) => {
-          const slope = z.ctx_adx_slope ?? null;
-          if (slope == null) return false;
-          if (adxTrendMode === "rising") return slope > thresh;
-          if (adxTrendMode === "falling") return slope < -thresh;
-          // "flat"
-          return Math.abs(slope) <= thresh;
-        });
-      }
-      if (deltaFilterEnabled && exclude !== "delta") {
-        pool = pool.filter((z) => {
-          const d = z.ctx_delta_ratio ?? null;
-          if (d == null) return false;
-          return d >= deltaMin && d <= deltaMax;
-        });
-      }
-      if (timeFilterEnabled && timeWindows.length > 0) {
-        const parsed = timeWindows.map((w) => ({
-          from: parseTimeMinutes(w.from),
-          to: parseTimeMinutes(w.to),
-        }));
-        pool = pool.filter((z) => {
-          const { hour, minute } = parseRawTimestamp(z.start_time);
-          const zm = hour * 60 + minute;
-          for (const w of parsed) {
-            if (w.from <= w.to) {
-              if (zm >= w.from && zm <= w.to) return true;
-            } else {
-              if (zm >= w.from || zm <= w.to) return true;
-            }
-          }
-          return false;
-        });
-      }
-      return pool;
-    },
-    [
-      runResult.syntheticZones,
-      adxFilterEnabled,
-      adxMin,
-      adxMax,
-      atrFilterEnabled,
-      atrMin,
-      atrMax,
-      trendFilterEnabled,
-      ema20Mode,
-      ema200Mode,
-      bollingerFilterEnabled,
-      bollingerAllowed,
-      bbWidthFilterEnabled,
-      bbWidthMin,
-      bbWidthMax,
-      maDistanceFilterEnabled,
-      maDistanceMode,
-      maDistanceMin,
-      maDistanceMax,
-      volumeFilterEnabled,
-      volumeMinRatio,
-      volumeMaxRatio,
-      rsiFilterEnabled,
-      rsiMin,
-      rsiMax,
-      adxTrendFilterEnabled,
-      adxTrendMode,
-      adxTrendFlatThreshold,
-      deltaFilterEnabled,
-      deltaMin,
-      deltaMax,
-      timeFilterEnabled,
-      timeWindows,
-      parseTimeMinutes,
-    ]
-  );
-
-  const runOptimizeAdx = useCallback(async () => {
-    if (runResult.syntheticZones.length === 0 || contextOptimizing) return;
-    setContextOptimizing(true);
-    try {
-      const result = await optimizeAdxInWorker(
-        buildBasePool("adx"),
-        runResult.syntheticBarsByZoneId,
-        rules,
-        runResult.syntheticAtrByZoneId
-      );
-      if (!result) {
-        showToast("ADX optimizer: no range produced at least 20 trades.");
-        return;
-      }
-      setAdxFilterEnabled(true);
-      setAdxMin(result.min);
-      setAdxMax(result.max);
-    } finally {
-      setContextOptimizing(false);
-    }
-  }, [
-    runResult.syntheticZones,
-    runResult.syntheticBarsByZoneId,
-    runResult.syntheticAtrByZoneId,
-    rules,
-    contextOptimizing,
-    buildBasePool,
-    showToast,
-  ]);
-
-  const runOptimizeAtr = useCallback(async () => {
-    if (runResult.syntheticZones.length === 0 || contextOptimizing) return;
-    setContextOptimizing(true);
-    try {
-      const result = await optimizeAtrInWorker(
-        buildBasePool("atr"),
-        runResult.syntheticBarsByZoneId,
-        rules,
-        runResult.syntheticAtrByZoneId
-      );
-      if (!result) {
-        showToast("ATR optimizer: no range produced at least 20 trades.");
-        return;
-      }
-      setAtrFilterEnabled(true);
-      setAtrMin(result.min);
-      setAtrMax(result.max);
-    } finally {
-      setContextOptimizing(false);
-    }
-  }, [
-    runResult.syntheticZones,
-    runResult.syntheticBarsByZoneId,
-    runResult.syntheticAtrByZoneId,
-    rules,
-    contextOptimizing,
-    buildBasePool,
-    showToast,
-  ]);
-
-  const runOptimizeTrend = useCallback(async () => {
-    if (runResult.syntheticZones.length === 0 || contextOptimizing) return;
-    setContextOptimizing(true);
-    try {
-      const result = await optimizeTrendInWorker(
-        buildBasePool("trend"),
-        runResult.syntheticBarsByZoneId,
-        rules,
-        runResult.syntheticAtrByZoneId
-      );
-      if (!result) {
-        showToast("Trend optimizer: no combination produced at least 20 trades.");
-        return;
-      }
-      setTrendFilterEnabled(true);
-      setEma20Mode(result.ema20Mode);
-      setEma200Mode(result.ema200Mode);
-    } finally {
-      setContextOptimizing(false);
-    }
-  }, [
-    runResult.syntheticZones,
-    runResult.syntheticBarsByZoneId,
-    runResult.syntheticAtrByZoneId,
-    rules,
-    contextOptimizing,
-    buildBasePool,
-    showToast,
-  ]);
-
-  const runOptimizeBollinger = useCallback(async () => {
-    if (runResult.syntheticZones.length === 0 || contextOptimizing) return;
-    setContextOptimizing(true);
-    try {
-      const result = await optimizeBollingerInWorker(
-        buildBasePool("bollinger"),
-        runResult.syntheticBarsByZoneId,
-        rules,
-        runResult.syntheticAtrByZoneId
-      );
-      if (!result) {
-        showToast("Bollinger optimizer: no subset produced at least 20 trades.");
-        return;
-      }
-      setBollingerFilterEnabled(true);
-      setBollingerAllowed(new Set(result.allowed));
-    } finally {
-      setContextOptimizing(false);
-    }
-  }, [
-    runResult.syntheticZones,
-    runResult.syntheticBarsByZoneId,
-    runResult.syntheticAtrByZoneId,
-    rules,
-    contextOptimizing,
-    buildBasePool,
-    showToast,
-  ]);
-
-  const runOptimizeBbWidth = useCallback(async () => {
-    if (runResult.syntheticZones.length === 0 || contextOptimizing) return;
-    setContextOptimizing(true);
-    try {
-      const result = await optimizeBbWidthInWorker(
-        buildBasePool("bbWidth"),
-        runResult.syntheticBarsByZoneId,
-        rules,
-        runResult.syntheticAtrByZoneId
-      );
-      if (!result) {
-        showToast("BB-width optimizer: no range produced at least 20 trades.");
-        return;
-      }
-      setBbWidthFilterEnabled(true);
-      setBbWidthMin(result.min);
-      setBbWidthMax(result.max);
-    } finally {
-      setContextOptimizing(false);
-    }
-  }, [
-    runResult.syntheticZones,
-    runResult.syntheticBarsByZoneId,
-    runResult.syntheticAtrByZoneId,
-    rules,
-    contextOptimizing,
-    buildBasePool,
-    showToast,
-  ]);
-
-  const runOptimizeMaDistance = useCallback(async () => {
-    if (runResult.syntheticZones.length === 0 || contextOptimizing) return;
-    setContextOptimizing(true);
-    try {
-      const result = await optimizeMaDistanceInWorker(
-        buildBasePool("maDistance"),
-        runResult.syntheticBarsByZoneId,
-        rules,
-        runResult.syntheticAtrByZoneId
-      );
-      if (!result) {
-        showToast("MA-distance optimizer: no range produced at least 20 trades.");
-        return;
-      }
-      setMaDistanceFilterEnabled(true);
-      setMaDistanceMode(result.mode);
-      setMaDistanceMin(result.min);
-      setMaDistanceMax(result.max);
-    } finally {
-      setContextOptimizing(false);
-    }
-  }, [
-    runResult.syntheticZones,
-    runResult.syntheticBarsByZoneId,
-    runResult.syntheticAtrByZoneId,
-    rules,
-    contextOptimizing,
-    buildBasePool,
-    showToast,
-  ]);
-
-  const runOptimizeVolume = useCallback(async () => {
-    if (runResult.syntheticZones.length === 0 || contextOptimizing) return;
-    setContextOptimizing(true);
-    try {
-      const result = await optimizeVolumeInWorker(
-        buildBasePool("volume"),
-        runResult.syntheticBarsByZoneId,
-        rules,
-        runResult.syntheticAtrByZoneId
-      );
-      if (!result) {
-        showToast("Volume optimizer: no range produced at least 20 trades.");
-        return;
-      }
-      setVolumeFilterEnabled(true);
-      setVolumeMinRatio(result.min);
-      setVolumeMaxRatio(result.max);
-    } finally {
-      setContextOptimizing(false);
-    }
-  }, [
-    runResult.syntheticZones,
-    runResult.syntheticBarsByZoneId,
-    runResult.syntheticAtrByZoneId,
-    rules,
-    contextOptimizing,
-    buildBasePool,
-    showToast,
-  ]);
-
-  const runOptimizeRsi = useCallback(async () => {
-    if (runResult.syntheticZones.length === 0 || contextOptimizing) return;
-    setContextOptimizing(true);
-    try {
-      const result = await optimizeRsiInWorker(
-        buildBasePool("rsi"),
-        runResult.syntheticBarsByZoneId,
-        rules,
-        runResult.syntheticAtrByZoneId
-      );
-      if (!result) {
-        showToast("RSI optimizer: no range produced at least 20 trades.");
-        return;
-      }
-      setRsiFilterEnabled(true);
-      setRsiMin(result.min);
-      setRsiMax(result.max);
-    } finally {
-      setContextOptimizing(false);
-    }
-  }, [
-    runResult.syntheticZones,
-    runResult.syntheticBarsByZoneId,
-    runResult.syntheticAtrByZoneId,
-    rules,
-    contextOptimizing,
-    buildBasePool,
-    showToast,
-  ]);
-
-  const runOptimizeAdxTrend = useCallback(async () => {
-    if (runResult.syntheticZones.length === 0 || contextOptimizing) return;
-    setContextOptimizing(true);
-    try {
-      const result = await optimizeAdxTrendInWorker(
-        buildBasePool("adxTrend"),
-        runResult.syntheticBarsByZoneId,
-        rules,
-        runResult.syntheticAtrByZoneId
-      );
-      if (!result) {
-        showToast("ADX-direction optimizer: no mode produced at least 20 trades.");
-        return;
-      }
-      setAdxTrendFilterEnabled(true);
-      setAdxTrendMode(result.mode);
-      setAdxTrendFlatThreshold(result.flatThreshold);
-    } finally {
-      setContextOptimizing(false);
-    }
-  }, [
-    runResult.syntheticZones,
-    runResult.syntheticBarsByZoneId,
-    runResult.syntheticAtrByZoneId,
-    rules,
-    contextOptimizing,
-    buildBasePool,
-    showToast,
-  ]);
-
-  // ─── Time optimizer callback ─────────────────────────────────────
-  // Sweeps every contiguous 30-min sub-window over the CONTEXT-filtered
-  // synthetic zones (mirrors simulator-panel.tsx — context filters are
-  // permanent constraints, so the time sweep respects them). The time
-  // filter itself is bypassed during the sweep so the optimizer can
-  // search outside the user's current window. Auto-enables the time
-  // filter so the result is immediately visible.
-  const handleOptimizeTime = useCallback(
-    (minWindowMinutes: number) => {
-      if (contextFilteredZones.length === 0 || optimizingTime) return;
-
-      setShowTimeOptModal(false);
-      timeCancelRef.current = false;
-      setOptimizingTime(true);
-      setOptimizeTimeProgress(0);
-
-      runTimeOptimizeChunked(
-        contextFilteredZones,
-        runResult.syntheticBarsByZoneId,
-        rules,
-        minWindowMinutes,
-        (p) => setOptimizeTimeProgress(p),
-        timeCancelRef,
-        runResult.syntheticAtrByZoneId
-      ).then((result) => {
-        setTimeFilterEnabled(true);
-        // Optimizer finds ONE best window — REPLACE the windows list
-        // with that single window. Users who want to stack additional
-        // windows on top can re-add them manually after the optimizer
-        // applies. Same convention the other context optimizers use
-        // (they overwrite the user's prior min/max with the best one).
-        setTimeWindows([{ from: result.bestTimeFrom, to: result.bestTimeTo }]);
-        setOptimizingTime(false);
-        setOptimizeTimeProgress(null);
-      });
-    },
-    [
-      contextFilteredZones,
-      runResult.syntheticBarsByZoneId,
-      runResult.syntheticAtrByZoneId,
-      rules,
-      optimizingTime,
-    ]
-  );
 
   // ─── CSV export ───────────────────────────────────────────────────
   // Mirrors the risk simulator's CSV export: one row per simulated trade
@@ -5181,25 +4433,22 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
   return (
     <div
       ref={splitContainerRef}
-      // In Script mode the dashboard renders as a 2-column flex layout:
-      // left = the existing UI controls + results (the click-through
-      // surface), right = the script editor + output panel in a sticky
-      // rail. The user-confirmed default is 60/40 left/right; ratio
-      // persists in localStorage and is editable via the drag divider
-      // between the two panes (see splitContainerRef + onSplitDown).
-      // No `gap` because the divider itself provides the visual
-      // separation — adding gap would make the divider hit-target feel
-      // detached from the columns it's resizing.
-      className={mode === "script" ? "flex flex-row gap-0 items-start" : "space-y-4"}
+      // The dashboard renders as a 2-column flex layout: left = the
+      // click-through controls + results, right = the script editor +
+      // output panel in a sticky rail. The user-confirmed default is
+      // 60/40 left/right; ratio persists in localStorage and is editable
+      // via the drag divider between the two panes (see splitContainerRef
+      // + onSplitDown). No `gap` because the divider itself provides the
+      // visual separation — adding gap would make the divider hit-target
+      // feel detached from the columns it's resizing.
+      className="flex flex-row gap-0 items-start"
     >
       <div
-        className={mode === "script" ? "min-w-0 space-y-4 pr-3" : "contents"}
+        className="min-w-0 space-y-4 pr-3"
         // Width is set as an inline percentage so the drag divider can
         // mutate it directly without reaching into Tailwind's spacing
-        // scale. In UI mode the wrapper uses `display: contents` so the
-        // outer space-y-4 layout sees the children as direct kids —
-        // legacy single-column behavior is byte-identical.
-        style={mode === "script" ? { width: `${scriptLeftPct}%` } : undefined}
+        // scale.
+        style={{ width: `${scriptLeftPct}%` }}
       >
       {/* ── Sticky walk-forward control bar ──────────────────────────
           Sticky-positioned at the very top of the left column so the
@@ -5253,66 +4502,55 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
           >
             Next →
           </button>
-          {/* ── Script-mode View sub-toggle ──────────────────────
-              Only visible in script mode. Switches the left column
-              between the legacy controls (UI) and a TradingView
-              candlestick chart (Chart) of the selected sessions.
-              Lives in the walk-forward sticky bar so it stays in
-              reach while the user scrolls deep into the trade
-              table. `ml-auto` pushes it (and the days span that
-              follows) to the right edge of the bar — keeps the
-              walk-forward buttons grouped at the left. */}
-          {mode === "script" && (
-            <div
-              className="ml-auto inline-flex rounded-md overflow-hidden border border-card-border"
-              role="group"
-              aria-label="Script view"
-            >
-              {(["ui", "chart"] as const).map((v) => (
-                <button
-                  key={v}
-                  onClick={() => setScriptViewMode(v)}
-                  className={`px-2.5 py-1 text-xs font-medium transition-colors ${
-                    scriptViewMode === v
-                      ? "bg-accent-green/20 text-accent-green"
-                      : "bg-white/5 text-muted-foreground hover:text-foreground hover:bg-white/10"
-                  }`}
-                  title={
-                    v === "ui"
-                      ? "Show controls + day picker + results"
-                      : "Show a candlestick chart of the selected sessions with signal/trade markers"
-                  }
-                >
-                  {v === "ui" ? "UI" : "Chart"}
-                </button>
-              ))}
-            </div>
-          )}
+          {/* ── View sub-toggle ──────────────────────────────────────
+              Switches the left column between the click-through controls
+              (UI) and a TradingView candlestick chart (Chart) of the
+              selected sessions. Lives in the walk-forward sticky bar so
+              it stays in reach while the user scrolls deep into the trade
+              table. `ml-auto` pushes it (and the days span that follows)
+              to the right edge of the bar — keeps the walk-forward
+              buttons grouped at the left. */}
+          <div
+            className="ml-auto inline-flex rounded-md overflow-hidden border border-card-border"
+            role="group"
+            aria-label="Script view"
+          >
+            {(["ui", "chart"] as const).map((v) => (
+              <button
+                key={v}
+                onClick={() => setScriptViewMode(v)}
+                className={`px-2.5 py-1 text-xs font-medium transition-colors ${
+                  scriptViewMode === v
+                    ? "bg-accent-green/20 text-accent-green"
+                    : "bg-white/5 text-muted-foreground hover:text-foreground hover:bg-white/10"
+                }`}
+                title={
+                  v === "ui"
+                    ? "Show controls + day picker + results"
+                    : "Show a candlestick chart of the selected sessions with signal/trade markers"
+                }
+              >
+                {v === "ui" ? "UI" : "Chart"}
+              </button>
+            ))}
+          </div>
           {selectedSessionIds.size > 0 && (
-            <span
-              className={`text-xs text-muted-foreground ${
-                mode === "script" ? "" : "ml-auto"
-              }`}
-            >
+            <span className="text-xs text-muted-foreground">
               Days {walkForwardStart + 1}–{wfWindowEnd} of {sessionsChrono.length}
             </span>
           )}
         </div>
       )}
 
-      {/* ── Script-mode Chart-view branch ──────────────────────────────
-          When the user picks "Chart" in the View toggle (script mode
-          only), all the click-through left-column children (Presets,
-          Mode toggle, Day picker, Results, Stat cards, ...) are
-          collapsed and replaced with a candlestick chart of the
+      {/* ── Chart-view branch ──────────────────────────────────────────
+          When the user picks "Chart" in the View toggle, the click-through
+          left-column children (Presets, Day picker, Results, Stat cards,
+          ...) are collapsed and replaced with a candlestick chart of the
           selected sessions. The walk-forward sticky bar above stays
-          visible because it owns the UI/Chart toggle that gets you
-          back here. The right rail (script editor + output panel) is
-          unaffected — it lives outside this wrapper.
-
-          UI-mode branch: render the entire legacy left-column
-          subtree, byte-identical to the pre-feature behavior. */}
-      {!(mode === "script" && scriptViewMode === "chart") && (
+          visible because it owns the UI/Chart toggle that gets you back
+          here. The right rail (script editor + output panel) is
+          unaffected — it lives outside this wrapper. */}
+      {scriptViewMode !== "chart" && (
         <>
       {/* ── Presets — saved configurations of strategy + params + rules
             + filters. Sits at the top so users land on it first when
@@ -5329,48 +4567,9 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
         liveParamMeta={scriptParamMeta}
       />
 
-      {/* ── UI ↔ Script mode toggle ─────────────────────────────────
-          Sits at the top of the editing surface so it's always visible
-          regardless of mode. In "ui" the click-through controls below are
-          live; in "script" they're hidden and the script editor takes
-          their place. Day selection / results / exports stay visible in
-          both — they aren't config, they're the act of running a backtest. */}
-      <div className="bg-card border border-card-border rounded-lg p-3 flex items-center justify-between flex-wrap gap-3">
-        <div className="flex items-center gap-2">
-          <span className="text-xs text-muted-foreground uppercase tracking-wider">
-            Mode
-          </span>
-          <div className="inline-flex rounded-md overflow-hidden border border-card-border">
-            {(["ui", "script"] as const).map((m) => (
-              <button
-                key={m}
-                onClick={() => setMode(m)}
-                className={`px-3 py-1 text-xs font-medium transition-colors ${
-                  mode === m
-                    ? "bg-accent-green/20 text-accent-green"
-                    : "bg-white/5 text-muted-foreground hover:text-foreground hover:bg-white/10"
-                }`}
-              >
-                {m === "ui" ? "UI" : "Script"}
-              </button>
-            ))}
-          </div>
-          <span className="text-[11px] text-muted-foreground/70 ml-2">
-            {mode === "ui"
-              ? "Edit configuration via the click-through controls below."
-              : "Edit the full configuration as a script. Use ⌃space / ⌘space for suggestions."}
-          </span>
-        </div>
-        {/* Reference / Sync from UI / Apply buttons used to live here.
-            They've been promoted to the sticky control bar at the top
-            of the right rail so they're always reachable while editing
-            the script — see the aside near the bottom of this return. */}
-      </div>
-
-      {/* Script editor lives in the RIGHT RAIL when mode === "script"
-          (see the aside near the bottom of this return). The inline
-          render here intentionally produces nothing in script mode so the
-          editor isn't double-mounted. */}
+      {/* Script editor lives in the RIGHT RAIL aside near the bottom of
+          this return — the inline render here intentionally produces
+          nothing so the editor isn't double-mounted. */}
 
       {/* ── Day picker ────────────────────────────────────────────────
           Multi-select chip grid of every downloaded session. Click a chip to
@@ -5827,1023 +5026,10 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
         scriptText={scriptText}
         scriptParams={scriptParams}
         paramMeta={scriptParamMeta}
-        onParamChange={(key, value) =>
-          setScriptParams((prev) => ({ ...prev, [key]: value }))
-        }
-        onLoadTemplate={(tpl: StrategyTemplate) => {
-          // Prepend the template's script with a separator so any
-          // existing rules/filters lines below remain. Most users start
-          // empty so this just installs the template.
-          const sep = scriptText.trim() === "" ? "" : `\n\n// ── existing script preserved below ──\n`;
-          setScriptText(tpl.script + sep + scriptText);
-          // Seed paramMeta + scriptParams with the template's defaults.
-          // The user's previously-tuned scriptParams for matching keys
-          // are preserved (preference > template default).
-          setScriptParamMeta((prev) => ({ ...tpl.paramMeta, ...prev }));
-          setScriptParams((prev) => {
-            const next = { ...prev };
-            for (const [k, m] of Object.entries(tpl.paramMeta)) {
-              if (next[k] === undefined) next[k] = m.default;
-            }
-            return next;
-          });
-        }}
+        onParamChange={handleScriptParamChange}
+        onLoadTemplate={handleLoadStrategyTemplate}
       />
 
-      {/* All click-through configuration — strategy picker, parameter
-          editor, time filter, context filters, and SimRules — only render
-          in UI mode. In script mode the editor on the right is the single
-          source of truth, so showing these controls would let users
-          accidentally tweak values that the script then silently
-          overrides on the next Apply. Day picker / results / exports
-          live OUTSIDE this gate because they're not configuration. */}
-      {mode === "ui" && (
-      <>
-      {/* ── Strategy picker + parameter editor ───────────────────────
-          Strategy dropdown drives which paramFields render below it. Each
-          field is a labeled numeric input; reset button restores defaults
-          for the current strategy. Inputs are uncontrolled with a 150ms
-          debounce so typing stays smooth. */}
-      <div className="bg-card border border-card-border rounded-lg p-4">
-        <div className="flex items-center justify-between mb-3">
-          <h3 className="text-sm text-muted-foreground uppercase tracking-wider">
-            Strategy
-          </h3>
-          <button
-            onClick={resetParams}
-            className="px-2 py-1 rounded text-xs font-medium bg-white/5 text-muted-foreground hover:text-foreground hover:bg-white/10 transition-colors"
-          >
-            Reset Defaults
-          </button>
-        </div>
-        <select
-          value={strategyId}
-          onChange={(e) => setStrategyId(e.target.value)}
-          className="w-full bg-card border border-card-border rounded-md px-3 py-2 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-accent-green mb-2"
-        >
-          {STRATEGIES.map((s) => (
-            <option key={s.id} value={s.id}>
-              {s.label}
-            </option>
-          ))}
-        </select>
-        <p className="text-xs text-muted-foreground mb-3">{currentStrategy.description}</p>
-
-        <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-3">
-          {currentStrategy.paramFields.map((field) => {
-            // The `key` prop tied to strategyId AND paramsVersion forces
-            // the uncontrolled input to remount when the user switches
-            // strategies OR when an optimizer mutates this value, so the
-            // displayed defaultValue stays in sync with state.
-            const value = params[field.key] ?? field.default;
-            const isOptimizingThis = optimizingParamKey === field.key;
-            const optDisabled =
-              (optimizingParamKey !== null && !isOptimizingThis) ||
-              selectedSessionIds.size === 0 ||
-              loadingCount > 0;
-            return (
-              <label
-                key={`${strategyId}.${field.key}.${paramsVersion}`}
-                className="flex flex-col gap-1"
-                title={field.description}
-              >
-                <span className="text-xs text-muted-foreground">{field.label}</span>
-                <div className="flex items-stretch gap-1.5">
-                  <input
-                    type="number"
-                    defaultValue={value}
-                    min={field.min}
-                    max={field.max}
-                    step={field.step}
-                    onChange={(e) => {
-                      const n = parseFloat(e.target.value);
-                      handleParamChange(field.key, Number.isFinite(n) ? n : field.default);
-                    }}
-                    className="flex-1 min-w-0 bg-card border border-card-border rounded-md px-2 py-1 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-accent-green"
-                  />
-                  {/* Per-param OPT button. Sweeps [field.min, field.max] in
-                      step increments, holds every other param at its
-                      current value, and applies the value with the highest
-                      total scaledPoints. Click again mid-run to cancel
-                      (applies best-so-far). Tooltip surfaces the live
-                      progress percentage when running. */}
-                  <button
-                    onClick={() => handleOptimizeParam(field)}
-                    disabled={optDisabled}
-                    title={
-                      isOptimizingThis
-                        ? `Optimizing ${field.label}... ${optimizeParamProgress !== null ? `${Math.round(optimizeParamProgress * 100)}%` : ""}\nClick to cancel and apply best-so-far.`
-                        : selectedSessionIds.size === 0
-                          ? "Select at least one downloaded day to enable per-param optimization."
-                          : `Sweep ${field.label} across [${field.min}, ${field.max}] step ${field.step} and pick the value with the highest total points.`
-                    }
-                    className={`px-2 rounded-md text-[10px] font-bold tracking-wider transition-colors whitespace-nowrap ${
-                      isOptimizingThis
-                        ? "bg-accent-green/30 text-accent-green"
-                        : optDisabled
-                          ? "bg-white/5 text-muted-foreground/40 cursor-not-allowed"
-                          : "bg-white/5 text-muted-foreground hover:text-foreground hover:bg-white/10"
-                    }`}
-                  >
-                    {isOptimizingThis
-                      ? optimizeParamProgress !== null
-                        ? `${Math.round(optimizeParamProgress * 100)}%`
-                        : "..."
-                      : "OPT"}
-                  </button>
-                </div>
-              </label>
-            );
-          })}
-        </div>
-      </div>
-
-      {/* ── Time-of-day filter ──────────────────────────────────────
-          Same control bar pattern as the risk simulator: a master toggle,
-          an OPTIMIZE TIME button (opens a min-window modal), and the two
-          time inputs (only shown when the filter is on). The filter
-          narrows the synthetic zones produced by the strategy generator
-          BEFORE they hit the simulator + optimizers. */}
-      <div className="flex items-center gap-3 flex-wrap">
-        <button
-          onClick={() => setTimeFilterEnabled(!timeFilterEnabled)}
-          className={`px-2.5 py-1 rounded text-xs font-medium transition-colors ${
-            timeFilterEnabled
-              ? "bg-accent-green/20 text-accent-green"
-              : "bg-white/5 text-muted-foreground hover:text-foreground"
-          }`}
-        >
-          {timeFilterEnabled ? "TIME FILTER ON" : "TIME FILTER OFF"}
-        </button>
-
-        {/* OPTIMIZE TIME — opens the min-window modal, then runs the time
-            optimizer. While running, clicking again cancels via timeCancelRef.
-            Disabled until at least one synthetic zone has been produced. */}
-        <button
-          onClick={
-            optimizingTime
-              ? () => {
-                  timeCancelRef.current = true;
-                }
-              : () => setShowTimeOptModal(true)
-          }
-          disabled={runResult.syntheticZones.length === 0 || optimizing || optimizingAtr}
-          className={`px-2.5 py-1 rounded text-xs font-medium transition-colors ${
-            optimizingTime
-              ? "bg-accent-green/20 text-accent-green"
-              : runResult.syntheticZones.length === 0 || optimizing || optimizingAtr
-                ? "bg-white/5 text-muted-foreground/40 cursor-not-allowed"
-                : "bg-white/5 text-muted-foreground hover:text-foreground hover:bg-white/10"
-          }`}
-        >
-          {optimizingTime
-            ? `OPTIMIZING TIME ${optimizeTimeProgress !== null ? `${Math.round(optimizeTimeProgress * 100)}%` : "..."}`
-            : "OPTIMIZE TIME"}
-        </button>
-
-        {/* Export buttons used to live here; they were extracted to a
-            standalone row that renders in BOTH UI and Script mode (see
-            below the rules section), so script-mode users can still
-            export their backtest results. */}
-
-        {timeFilterEnabled && (
-          <>
-            {/* Each window is editable + removable; the "+ Add window"
-                button appends a new row. Bars pass when their time falls
-                in ANY window (OR semantics). The last surviving window
-                CAN be removed — clicking remove on the only row leaves
-                the windows list empty, which short-circuits the time
-                filter to a no-op (functionally identical to disabling
-                the filter, but keeps the master toggle's intent). */}
-            {timeWindows.map((w, idx) => (
-              <div
-                key={idx}
-                className="flex items-center gap-1.5 bg-card/40 border border-card-border rounded-md pl-2 pr-1 py-0.5"
-              >
-                <label className="text-xs text-muted-foreground">From</label>
-                <input
-                  type="time"
-                  value={w.from}
-                  onChange={(e) =>
-                    setTimeWindows((prev) => {
-                      const next = [...prev];
-                      next[idx] = { ...next[idx], from: e.target.value };
-                      return next;
-                    })
-                  }
-                  className="bg-card border border-card-border rounded-md px-2 py-1 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-accent-green"
-                />
-                <label className="text-xs text-muted-foreground">To</label>
-                <input
-                  type="time"
-                  value={w.to}
-                  onChange={(e) =>
-                    setTimeWindows((prev) => {
-                      const next = [...prev];
-                      next[idx] = { ...next[idx], to: e.target.value };
-                      return next;
-                    })
-                  }
-                  className="bg-card border border-card-border rounded-md px-2 py-1 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-accent-green"
-                />
-                <button
-                  onClick={() =>
-                    setTimeWindows((prev) => prev.filter((_, i) => i !== idx))
-                  }
-                  className="px-1.5 py-0.5 rounded text-xs text-muted-foreground hover:text-foreground hover:bg-white/10"
-                  title="Remove this window"
-                  aria-label="Remove window"
-                >
-                  ×
-                </button>
-              </div>
-            ))}
-            <button
-              onClick={() =>
-                setTimeWindows((prev) => [
-                  ...prev,
-                  // Default a new window to the latest one's `to` as the
-                  // start so users typing two consecutive sessions just
-                  // adjust the end time. If there are no windows yet, fall
-                  // back to a sensible RTH afternoon default.
-                  prev.length > 0
-                    ? { from: prev[prev.length - 1].to, to: "16:00" }
-                    : { from: "09:30", to: "16:00" },
-                ])
-              }
-              className="px-2.5 py-1 rounded text-xs font-medium bg-white/5 text-muted-foreground hover:text-foreground hover:bg-white/10"
-              title="Add another time window — passes are OR'd"
-            >
-              + Add window
-            </button>
-            <span className="text-xs text-muted-foreground">
-              {timeFilteredZones.length} of {runResult.syntheticZones.length} signals
-            </span>
-          </>
-        )}
-      </div>
-
-      {/* ── Context filters — read ctx_* fields the backtest engine
-            stamps onto each synthetic zone at signal entry. Same UX as
-            the risk simulator's filter bars: independent toggles, an
-            OPTIMIZE button per filter (worker-backed, runs in
-            background tabs), and per-filter inputs that appear when the
-            toggle is on. All four AND together and apply BEFORE the
-            time filter so optimizers downstream respect them. */}
-
-      {/* ADX range filter */}
-      <div className="flex items-center gap-3 flex-wrap">
-        <button
-          onClick={() => setAdxFilterEnabled(!adxFilterEnabled)}
-          className={`px-2.5 py-1 rounded text-xs font-medium transition-colors ${
-            adxFilterEnabled
-              ? "bg-accent-green/20 text-accent-green"
-              : "bg-white/5 text-muted-foreground hover:text-foreground"
-          }`}
-        >
-          {adxFilterEnabled ? "ADX FILTER ON" : "ADX FILTER OFF"}
-        </button>
-        <button
-          onClick={runOptimizeAdx}
-          disabled={runResult.syntheticZones.length === 0 || contextOptimizing}
-          className="px-2.5 py-1 rounded text-xs font-medium bg-white/5 text-muted-foreground hover:text-foreground hover:bg-white/10 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-          title="Sweep ADX min/max ranges, keep the one with the best avg points/trade (min 20 trades). Respects other active filters."
-        >
-          {contextOptimizing ? "OPTIMIZING..." : "OPTIMIZE"}
-        </button>
-        {adxFilterEnabled && (
-          <>
-            <div className="flex items-center gap-1.5">
-              <label className="text-xs text-muted-foreground">Min</label>
-              <input
-                type="number"
-                min={0}
-                max={100}
-                step={1}
-                value={adxMin}
-                onChange={(e) => setAdxMin(Number(e.target.value))}
-                className="w-16 bg-card border border-card-border rounded-md px-2 py-1 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-accent-green"
-              />
-            </div>
-            <div className="flex items-center gap-1.5">
-              <label className="text-xs text-muted-foreground">Max</label>
-              <input
-                type="number"
-                min={0}
-                max={100}
-                step={1}
-                value={adxMax}
-                onChange={(e) => setAdxMax(Number(e.target.value))}
-                className="w-16 bg-card border border-card-border rounded-md px-2 py-1 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-accent-green"
-              />
-            </div>
-            <div className="flex items-center gap-1.5">
-              <label className="text-xs text-muted-foreground">Period</label>
-              <input
-                type="number"
-                min={2}
-                max={200}
-                step={1}
-                value={adxPeriod}
-                onChange={(e) => setAdxPeriod(Math.max(2, Number(e.target.value) || 14))}
-                className="w-16 bg-card border border-card-border rounded-md px-2 py-1 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-accent-green"
-              />
-            </div>
-            <span className="text-xs text-muted-foreground">
-              ADX({adxPeriod}) at entry — higher = trending, lower = choppy
-            </span>
-          </>
-        )}
-      </div>
-
-      {/* ATR range filter */}
-      <div className="flex items-center gap-3 flex-wrap">
-        <button
-          onClick={() => setAtrFilterEnabled(!atrFilterEnabled)}
-          className={`px-2.5 py-1 rounded text-xs font-medium transition-colors ${
-            atrFilterEnabled
-              ? "bg-accent-green/20 text-accent-green"
-              : "bg-white/5 text-muted-foreground hover:text-foreground"
-          }`}
-        >
-          {atrFilterEnabled ? "ATR FILTER ON" : "ATR FILTER OFF"}
-        </button>
-        <button
-          onClick={runOptimizeAtr}
-          disabled={runResult.syntheticZones.length === 0 || contextOptimizing}
-          className="px-2.5 py-1 rounded text-xs font-medium bg-white/5 text-muted-foreground hover:text-foreground hover:bg-white/10 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-          title="Sweep ATR min/max ranges, keep the one with the best avg points/trade (min 20 trades). Respects other active filters."
-        >
-          {contextOptimizing ? "OPTIMIZING..." : "OPTIMIZE"}
-        </button>
-        {atrFilterEnabled && (
-          <>
-            <div className="flex items-center gap-1.5">
-              <label className="text-xs text-muted-foreground">Min</label>
-              <input
-                type="number"
-                min={0}
-                max={100}
-                step={0.5}
-                value={atrMin}
-                onChange={(e) => setAtrMin(Number(e.target.value))}
-                className="w-16 bg-card border border-card-border rounded-md px-2 py-1 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-accent-green"
-              />
-            </div>
-            <div className="flex items-center gap-1.5">
-              <label className="text-xs text-muted-foreground">Max</label>
-              <input
-                type="number"
-                min={0}
-                max={100}
-                step={0.5}
-                value={atrMax}
-                onChange={(e) => setAtrMax(Number(e.target.value))}
-                className="w-16 bg-card border border-card-border rounded-md px-2 py-1 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-accent-green"
-              />
-            </div>
-            <div className="flex items-center gap-1.5">
-              <label className="text-xs text-muted-foreground">Period</label>
-              <input
-                type="number"
-                min={2}
-                max={200}
-                step={1}
-                value={atrPeriod}
-                onChange={(e) => setAtrPeriod(Math.max(2, Number(e.target.value) || 14))}
-                className="w-16 bg-card border border-card-border rounded-md px-2 py-1 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-accent-green"
-                title="Wilder ATR period — drives this filter AND the ± ATR adjust math on SL/TP/Trail/BE."
-              />
-            </div>
-            <span className="text-xs text-muted-foreground">
-              ATR({atrPeriod}) at entry, in points
-            </span>
-          </>
-        )}
-      </div>
-
-      {/* Trend-alignment filter (price vs EMA20 / EMA200) */}
-      <div className="flex items-center gap-3 flex-wrap">
-        <button
-          onClick={() => setTrendFilterEnabled(!trendFilterEnabled)}
-          className={`px-2.5 py-1 rounded text-xs font-medium transition-colors ${
-            trendFilterEnabled
-              ? "bg-accent-green/20 text-accent-green"
-              : "bg-white/5 text-muted-foreground hover:text-foreground"
-          }`}
-        >
-          {trendFilterEnabled ? "TREND FILTER ON" : "TREND FILTER OFF"}
-        </button>
-        <button
-          onClick={runOptimizeTrend}
-          disabled={runResult.syntheticZones.length === 0 || contextOptimizing}
-          className="px-2.5 py-1 rounded text-xs font-medium bg-white/5 text-muted-foreground hover:text-foreground hover:bg-white/10 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-          title="Try all 9 combinations of EMA20 × EMA200 modes, keep the best avg points/trade (min 20 trades). Respects other active filters."
-        >
-          {contextOptimizing ? "OPTIMIZING..." : "OPTIMIZE"}
-        </button>
-        {trendFilterEnabled && (
-          <>
-            {/* Fast leg — type + period drive ctx_ema20 / ctx_price_vs_ema20 */}
-            <div className="flex items-center gap-1.5">
-              <label className="text-xs text-muted-foreground">Fast</label>
-              <select
-                value={trendFastType}
-                onChange={(e) => setTrendFastType(e.target.value as MaType)}
-                className="bg-card border border-card-border rounded-md px-1.5 py-1 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-accent-green"
-                title="EMA reacts faster; SMA gives equal weight."
-              >
-                <option value="ema">EMA</option>
-                <option value="sma">SMA</option>
-              </select>
-              <input
-                type="number"
-                min={2}
-                max={500}
-                step={1}
-                value={trendFastPeriod}
-                onChange={(e) =>
-                  setTrendFastPeriod(Math.max(2, Number(e.target.value) || 20))
-                }
-                className="w-16 bg-card border border-card-border rounded-md px-2 py-1 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-accent-green"
-                title="Period of the fast trend MA"
-              />
-              <select
-                value={ema20Mode}
-                onChange={(e) => setEma20Mode(e.target.value as TrendMode)}
-                className="bg-card border border-card-border rounded-md px-2 py-1 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-accent-green"
-              >
-                <option value="any">Any</option>
-                <option value="with">With trend</option>
-                <option value="against">Against trend</option>
-              </select>
-            </div>
-            {/* Slow leg — type + period drive ctx_ema200 / ctx_price_vs_ema200 */}
-            <div className="flex items-center gap-1.5">
-              <label className="text-xs text-muted-foreground">Slow</label>
-              <select
-                value={trendSlowType}
-                onChange={(e) => setTrendSlowType(e.target.value as MaType)}
-                className="bg-card border border-card-border rounded-md px-1.5 py-1 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-accent-green"
-              >
-                <option value="ema">EMA</option>
-                <option value="sma">SMA</option>
-              </select>
-              <input
-                type="number"
-                min={2}
-                max={1000}
-                step={1}
-                value={trendSlowPeriod}
-                onChange={(e) =>
-                  setTrendSlowPeriod(Math.max(2, Number(e.target.value) || 200))
-                }
-                className="w-16 bg-card border border-card-border rounded-md px-2 py-1 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-accent-green"
-                title="Period of the slow trend MA"
-              />
-              <select
-                value={ema200Mode}
-                onChange={(e) => setEma200Mode(e.target.value as TrendMode)}
-                className="bg-card border border-card-border rounded-md px-2 py-1 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-accent-green"
-              >
-                <option value="any">Any</option>
-                <option value="with">With trend</option>
-                <option value="against">Against trend</option>
-              </select>
-            </div>
-            <span className="text-xs text-muted-foreground">
-              With = long above MA / short below
-            </span>
-          </>
-        )}
-      </div>
-
-      {/* Bollinger position filter (multi-select chips) */}
-      <div className="flex items-center gap-3 flex-wrap">
-        <button
-          onClick={() => setBollingerFilterEnabled(!bollingerFilterEnabled)}
-          className={`px-2.5 py-1 rounded text-xs font-medium transition-colors ${
-            bollingerFilterEnabled
-              ? "bg-accent-green/20 text-accent-green"
-              : "bg-white/5 text-muted-foreground hover:text-foreground"
-          }`}
-        >
-          {bollingerFilterEnabled ? "BOLLINGER FILTER ON" : "BOLLINGER FILTER OFF"}
-        </button>
-        <button
-          onClick={runOptimizeBollinger}
-          disabled={runResult.syntheticZones.length === 0 || contextOptimizing}
-          className="px-2.5 py-1 rounded text-xs font-medium bg-white/5 text-muted-foreground hover:text-foreground hover:bg-white/10 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-          title="Try all 7 non-empty subsets of Bollinger positions, keep the best avg points/trade (min 20 trades). Respects other active filters."
-        >
-          {contextOptimizing ? "OPTIMIZING..." : "OPTIMIZE"}
-        </button>
-        {bollingerFilterEnabled && (
-          <>
-            {[
-              { value: "above_upper", label: "Above upper" },
-              { value: "inside", label: "Inside" },
-              { value: "below_lower", label: "Below lower" },
-            ].map((opt) => {
-              const active = bollingerAllowed.has(opt.value);
-              return (
-                <button
-                  key={opt.value}
-                  onClick={() => {
-                    setBollingerAllowed((prev) => {
-                      const next = new Set(prev);
-                      if (next.has(opt.value)) next.delete(opt.value);
-                      else next.add(opt.value);
-                      return next;
-                    });
-                  }}
-                  className={`px-2.5 py-1 rounded text-xs font-medium transition-colors ${
-                    active
-                      ? "bg-accent-green/20 text-accent-green"
-                      : "bg-white/5 text-muted-foreground hover:text-foreground"
-                  }`}
-                >
-                  {opt.label}
-                </button>
-              );
-            })}
-            <div className="flex items-center gap-1.5">
-              <label className="text-xs text-muted-foreground">Period</label>
-              <input
-                type="number"
-                min={2}
-                max={500}
-                step={1}
-                value={bollingerPeriod}
-                onChange={(e) =>
-                  setBollingerPeriod(Math.max(2, Number(e.target.value) || 20))
-                }
-                className="w-16 bg-card border border-card-border rounded-md px-2 py-1 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-accent-green"
-              />
-            </div>
-            <div className="flex items-center gap-1.5">
-              <label className="text-xs text-muted-foreground">σ × </label>
-              <input
-                type="number"
-                min={0.5}
-                max={5}
-                step={0.1}
-                value={bollingerStdDev}
-                onChange={(e) =>
-                  setBollingerStdDev(Math.max(0.1, Number(e.target.value) || 2))
-                }
-                className="w-16 bg-card border border-card-border rounded-md px-2 py-1 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-accent-green"
-              />
-            </div>
-            <span className="text-xs text-muted-foreground">
-              price vs {bollingerPeriod}-SMA ± {bollingerStdDev}σ at entry
-            </span>
-          </>
-        )}
-      </div>
-
-      {/* BB band-width range filter — uses the same period+stdDev as
-          the bollinger position filter above so users tune one set. */}
-      <div className="flex items-center gap-3 flex-wrap">
-        <button
-          onClick={() => setBbWidthFilterEnabled(!bbWidthFilterEnabled)}
-          className={`px-2.5 py-1 rounded text-xs font-medium transition-colors ${
-            bbWidthFilterEnabled
-              ? "bg-accent-green/20 text-accent-green"
-              : "bg-white/5 text-muted-foreground hover:text-foreground"
-          }`}
-        >
-          {bbWidthFilterEnabled ? "BB WIDTH FILTER ON" : "BB WIDTH FILTER OFF"}
-        </button>
-        <button
-          onClick={runOptimizeBbWidth}
-          disabled={runResult.syntheticZones.length === 0 || contextOptimizing}
-          className="px-2.5 py-1 rounded text-xs font-medium bg-white/5 text-muted-foreground hover:text-foreground hover:bg-white/10 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-          title="Sweep band-width percentile bins, keep the range with the best avg points/trade (min 20 trades). Respects other active filters."
-        >
-          {contextOptimizing ? "OPTIMIZING..." : "OPTIMIZE"}
-        </button>
-        {bbWidthFilterEnabled && (
-          <>
-            <div className="flex items-center gap-1.5">
-              <label className="text-xs text-muted-foreground">Min</label>
-              <input
-                type="number"
-                min={0}
-                step={0.25}
-                value={bbWidthMin}
-                onChange={(e) => setBbWidthMin(Number(e.target.value))}
-                className="w-20 bg-card border border-card-border rounded-md px-2 py-1 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-accent-green"
-              />
-            </div>
-            <div className="flex items-center gap-1.5">
-              <label className="text-xs text-muted-foreground">Max</label>
-              <input
-                type="number"
-                min={0}
-                step={0.25}
-                value={bbWidthMax}
-                onChange={(e) => setBbWidthMax(Number(e.target.value))}
-                className="w-20 bg-card border border-card-border rounded-md px-2 py-1 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-accent-green"
-              />
-            </div>
-            <span className="text-xs text-muted-foreground">
-              upper − lower band, in price points (uses BB period/stdDev above)
-            </span>
-          </>
-        )}
-      </div>
-
-      {/* MA distance filter — distance from a configurable MA, in ATR units */}
-      <div className="flex items-center gap-3 flex-wrap">
-        <button
-          onClick={() => setMaDistanceFilterEnabled(!maDistanceFilterEnabled)}
-          className={`px-2.5 py-1 rounded text-xs font-medium transition-colors ${
-            maDistanceFilterEnabled
-              ? "bg-accent-green/20 text-accent-green"
-              : "bg-white/5 text-muted-foreground hover:text-foreground"
-          }`}
-        >
-          {maDistanceFilterEnabled ? "MA DIST FILTER ON" : "MA DIST FILTER OFF"}
-        </button>
-        <button
-          onClick={runOptimizeMaDistance}
-          disabled={runResult.syntheticZones.length === 0 || contextOptimizing}
-          className="px-2.5 py-1 rounded text-xs font-medium bg-white/5 text-muted-foreground hover:text-foreground hover:bg-white/10 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-          title="Sweep |distance|/above/below modes × ATR-unit bins, keep the best avg points/trade (min 20 trades). Respects other active filters."
-        >
-          {contextOptimizing ? "OPTIMIZING..." : "OPTIMIZE"}
-        </button>
-        {maDistanceFilterEnabled && (
-          <>
-            <div className="flex items-center gap-1.5">
-              <select
-                value={maDistanceType}
-                onChange={(e) => setMaDistanceType(e.target.value as MaType)}
-                className="bg-card border border-card-border rounded-md px-1.5 py-1 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-accent-green"
-              >
-                <option value="ema">EMA</option>
-                <option value="sma">SMA</option>
-              </select>
-              <input
-                type="number"
-                min={2}
-                max={1000}
-                step={1}
-                value={maDistancePeriod}
-                onChange={(e) =>
-                  setMaDistancePeriod(Math.max(2, Number(e.target.value) || 50))
-                }
-                className="w-16 bg-card border border-card-border rounded-md px-2 py-1 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-accent-green"
-                title="MA period"
-              />
-            </div>
-            <div className="flex items-center gap-1.5">
-              <label className="text-xs text-muted-foreground">Mode</label>
-              <select
-                value={maDistanceMode}
-                onChange={(e) =>
-                  setMaDistanceMode(e.target.value as MaDistanceMode)
-                }
-                className="bg-card border border-card-border rounded-md px-2 py-1 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-accent-green"
-                title="absolute = |distance| in [min, max]; above/below = price must be on that side."
-              >
-                <option value="absolute">|distance|</option>
-                <option value="above">above MA</option>
-                <option value="below">below MA</option>
-              </select>
-            </div>
-            <div className="flex items-center gap-1.5">
-              <label className="text-xs text-muted-foreground">Min</label>
-              <input
-                type="number"
-                min={0}
-                max={50}
-                step={0.05}
-                value={maDistanceMin}
-                onChange={(e) => setMaDistanceMin(Number(e.target.value))}
-                className="w-20 bg-card border border-card-border rounded-md px-2 py-1 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-accent-green"
-              />
-            </div>
-            <div className="flex items-center gap-1.5">
-              <label className="text-xs text-muted-foreground">Max</label>
-              <input
-                type="number"
-                min={0}
-                max={50}
-                step={0.05}
-                value={maDistanceMax}
-                onChange={(e) => setMaDistanceMax(Number(e.target.value))}
-                className="w-20 bg-card border border-card-border rounded-md px-2 py-1 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-accent-green"
-              />
-            </div>
-            <span className="text-xs text-muted-foreground">
-              distance from {maDistanceType.toUpperCase()}({maDistancePeriod}), in ATR({atrPeriod}) units
-            </span>
-          </>
-        )}
-      </div>
-
-      {/* Volume ratio filter */}
-      <div className="flex items-center gap-3 flex-wrap">
-        <button
-          onClick={() => setVolumeFilterEnabled(!volumeFilterEnabled)}
-          className={`px-2.5 py-1 rounded text-xs font-medium transition-colors ${
-            volumeFilterEnabled
-              ? "bg-accent-green/20 text-accent-green"
-              : "bg-white/5 text-muted-foreground hover:text-foreground"
-          }`}
-        >
-          {volumeFilterEnabled ? "VOLUME FILTER ON" : "VOLUME FILTER OFF"}
-        </button>
-        <button
-          onClick={runOptimizeVolume}
-          disabled={runResult.syntheticZones.length === 0 || contextOptimizing}
-          className="px-2.5 py-1 rounded text-xs font-medium bg-white/5 text-muted-foreground hover:text-foreground hover:bg-white/10 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-          title="Sweep volume-ratio bins, keep the range with the best avg points/trade (min 20 trades). Respects other active filters."
-        >
-          {contextOptimizing ? "OPTIMIZING..." : "OPTIMIZE"}
-        </button>
-        {volumeFilterEnabled && (
-          <>
-            <div className="flex items-center gap-1.5">
-              <label className="text-xs text-muted-foreground">Period</label>
-              <input
-                type="number"
-                min={2}
-                max={500}
-                step={1}
-                value={volumeMaPeriod}
-                onChange={(e) =>
-                  setVolumeMaPeriod(Math.max(2, Number(e.target.value) || 20))
-                }
-                className="w-16 bg-card border border-card-border rounded-md px-2 py-1 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-accent-green"
-                title="N-bar lookback for the volume average."
-              />
-            </div>
-            <div className="flex items-center gap-1.5">
-              <label className="text-xs text-muted-foreground">Min ratio</label>
-              <input
-                type="number"
-                min={0}
-                max={100}
-                step={0.05}
-                value={volumeMinRatio}
-                onChange={(e) => setVolumeMinRatio(Number(e.target.value))}
-                className="w-20 bg-card border border-card-border rounded-md px-2 py-1 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-accent-green"
-              />
-            </div>
-            <div className="flex items-center gap-1.5">
-              <label className="text-xs text-muted-foreground">Max ratio</label>
-              <input
-                type="number"
-                min={0}
-                max={1000}
-                step={0.05}
-                value={volumeMaxRatio}
-                onChange={(e) => setVolumeMaxRatio(Number(e.target.value))}
-                className="w-20 bg-card border border-card-border rounded-md px-2 py-1 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-accent-green"
-              />
-            </div>
-            <span className="text-xs text-muted-foreground">
-              entry-bar volume / {volumeMaPeriod}-bar avg
-            </span>
-          </>
-        )}
-      </div>
-
-      {/* RSI range filter */}
-      <div className="flex items-center gap-3 flex-wrap">
-        <button
-          onClick={() => setRsiFilterEnabled(!rsiFilterEnabled)}
-          className={`px-2.5 py-1 rounded text-xs font-medium transition-colors ${
-            rsiFilterEnabled
-              ? "bg-accent-green/20 text-accent-green"
-              : "bg-white/5 text-muted-foreground hover:text-foreground"
-          }`}
-        >
-          {rsiFilterEnabled ? "RSI FILTER ON" : "RSI FILTER OFF"}
-        </button>
-        <button
-          onClick={runOptimizeRsi}
-          disabled={runResult.syntheticZones.length === 0 || contextOptimizing}
-          className="px-2.5 py-1 rounded text-xs font-medium bg-white/5 text-muted-foreground hover:text-foreground hover:bg-white/10 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-          title="Sweep RSI min/max bins, keep the range with the best avg points/trade (min 20 trades). Respects other active filters."
-        >
-          {contextOptimizing ? "OPTIMIZING..." : "OPTIMIZE"}
-        </button>
-        {rsiFilterEnabled && (
-          <>
-            <div className="flex items-center gap-1.5">
-              <label className="text-xs text-muted-foreground">Min</label>
-              <input
-                type="number"
-                min={0}
-                max={100}
-                step={1}
-                value={rsiMin}
-                onChange={(e) => setRsiMin(Number(e.target.value))}
-                className="w-16 bg-card border border-card-border rounded-md px-2 py-1 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-accent-green"
-              />
-            </div>
-            <div className="flex items-center gap-1.5">
-              <label className="text-xs text-muted-foreground">Max</label>
-              <input
-                type="number"
-                min={0}
-                max={100}
-                step={1}
-                value={rsiMax}
-                onChange={(e) => setRsiMax(Number(e.target.value))}
-                className="w-16 bg-card border border-card-border rounded-md px-2 py-1 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-accent-green"
-              />
-            </div>
-            <div className="flex items-center gap-1.5">
-              <label className="text-xs text-muted-foreground">Period</label>
-              <input
-                type="number"
-                min={2}
-                max={200}
-                step={1}
-                value={rsiPeriod}
-                onChange={(e) => setRsiPeriod(Math.max(2, Number(e.target.value) || 14))}
-                className="w-16 bg-card border border-card-border rounded-md px-2 py-1 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-accent-green"
-              />
-            </div>
-            <span className="text-xs text-muted-foreground">
-              RSI({rsiPeriod}) at entry — &lt;30 oversold / &gt;70 overbought
-            </span>
-          </>
-        )}
-      </div>
-
-      {/* ADX direction filter — gates on rising/falling/flat ADX slope */}
-      <div className="flex items-center gap-3 flex-wrap">
-        <button
-          onClick={() => setAdxTrendFilterEnabled(!adxTrendFilterEnabled)}
-          className={`px-2.5 py-1 rounded text-xs font-medium transition-colors ${
-            adxTrendFilterEnabled
-              ? "bg-accent-green/20 text-accent-green"
-              : "bg-white/5 text-muted-foreground hover:text-foreground"
-          }`}
-        >
-          {adxTrendFilterEnabled ? "ADX DIR FILTER ON" : "ADX DIR FILTER OFF"}
-        </button>
-        <button
-          onClick={runOptimizeAdxTrend}
-          disabled={runResult.syntheticZones.length === 0 || contextOptimizing}
-          className="px-2.5 py-1 rounded text-xs font-medium bg-white/5 text-muted-foreground hover:text-foreground hover:bg-white/10 disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
-          title="Try rising/falling/flat at several flat-threshold values, keep the best avg points/trade (min 20 trades). Respects other active filters."
-        >
-          {contextOptimizing ? "OPTIMIZING..." : "OPTIMIZE"}
-        </button>
-        {adxTrendFilterEnabled && (
-          <>
-            <div className="flex items-center gap-1.5">
-              <label className="text-xs text-muted-foreground">Mode</label>
-              <select
-                value={adxTrendMode}
-                onChange={(e) =>
-                  setAdxTrendMode(e.target.value as AdxTrendMode)
-                }
-                className="bg-card border border-card-border rounded-md px-2 py-1 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-accent-green"
-              >
-                <option value="any">Any</option>
-                <option value="rising">Rising</option>
-                <option value="falling">Falling</option>
-                <option value="flat">Flat</option>
-              </select>
-            </div>
-            <div className="flex items-center gap-1.5">
-              <label className="text-xs text-muted-foreground">Lookback</label>
-              <input
-                type="number"
-                min={1}
-                max={100}
-                step={1}
-                value={adxTrendLookback}
-                onChange={(e) =>
-                  setAdxTrendLookback(Math.max(1, Number(e.target.value) || 5))
-                }
-                className="w-16 bg-card border border-card-border rounded-md px-2 py-1 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-accent-green"
-                title="Bars looked back when computing ADX slope. Changing this re-runs the backtest."
-              />
-            </div>
-            <div className="flex items-center gap-1.5">
-              <label className="text-xs text-muted-foreground">Flat thresh</label>
-              <input
-                type="number"
-                min={0}
-                max={50}
-                step={0.1}
-                value={adxTrendFlatThreshold}
-                onChange={(e) =>
-                  setAdxTrendFlatThreshold(Number(e.target.value))
-                }
-                className="w-16 bg-card border border-card-border rounded-md px-2 py-1 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-accent-green"
-                title="|slope| ≤ this is flat. Wider band → tighter rising/falling gates."
-              />
-            </div>
-            <span className="text-xs text-muted-foreground">
-              ADX slope over last {adxTrendLookback} bar{adxTrendLookback === 1 ? "" : "s"}
-            </span>
-          </>
-        )}
-      </div>
-
-      {/* Bid/ask delta-imbalance filter — gates on (ask − bid) / (ask + bid)
-          at the entry bar. Only meaningful for sessions whose source bars
-          carry a bid/ask split (tick / tick_bidask after aggregation, or
-          ohlcv_bidask). Plain ohlcv sessions reject every trade when this
-          is on — deliberate fail-closed default for a knob whose data
-          isn't present. */}
-      <div className="flex items-center gap-3 flex-wrap">
-        <button
-          onClick={() => setDeltaFilterEnabled(!deltaFilterEnabled)}
-          className={`px-2.5 py-1 rounded text-xs font-medium transition-colors ${
-            deltaFilterEnabled
-              ? "bg-accent-green/20 text-accent-green"
-              : "bg-white/5 text-muted-foreground hover:text-foreground"
-          }`}
-          title="Gate on bid/ask delta imbalance at entry. Requires tick / tick_bidask / ohlcv_bidask source data."
-        >
-          {deltaFilterEnabled ? "DELTA FILTER ON" : "DELTA FILTER OFF"}
-        </button>
-        {deltaFilterEnabled && (
-          <>
-            <div className="flex items-center gap-1.5">
-              <label className="text-xs text-muted-foreground">Min</label>
-              <input
-                type="number"
-                min={-1}
-                max={1}
-                step={0.05}
-                value={deltaMin}
-                onChange={(e) =>
-                  setDeltaMin(Math.max(-1, Math.min(1, Number(e.target.value))))
-                }
-                className="w-20 bg-card border border-card-border rounded-md px-2 py-1 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-accent-green"
-                title="Lower bound. -1 = pure sell-aggressor, 0 = balanced, +1 = pure buy-aggressor."
-              />
-            </div>
-            <div className="flex items-center gap-1.5">
-              <label className="text-xs text-muted-foreground">Max</label>
-              <input
-                type="number"
-                min={-1}
-                max={1}
-                step={0.05}
-                value={deltaMax}
-                onChange={(e) =>
-                  setDeltaMax(Math.max(-1, Math.min(1, Number(e.target.value))))
-                }
-                className="w-20 bg-card border border-card-border rounded-md px-2 py-1 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-accent-green"
-                title="Upper bound."
-              />
-            </div>
-            <span className="text-xs text-muted-foreground">
-              (ask − bid) / (ask + bid) ∈ [{deltaMin.toFixed(2)}, {deltaMax.toFixed(2)}]
-            </span>
-          </>
-        )}
-      </div>
-
-      {/* Total context-filtered count — only visible when any context
-          filter is active, so users see exactly how many signals
-          survived BEFORE the time filter narrows further. */}
-      {(adxFilterEnabled ||
-        atrFilterEnabled ||
-        trendFilterEnabled ||
-        bollingerFilterEnabled ||
-        bbWidthFilterEnabled ||
-        maDistanceFilterEnabled ||
-        volumeFilterEnabled ||
-        rsiFilterEnabled ||
-        (adxTrendFilterEnabled && adxTrendMode !== "any") ||
-        deltaFilterEnabled) && (
-        <div className="text-xs text-muted-foreground">
-          {contextFilteredZones.length} of {runResult.syntheticZones.length} signals pass context filters
-        </div>
-      )}
-
-      {/* ── Sim rules (SL/TP/Trail/BE/Timer/Scaling/Position-mode) ──
-          Identical control panel to the risk simulator. Optimizer buttons
-          run the same chunked grid search against this tab's synthetic-zone
-          backtest results. `key={rulesVersion}` forces a remount so the
-          uncontrolled inputs reflect new values after an optimizer merge. */}
-      <SimulatorControls
-        key={rulesVersion}
-        rules={rules}
-        onRulesChange={setRules}
-        onOptimize={openOptimizeModal}
-        optimizing={optimizing}
-        optimizeProgress={optimizeProgress}
-        onOptimizeAtr={openOptimizeAtrModal}
-        optimizingAtr={optimizingAtr}
-        optimizeAtrProgress={optimizeAtrProgress}
-      />
-      </>
-      )}
 
       {/* ── Exports row — visible in BOTH modes ─────────────────────
           The export buttons used to live inside the time filter row, but
@@ -7108,53 +5294,6 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
         />
       )}
 
-      {/* ── Time Optimize Modal — pick min window before sweep ──────
-          Same min-window options as the risk simulator's modal.
-          Selecting a value kicks off the optimizer and closes the modal. */}
-      {showTimeOptModal && (
-        <div
-          className="fixed inset-0 z-50 flex items-center justify-center bg-black/60"
-          onClick={() => setShowTimeOptModal(false)}
-        >
-          <div
-            className="bg-card border border-card-border rounded-lg p-6 w-full max-w-sm shadow-xl"
-            onClick={(e) => e.stopPropagation()}
-          >
-            <div className="flex items-center justify-between mb-4">
-              <h3 className="text-lg font-bold text-foreground">Optimize Time</h3>
-              <button
-                onClick={() => setShowTimeOptModal(false)}
-                className="text-muted-foreground hover:text-foreground text-xl leading-none"
-              >
-                &times;
-              </button>
-            </div>
-            <p className="text-sm text-muted-foreground mb-4">
-              Select the minimum window size. The optimizer will find the best
-              time-of-day window (by avg points/trade) at least this wide.
-            </p>
-            <div className="grid grid-cols-2 gap-2">
-              {[
-                { label: "30 min", value: 30 },
-                { label: "1 hour", value: 60 },
-                { label: "2 hours", value: 120 },
-                { label: "3 hours", value: 180 },
-                { label: "4 hours", value: 240 },
-                { label: "6 hours", value: 360 },
-              ].map((opt) => (
-                <button
-                  key={opt.value}
-                  onClick={() => handleOptimizeTime(opt.value)}
-                  className="px-3 py-2 rounded-md text-sm font-medium bg-white/5 text-foreground hover:bg-accent-green/20 hover:text-accent-green transition-colors"
-                >
-                  {opt.label}
-                </button>
-              ))}
-            </div>
-          </div>
-        </div>
-      )}
-
       {/* ── Export For AI Modal ─────────────────────────────────────
           Same modal the risk simulator uses. Lets the user pick how
           many pre-entry bars to bundle per trade before triggering the
@@ -7176,12 +5315,12 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
         </>
       )}
 
-      {/* Chart view of script mode — a candlestick chart of the stitched
-          bars from every selected session, with two layered marker
-          tracks (raw signals + filtered trades). Independent of the
-          UI subtree above so the layout stays simple: exactly one of
-          {legacy children, chart} renders at a time. */}
-      {mode === "script" && scriptViewMode === "chart" && (
+      {/* Chart view — a candlestick chart of the stitched bars from every
+          selected session, with two layered marker tracks (raw signals +
+          filtered trades). Independent of the click-through subtree above
+          so the layout stays simple: exactly one of {click-through
+          children, chart} renders at a time. */}
+      {scriptViewMode === "chart" && (
         <BacktestScriptChart
           bars={scriptChartInputs.bars}
           signalZones={runResult.syntheticZones}
@@ -7196,19 +5335,15 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
 
       </div>
 
-      {/* ── Script v2 drag divider + right rail ──────────────────────
+      {/* ── Drag divider + right rail ──────────────────────────────
           The divider is a 6px column-resize strip; pointerdown on it
           captures pointermove/up on the window so the drag continues
           even when the cursor leaves the strip. Sticky-positions the
           aside so the editor + output panel stay in view while the
-          user scrolls the left column. Renders only in script mode;
-          the legacy single-column `<div>` is reused under the UI-mode
-          branch via `contents` so semantics stay identical when the
-          user is not scripting. */}
-      {mode === "script" && (
-        <>
-          <div
-            onPointerDown={onSplitDown}
+          user scrolls the left column. */}
+      <>
+        <div
+          onPointerDown={onSplitDown}
             onMouseDown={onSplitDown}
             // Sticky-positioned just like the aside so the divider is
             // ALWAYS visible regardless of scroll position. Without this
@@ -7342,13 +5477,6 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
             >
               Load Defaults
             </button>
-            <button
-              onClick={syncScriptFromState}
-              className="px-2.5 py-1 rounded text-xs font-medium bg-white/5 text-muted-foreground hover:text-foreground hover:bg-white/10 transition-colors"
-              title="Replace the editor contents with a fresh script derived from the dashboard's current state. Discards your edits."
-            >
-              Sync from UI
-            </button>
             {/* Run / Cancel toggle. While the async optimizer is in
                 flight (`scriptRunProgress` non-null) the button flips
                 to a red Cancel — clicking it flags the optimizer's
@@ -7475,8 +5603,7 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
             warnings={tradesAndOptimization.optimizationWarnings}
           />
         </aside>
-        </>
-      )}
+      </>
 
       {/* Toast — fixed bottom-right, auto-dismisses after 3.5s. Used for
           context-optimizer feedback when no candidate clears the

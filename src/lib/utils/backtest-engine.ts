@@ -1416,7 +1416,7 @@ const DEFAULT_PRE_ENTRY_BARS = 30;
  *  we'd rather warn and produce NaN at entry than allocate 50k bars per
  *  zone × N zones. 1000 bars covers any reasonable indicator period
  *  (200-EMA, 500-EMA, ADX(50), etc.) with headroom. */
-const MAX_AUTO_PRE_ENTRY_BARS = 1000;
+export const MAX_AUTO_PRE_ENTRY_BARS = 1000;
 
 /** Walk every Expr referenced by a ScriptOverlay (numericOverrides RHS,
  *  tradePrints, Optimize bound expressions, filter.if cond + per-branch
@@ -1579,6 +1579,15 @@ export interface BacktestRunResult {
    *  that led into each entry. Always populated (may be empty for signals
    *  fired close to the start of a session). */
   syntheticPreEntryBarsByZoneId: Map<number, TradeZoneBar[]>;
+  /** Warmup-extended pre-entry bars per zone, drawn from `combinedBars`
+   *  (= prior session's tail + this session's bars) and capped at
+   *  MAX_AUTO_PRE_ENTRY_BARS rather than the smaller `effectivePreEntryBars`.
+   *  Used by ANY filter-sim re-run (`precomputeIndicators` in the
+   *  dashboard's `tradesAndOptimization` useMemo) so Wilder ATR/ADX
+   *  converge to NT8's continuous-state values at trade-eval time. The
+   *  session-local `syntheticPreEntryBarsByZoneId` above stays untouched
+   *  for the AI export's setup-context window. */
+  syntheticIndicatorPreEntryBarsByZoneId: Map<number, TradeZoneBar[]>;
   /** Per-zone ATR(14) at entry, lifted from each synthetic zone's
    *  `ctx_atr14`. Required by the simulator's ATR-adjust math
    *  (effective threshold = basePoints + atrAdjust × zoneATR) — without
@@ -1702,6 +1711,16 @@ export function runBacktestForSession(args: {
    *  tick-required indicators emit all-NaN. */
   sessionTicks?: ParsedTicks | null;
   sessionTickRanges?: Int32Array | null;
+  /** Tail of the prior chronological session's bars, used as warmup-only
+   *  history for the signal evaluator and context-series indicators so
+   *  ATR/ADX/rolling-* are valid at bar 0 of THIS session (matches NT8's
+   *  continuous Calculate.OnBarClose feed). Capped to the auto-sized
+   *  `effectivePreEntryBars` (≤ MAX_AUTO_PRE_ENTRY_BARS). Warmup bars
+   *  never produce signals or zones; ticks are NOT extended into them
+   *  (we don't carry prior-session ticks). When absent or empty, behavior
+   *  is the legacy cold-start (only safe for the very first session of a
+   *  multi-session run). */
+  priorBars?: ReplayBar[];
 }): BacktestRunResult {
   const {
     bars,
@@ -1717,6 +1736,7 @@ export function runBacktestForSession(args: {
     strategyOverride,
     sessionTicks = null,
     sessionTickRanges = null,
+    priorBars: rawPriorBars = [],
   } = args;
   // Both tick fields must be present together for tick indicators to
   // work; otherwise we fall back to all-NaN at the indicator layer.
@@ -1769,12 +1789,46 @@ export function runBacktestForSession(args: {
     );
   }
 
+  // Per-session warmup splice — prepend a tail of the prior chronological
+  // session so ATR(14)/ADX(14)/rolling-* are valid at bar 0 of THIS
+  // session. Without this, the per-session model produces NaN/seeded
+  // indicators at session start while NT8 (continuous Calculate.OnBarClose)
+  // shows fully-warm values, leaking extra signals through filter.if gates.
+  // Cap caller-supplied prior bars at MAX_AUTO_PRE_ENTRY_BARS for memory
+  // safety. We deliberately do NOT cap at `effectivePreEntryBars` — that
+  // value is sized for the per-zone, per-trade pre-entry export window
+  // (~30 bars is enough to evaluate filter.if at trade-eval time). But
+  // ATR/ADX use Wilder smoothing which converges ASYMPTOTICALLY: matching
+  // NT8's continuous-state values requires hundreds of bars, not just
+  // `period + 10`. The caller in backtest-dashboard.tsx already capped at
+  // MAX_AUTO_PRE_ENTRY_BARS; this is a defensive recap. Synthetic zones
+  // below stay session-local (no prior bars in the AI export's pre-entry
+  // window — see the comment on `preStart`). The very first session of a
+  // multi-session run still cold-starts (caller passes []).
+  const priorBars = rawPriorBars.length > 0
+    ? rawPriorBars.slice(-MAX_AUTO_PRE_ENTRY_BARS)
+    : rawPriorBars;
+  const warmupCount = priorBars.length;
+  const combinedBars = warmupCount > 0 ? [...priorBars, ...bars] : bars;
+
+  // Per-session warmup splice has three known parity-floor sources vs a
+  // continuous-feed engine like NT8:
+  //   1. Run's first session: priorBars=[] (no chronologically-prior session).
+  //   2. Days the user didn't load (CME Sunday reopens, holiday-Mondays):
+  //      no signals fire for those wall-clock periods at all.
+  //   3. Weekend gaps: priorBars come from the last selected session, which
+  //      ends days before the current session starts. NT8's continuous feed
+  //      has bars in those gaps; the dashboard can't see them.
+  // The first two are user-action fixable (load the missing sessions); the
+  // third is architectural (would need cross-session bar bridging).
+
   if (bars.length === 0) {
     return {
       trades: [],
       syntheticZones: [],
       syntheticBarsByZoneId: new Map(),
       syntheticPreEntryBarsByZoneId: new Map(),
+      syntheticIndicatorPreEntryBarsByZoneId: new Map(),
       syntheticAtrByZoneId: new Map(),
       syntheticTickCtxByZoneId: new Map(),
       totalSignals: 0,
@@ -1796,29 +1850,61 @@ export function runBacktestForSession(args: {
       "fallback was removed to prevent silent script divergence."
     );
   }
-  const signals = evaluateStrategyScript({
+  // Thread the session's TickContext so signal-generation scripts can
+  // reference tick-resolution indicators (POC/VAH/VAL, vwap_tick, etc.)
+  // and bid/ask-aware indicators. When warmup is spliced in, pad the
+  // tick-range Int32Array with empty [0,0) ranges for the prior bars —
+  // we don't carry prior-session ticks, and TickContext requires the
+  // ranges array to be sized `bars.length * 2`. Empty ranges yield NaN
+  // for tick-resolution indicators on warmup bars (same as cold start).
+  const evalTickCtx = hasTicks
+    ? warmupCount > 0
+      ? (() => {
+          const padded = new Int32Array(combinedBars.length * 2);
+          padded.set(sessionTickRanges!, warmupCount * 2);
+          return { ticks: sessionTicks!, barTickRanges: padded };
+        })()
+      : { ticks: sessionTicks!, barTickRanges: sessionTickRanges! }
+    : undefined;
+
+  const rawSignals = evaluateStrategyScript({
     stmts: strategyOverride.stmts,
     paramOverrides: strategyOverride.paramOverrides,
-    bars,
-    // Thread the session's TickContext so signal-generation scripts
-    // can reference tick-resolution indicators (POC, VAH, VAL,
-    // tick_imbalance, vwap_tick, …) and bid/ask-aware indicators.
-    // Already validated above via `hasTicks`: sessionTickRanges has
-    // length === bars.length * 2, exactly the invariant TickContext
-    // expects.
-    tickCtx: hasTicks
-      ? { ticks: sessionTicks!, barTickRanges: sessionTickRanges! }
-      : undefined,
+    bars: combinedBars,
+    // Skip signal emission for warmup bars; let bindings still evaluate
+    // across the prior history so ATR/ADX are warm by index `warmupCount`.
+    minBarIndex: warmupCount,
+    tickCtx: evalTickCtx,
   }).signals;
+
+  // Rebase signal indices back to session-local space so downstream zone
+  // construction (which reads `bars[sig.barIndex]`) stays unchanged. The
+  // `minBarIndex` filter above already excludes warmup bars; the explicit
+  // filter is belt-and-suspenders against any future evaluator change.
+  const signals = warmupCount === 0
+    ? rawSignals
+    : rawSignals
+        .filter((s) => s.barIndex >= warmupCount)
+        .map((s) => ({ ...s, barIndex: s.barIndex - warmupCount }));
 
   // Pre-compute every indicator series ONCE per session so the per-signal
   // ctx_* snapshot is just a constant-time array lookup. Way cheaper than
-  // re-running ATR/ADX/EMA/Bollinger inside the signal loop.
-  const ctxSeries = signals.length > 0 ? buildContextSeries(bars, indicatorConfig) : null;
+  // re-running ATR/ADX/EMA/Bollinger inside the signal loop. Run on
+  // `combinedBars` so indicator series are warmed up across the prior
+  // session's tail; per-signal lookups index with `sig.barIndex + warmupCount`.
+  const ctxSeries = signals.length > 0 ? buildContextSeries(combinedBars, indicatorConfig) : null;
 
   const syntheticZones: TradeZone[] = [];
   const syntheticBarsByZoneId = new Map<number, TradeZoneBar[]>();
   const syntheticPreEntryBarsByZoneId = new Map<number, TradeZoneBar[]>();
+  // Indicator-only pre-entry window. Drawn from `combinedBars` (so it
+  // reaches into priorBars when a signal fires near session start) and
+  // capped at MAX_AUTO_PRE_ENTRY_BARS instead of `effectivePreEntryBars`,
+  // so Wilder ATR/ADX have enough history to converge to NT8's continuous-
+  // state values when filter.if evaluates them at trade-eval time. The
+  // session-local `syntheticPreEntryBarsByZoneId` above stays unchanged
+  // for AI export and downstream viz consumers.
+  const syntheticIndicatorPreEntryBarsByZoneId = new Map<number, TradeZoneBar[]>();
   // Per-zone ATR(14) at entry — same value the snapshot stamps onto
   // ctx_atr14, exposed as a Map<zoneId, number> so the simulator's
   // ATR-adjust math has the lookup it expects. Without this the ± ATR
@@ -1860,7 +1946,10 @@ export function runBacktestForSession(args: {
       ? snapshotContext(
           ctxSeries,
           entryPrice,
-          sig.barIndex,
+          // ctxSeries was built on `combinedBars`, which has `warmupCount`
+          // prior-session bars prepended. Offset the index so we read the
+          // warmed indicator value at this signal's bar.
+          sig.barIndex + warmupCount,
           entryBar,
           indicatorConfig.adxSlopeLookback
         )
@@ -1925,15 +2014,36 @@ export function runBacktestForSession(args: {
     // `effectivePreEntryBars` is auto-sized from the script's indicator
     // periods (see top of runBacktestForSession) — for non-script runs
     // it equals `maxPreEntryBars`.
+    // NOTE: deliberately session-local — we do NOT pull the warmup
+    // `priorBars` into this window. The AI export labels these bars with
+    // session-relative indices and chronological time, and prior-session
+    // bars would corrupt that view. Indicator parity is handled by the
+    // combinedBars splice into evaluateStrategyScript / buildContextSeries
+    // upstream; the per-zone pre-entry slice is for export only.
     const preStart = Math.max(0, sig.barIndex - effectivePreEntryBars);
     const preBars: TradeZoneBar[] = [];
     for (let k = preStart; k < sig.barIndex; k++) {
       preBars.push(replayBarToZoneBar(bars[k], zoneId, k - sig.barIndex));
     }
 
+    // Indicator-only pre-entry window for filter.if's per-zone series.
+    // Drawn from `combinedBars` (reaches into priorBars when the signal
+    // fires near session start) and capped at MAX_AUTO_PRE_ENTRY_BARS
+    // so Wilder ATR/ADX converge to NT8's continuous-state values. The
+    // session-local `preBars` above stays untouched for AI export.
+    const sigCombinedIdx = sig.barIndex + warmupCount;
+    const indPreStart = Math.max(0, sigCombinedIdx - MAX_AUTO_PRE_ENTRY_BARS);
+    const indicatorPreBars: TradeZoneBar[] = [];
+    for (let k = indPreStart; k < sigCombinedIdx; k++) {
+      indicatorPreBars.push(
+        replayBarToZoneBar(combinedBars[k], zoneId, k - sigCombinedIdx)
+      );
+    }
+
     syntheticZones.push(zone);
     syntheticBarsByZoneId.set(zoneId, zoneBars);
     syntheticPreEntryBarsByZoneId.set(zoneId, preBars);
+    syntheticIndicatorPreEntryBarsByZoneId.set(zoneId, indicatorPreBars);
     // Build the zone-local tickRanges by copying the slice of session
     // ranges that covers the zone's combined (pre + post) bar window.
     // The order matches `precomputeIndicators`'s combined array
@@ -2006,7 +2116,11 @@ export function runBacktestForSession(args: {
         syntheticZones,
         syntheticBarsByZoneId,
         overlayExprs,
-        syntheticPreEntryBarsByZoneId,
+        // Use the warmed indicator pre-entry map (drawn from combinedBars,
+        // capped at MAX_AUTO_PRE_ENTRY_BARS) so filter.if's Wilder
+        // smoothers converge to NT8's continuous-state values. The session-
+        // local `syntheticPreEntryBarsByZoneId` is reserved for AI export.
+        syntheticIndicatorPreEntryBarsByZoneId,
         syntheticTickCtxByZoneId.size > 0 ? syntheticTickCtxByZoneId : undefined,
       ),
     };
@@ -2052,6 +2166,7 @@ export function runBacktestForSession(args: {
     syntheticZones,
     syntheticBarsByZoneId,
     syntheticPreEntryBarsByZoneId,
+    syntheticIndicatorPreEntryBarsByZoneId,
     syntheticAtrByZoneId,
     syntheticTickCtxByZoneId,
     totalSignals: signals.length,
@@ -2098,6 +2213,7 @@ export function runBacktestAcrossSessions(args: {
   const allZones: TradeZone[] = [];
   const allBars = new Map<number, TradeZoneBar[]>();
   const allPreEntryBars = new Map<number, TradeZoneBar[]>();
+  const allIndicatorPreEntryBars = new Map<number, TradeZoneBar[]>();
   const allAtr = new Map<number, number>();
   const allTickCtx = new Map<number, TickContext>();
   let idOffset = 0;
@@ -2121,6 +2237,9 @@ export function runBacktestAcrossSessions(args: {
     allZones.push(...r.syntheticZones);
     for (const [k, v] of r.syntheticBarsByZoneId) allBars.set(k, v);
     for (const [k, v] of r.syntheticPreEntryBarsByZoneId) allPreEntryBars.set(k, v);
+    for (const [k, v] of r.syntheticIndicatorPreEntryBarsByZoneId) {
+      allIndicatorPreEntryBars.set(k, v);
+    }
     for (const [k, v] of r.syntheticAtrByZoneId) allAtr.set(k, v);
     for (const [k, v] of r.syntheticTickCtxByZoneId) allTickCtx.set(k, v);
     idOffset += r.syntheticZones.length;
@@ -2138,6 +2257,7 @@ export function runBacktestAcrossSessions(args: {
     syntheticZones: allZones,
     syntheticBarsByZoneId: allBars,
     syntheticPreEntryBarsByZoneId: allPreEntryBars,
+    syntheticIndicatorPreEntryBarsByZoneId: allIndicatorPreEntryBars,
     syntheticAtrByZoneId: allAtr,
     syntheticTickCtxByZoneId: allTickCtx,
     totalSignals,

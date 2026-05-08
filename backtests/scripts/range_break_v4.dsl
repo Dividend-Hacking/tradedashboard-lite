@@ -261,7 +261,7 @@ rules.stopLossEnabled = true
 rules.stopLossPoints = 0
 rules.takeProfitEnabled = true
 rules.takeProfitPoints = 0
-rules.positionMode = "add-close"
+rules.positionMode = "reverse-null"
 
 rules.slAtrAdjust = 20
 rules.tpAtrAdjust = 4
@@ -270,6 +270,7 @@ rules.timedExitBars = 100
 rules.timedExitEnabled = true
 
 filter.if = (ATR(14) <= 10, , )
+filter.if = (ADX(14) > 30 && ADX(14) < 50, , )
 // Optional volatility gate. Single-arg form: cond true → pass,
 // false → reject. Use uppercase `ATR` — lowercase `atr` compiles but
 // evaluates to NaN at runtime (no such indicator). Uncomment to use.

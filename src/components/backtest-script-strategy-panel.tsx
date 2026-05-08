@@ -17,14 +17,15 @@
  *      `scriptParamOverrides` (controlled by the dashboard) and passed
  *      through to evaluateStrategyScript at run time.
  *
- * This panel renders only when the dashboard is in `mode === "ui"` (same
- * gate as the legacy strategy panel) AND the user has authored a script
- * with signal statements OR inferred params.
+ * This panel renders unconditionally above the script editor — when the
+ * script doesn't define `signal.long.if` / `signal.short.if` or any
+ * `params.X` references, the panel renders empty (its body is gated on
+ * having something to show).
  */
 
 "use client";
 
-import { useMemo } from "react";
+import { memo, useMemo } from "react";
 import { parseStrategyScript } from "@/lib/utils/strategy-evaluator";
 import {
   BUILTIN_STRATEGY_TEMPLATES,
@@ -79,7 +80,7 @@ function buildTemplateMetaFallback(): Record<string, InferredParam["meta"]> {
 
 const TEMPLATE_META_FALLBACK = buildTemplateMetaFallback();
 
-export function BacktestScriptStrategyPanel({
+function BacktestScriptStrategyPanelImpl({
   scriptText,
   scriptParams,
   paramMeta,
@@ -209,3 +210,10 @@ export function BacktestScriptStrategyPanel({
     </div>
   );
 }
+
+// Memoized so a parent re-render with unchanged props (the common case
+// during fast typing in the script editor — `scriptText` is the only
+// prop that mutates per keystroke, and the panel correctly re-runs its
+// `parseStrategyScript` useMemo when it does) skips the body entirely.
+// Default shallow compare covers all props.
+export const BacktestScriptStrategyPanel = memo(BacktestScriptStrategyPanelImpl);

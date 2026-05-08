@@ -70,7 +70,7 @@ function fmt(v: number): string {
   return v.toLocaleString(undefined, { maximumFractionDigits: 6 });
 }
 
-export function ScriptOutputPanel({
+function ScriptOutputPanelImpl({
   summaryPrints,
   trades,
   tradePrintLabels,
@@ -318,6 +318,14 @@ export function ScriptOutputPanel({
     </div>
   );
 }
+
+// Memoized so the panel skips re-renders during fast typing in the
+// script editor. None of its props (summary prints, trades,
+// tradePrintLabels, optimizationHistory, warnings) mutate per keystroke
+// — they're derived from `appliedScriptText` snapshots, not the live
+// `scriptText` — so default shallow compare keeps the body stable
+// throughout an editing burst.
+export const ScriptOutputPanel = React.memo(ScriptOutputPanelImpl);
 
 function shortTime(iso: string): string {
   // Cheap "MM-DD HH:MM" formatter without pulling in a dep. Falls back

@@ -578,16 +578,27 @@ export function evaluateStrategyScript(opts: EvaluateOptions): EvaluateResult {
   // Used for the dump only; the per-bar resolver still uses letDefs.
   const letNames = Array.from(letDefs.keys());
 
-  for (let i = minBarIndex; i < bars.length; i++) {
+  // Loop starts at 0 (not minBarIndex) so signal expressions evaluate on
+  // every bar including the prepended warmup window. That's required for
+  // `bars_since(signal.X)` to return the right count at session start —
+  // NT8's continuous Calculate.OnBarClose evaluates LongCondition() across
+  // session boundaries, and we must mirror that or the cooldown/lock
+  // gates (long_in_window, long_locked, …) diverge. Output emission
+  // (`signals.push` and the per-bar diag dump) stays gated by
+  // `minBarIndex` so the caller's session-local view is unchanged.
+  for (let i = 0; i < bars.length; i++) {
     ctx.barIndex = i;
     ctx.letCache.clear();
+    const inOutputRange = i >= minBarIndex;
     let firedLong = false;
     if (signalLong) {
       const v = evalNumber(signalLong, ctx);
       if (Number.isFinite(v) && v !== 0) {
-        signals.push({ barIndex: i, direction: "Long" });
+        // Track in ALL ranges (incl. warmup) so bars_since(signal.long)
+        // at bar `minBarIndex` counts back into the prepended history.
         ctx.firingsLong.push(i);
         firedLong = true;
+        if (inOutputRange) signals.push({ barIndex: i, direction: "Long" });
       }
     }
     // A bar can't fire both directions — matches the legacy strategies'
@@ -596,8 +607,8 @@ export function evaluateStrategyScript(opts: EvaluateOptions): EvaluateResult {
       ctx.letCache.clear();
       const v = evalNumber(signalShort, ctx);
       if (Number.isFinite(v) && v !== 0) {
-        signals.push({ barIndex: i, direction: "Short" });
         ctx.firingsShort.push(i);
+        if (inOutputRange) signals.push({ barIndex: i, direction: "Short" });
       }
     }
 
@@ -605,8 +616,11 @@ export function evaluateStrategyScript(opts: EvaluateOptions): EvaluateResult {
     // already cached. We force-evaluate every let in declaration order
     // (signal eval may short-circuit before resolving every let) so the
     // dashboard's dump is directly comparable to NT8's, which evaluates
-    // all lets unconditionally on every bar.
-    if (diagDump && barInDiagWindow(bars[i].bar_time, diagDump)) {
+    // all lets unconditionally on every bar. Gated by `inOutputRange` so
+    // warmup-prefixed bars (which also belong to a prior session and get
+    // dumped when THAT session runs) don't emit duplicates that would
+    // corrupt diff-let-dumps' bar-pair join.
+    if (inOutputRange && diagDump && barInDiagWindow(bars[i].bar_time, diagDump)) {
       // Clear letCache and resolve each let fresh — gives us the live
       // value at offset 0 with all dependencies primed.
       ctx.letCache.clear();

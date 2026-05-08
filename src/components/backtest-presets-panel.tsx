@@ -18,7 +18,7 @@
  */
 "use client";
 
-import { useState, useMemo } from "react";
+import { memo, useState, useMemo } from "react";
 import { BacktestPreset } from "@/lib/utils/backtest-presets";
 
 interface BacktestPresetsPanelProps {
@@ -49,7 +49,7 @@ interface BacktestPresetsPanelProps {
   liveParamMeta?: BacktestPreset["paramMeta"];
 }
 
-export function BacktestPresetsPanel({
+function BacktestPresetsPanelImpl({
   presets,
   onLoad,
   onSaveAs,
@@ -463,3 +463,11 @@ export function BacktestPresetsPanel({
     </div>
   );
 }
+
+// Memoized to skip re-renders triggered by parent state that the panel
+// doesn't read. `liveScript` does mutate on every keystroke in the
+// script editor, so this memo is only fully effective when other state
+// (filters, selection, etc.) changes — but the body is shallow and the
+// callback props are already `useCallback`'d in the dashboard, so the
+// shallow compare is otherwise stable.
+export const BacktestPresetsPanel = memo(BacktestPresetsPanelImpl);
