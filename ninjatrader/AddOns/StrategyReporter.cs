@@ -38,12 +38,14 @@ namespace NinjaTrader.NinjaScript.AddOns
     public class StrategyReporter
     {
         // ─── Supabase connection ──────────────────────────────────────────────
-        // URL + key loaded from livebridge.config.json at runtime — see LiveBridgeConfig.cs.
-        private static string SUPABASE_URL { get { return LiveBridgeConfig.Url; } }
-        private static string SUPABASE_ANON_KEY { get { return LiveBridgeConfig.AnonKey; } }
+        // Hardcoded — same pattern as SupabaseWriter (single trusted VM).
+        // Anon key has full RLS access (insert/update/select/delete) on the
+        // live_strategies and strategy_logs tables.
+        private const string SUPABASE_URL = "https://zidddaorklilipbxfogr.supabase.co";
+        private const string SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InppZGRkYW9ya2xpbGlwYnhmb2dyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzEwODUwODgsImV4cCI6MjA4NjY2MTA4OH0.9ankT2x20vbSjjO77bnoSsBsVd4Un5Ganu94_CtmAjk";
 
-        private static string LIVE_STRATEGIES_ENDPOINT { get { return SUPABASE_URL + "/rest/v1/live_strategies"; } }
-        private static string STRATEGY_LOGS_ENDPOINT   { get { return SUPABASE_URL + "/rest/v1/strategy_logs"; } }
+        private const string LIVE_STRATEGIES_ENDPOINT = SUPABASE_URL + "/rest/v1/live_strategies";
+        private const string STRATEGY_LOGS_ENDPOINT   = SUPABASE_URL + "/rest/v1/strategy_logs";
 
         // ─── Heartbeat cadence ────────────────────────────────────────────────
         // 20s is a balance: dashboard sees timely status without us hammering

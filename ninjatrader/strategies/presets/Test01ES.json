@@ -1,0 +1,139 @@
+{
+  "version": 1,
+  "id": "mokwfh3i-e9azk8l6",
+  "name": "Test01 ES",
+  "createdAt": "2026-04-30T03:02:59.405Z",
+  "updatedAt": "2026-04-30T03:02:59.405Z",
+  "strategyId": "signal_v2",
+  "params": {
+    "lookback": 20,
+    "atrPeriod": 14,
+    "zoneExitV2": 0.3,
+    "zoneEnterV2": 0.5,
+    "staleBarsBack": 15,
+    "cooldownBarsV2": 30,
+    "atEdgeThreshold": 0.85,
+    "baseRangeAtrMax": 4,
+    "baseRangeAtrMin": 1.5,
+    "flatAtrFraction": 0.2,
+    "baseDriftFraction": 0.5,
+    "nearEdgeThreshold": 0.5,
+    "pullbackAtrFraction": 0.4,
+    "staleBreakThreshold": 1.05
+  },
+  "rules": {
+    "stopLossEnabled": true,
+    "stopLossPoints": 0,
+    "takeProfitEnabled": true,
+    "takeProfitPoints": 0,
+    "trailingStopEnabled": false,
+    "trailingStopPoints": 0,
+    "timedExitEnabled": false,
+    "timedExitBars": 30,
+    "breakEvenEnabled": false,
+    "breakEvenTrigger": 5,
+    "exitAtBarClose": false,
+    "extensionBarsEnabled": false,
+    "extensionBars": 20,
+    "slAtrAdjust": 8,
+    "tpAtrAdjust": 8,
+    "trailAtrAdjust": 12,
+    "beAtrAdjust": 0,
+    "positionMode": "add-close",
+    "scalingEnabled": false,
+    "scalingStartSize": 1,
+    "scalingWinStep": 1,
+    "scalingLossStep": 2,
+    "scalingMinSize": 1,
+    "scalingMaxSize": 5,
+    "scalingResetDaily": false,
+    "dailyStopLossEnabled": true,
+    "dailyStopLossPoints": 30,
+    "dailyTakeProfitEnabled": false,
+    "dailyTakeProfitPoints": 50,
+    "dailyLimitExactMode": true,
+    "maxTradesPerDayEnabled": false,
+    "maxTradesPerDay": 3,
+    "maxLossesPerDayEnabled": false,
+    "maxLossesPerDay": 1,
+    "cooldownBetweenTradesEnabled": false,
+    "cooldownBetweenTradesBars": 5,
+    "fillMode": "next_open",
+    "slippagePoints": 0,
+    "commissionPerRoundTrip": 0,
+    "pointValue": 20
+  },
+  "filters": {
+    "time": {
+      "enabled": true,
+      "from": "00:00",
+      "to": "10:00",
+      "windows": [
+        {
+          "from": "00:00",
+          "to": "10:00"
+        }
+      ]
+    },
+    "adx": {
+      "enabled": false,
+      "min": 30,
+      "max": 100,
+      "period": 14
+    },
+    "atr": {
+      "enabled": false,
+      "min": 0,
+      "max": 3.6,
+      "period": 14
+    },
+    "trend": {
+      "enabled": true,
+      "ema20Mode": "any",
+      "ema200Mode": "with",
+      "fastPeriod": 20,
+      "fastType": "ema",
+      "slowPeriod": 200,
+      "slowType": "ema"
+    },
+    "bollinger": {
+      "enabled": false,
+      "allowed": [
+        "inside"
+      ],
+      "period": 20,
+      "stdDev": 2
+    },
+    "bbWidth": {
+      "enabled": false,
+      "min": 0,
+      "max": 1000
+    },
+    "maDistance": {
+      "enabled": false,
+      "period": 50,
+      "type": "ema",
+      "mode": "absolute",
+      "min": 0,
+      "max": 5
+    },
+    "volume": {
+      "enabled": false,
+      "period": 20,
+      "minRatio": 0,
+      "maxRatio": 100
+    },
+    "rsi": {
+      "enabled": false,
+      "period": 14,
+      "min": 0,
+      "max": 100
+    },
+    "adxTrend": {
+      "enabled": false,
+      "mode": "rising",
+      "lookback": 10,
+      "flatThreshold": 4
+    }
+  }
+}

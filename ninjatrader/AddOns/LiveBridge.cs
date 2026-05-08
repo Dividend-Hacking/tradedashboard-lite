@@ -215,17 +215,20 @@ namespace NinjaTrader.NinjaScript.AddOns
 
     public class LiveBridge : AddOnBase
     {
-        // ─── Supabase ──────────────────────────────────────────────────────────
-        // URL + key loaded from livebridge.config.json at runtime — see LiveBridgeConfig.cs.
-        private static string SUPABASE_URL { get { return LiveBridgeConfig.Url; } }
-        private static string SUPABASE_ANON_KEY { get { return LiveBridgeConfig.AnonKey; } }
-        private static string LIVE_BARS_EP { get { return SUPABASE_URL + "/rest/v1/live_bars"; } }
-        private static string LIVE_TICKER_EP { get { return SUPABASE_URL + "/rest/v1/live_ticker"; } }
-        private static string ORDER_REQUESTS_EP { get { return SUPABASE_URL + "/rest/v1/order_requests"; } }
-        private static string LIVE_STATE_EP { get { return SUPABASE_URL + "/rest/v1/live_state"; } }
-        private static string LIVE_ACCOUNTS_EP { get { return SUPABASE_URL + "/rest/v1/live_accounts"; } }
-        private static string LIVE_COMMANDS_EP { get { return SUPABASE_URL + "/rest/v1/live_commands"; } }
-        private static string LIVEBRIDGE_ENDPOINT_EP { get { return SUPABASE_URL + "/rest/v1/livebridge_endpoint"; } }
+        // ─── Endpoint resolution ──────────────────────────────────────────────
+        // Switch between cloud Supabase REST and the dashboard's local
+        // /api/nt8/* routes via ModeConfig. Header lines that add apikey/
+        // Authorization remain unchanged — local routes accept and ignore
+        // those headers, so no further edits in this file.
+        private static string SUPABASE_URL => ModeConfig.Endpoint;
+        private static string SUPABASE_ANON_KEY => ModeConfig.ApiKey;
+        private static string LIVE_BARS_EP => ModeConfig.TableUrl("live_bars");
+        private static string LIVE_TICKER_EP => ModeConfig.TableUrl("live_ticker");
+        private static string ORDER_REQUESTS_EP => ModeConfig.TableUrl("order_requests");
+        private static string LIVE_STATE_EP => ModeConfig.TableUrl("live_state");
+        private static string LIVE_ACCOUNTS_EP => ModeConfig.TableUrl("live_accounts");
+        private static string LIVE_COMMANDS_EP => ModeConfig.TableUrl("live_commands");
+        private static string LIVEBRIDGE_ENDPOINT_EP => ModeConfig.TableUrl("livebridge_endpoint");
 
         // ─── Configuration ─────────────────────────────────────────────────────
         // Active instrument and timeframe — updated dynamically via switch_instrument command

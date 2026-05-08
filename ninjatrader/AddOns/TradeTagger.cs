@@ -163,11 +163,12 @@ namespace NinjaTrader.NinjaScript.AddOns
         // the window will repopulate itself when re-created.
         public WorkspaceOptions WorkspaceOptions { get; set; }
 
-        // ─── Supabase Connection ───────────────────────────────────────────────
-        // URL + key loaded from livebridge.config.json at runtime — see LiveBridgeConfig.cs.
-        private static string SUPABASE_URL { get { return LiveBridgeConfig.Url; } }
-        private static string SUPABASE_ANON_KEY { get { return LiveBridgeConfig.AnonKey; } }
-        private static string TRADES_ENDPOINT { get { return SUPABASE_URL + "/rest/v1/trades"; } }
+        // ─── Supabase Connection Constants ─────────────────────────────────────
+        // Self-contained — duplicated from SupabaseWriter so TradeTagger has no
+        // coupling to TradeTracker's internal classes.
+        private const string SUPABASE_URL = "https://zidddaorklilipbxfogr.supabase.co";
+        private const string SUPABASE_ANON_KEY = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InppZGRkYW9ya2xpbGlwYnhmb2dyIiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzEwODUwODgsImV4cCI6MjA4NjY2MTA4OH0.9ankT2x20vbSjjO77bnoSsBsVd4Un5Ganu94_CtmAjk";
+        private const string TRADES_ENDPOINT = SUPABASE_URL + "/rest/v1/trades";
 
         // ─── Dropdown option arrays ────────────────────────────────────────────
         // Empty string = "not tagged yet" → maps to null in PATCH body

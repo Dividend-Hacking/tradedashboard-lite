@@ -27,16 +27,21 @@ namespace NinjaTrader.NinjaScript.AddOns
     /// </summary>
     public static class TradeZoneWriter
     {
-        // ─── Supabase Connection ─────────────────────────────────────────────────
-        // URL + key loaded from livebridge.config.json at runtime — see LiveBridgeConfig.cs.
-        private static string SUPABASE_URL { get { return LiveBridgeConfig.Url; } }
-        private static string SUPABASE_ANON_KEY { get { return LiveBridgeConfig.AnonKey; } }
+        // ─── Endpoint resolution ─────────────────────────────────────────────────
+        // Switch between cloud Supabase REST and the dashboard's local
+        // /api/nt8/* routes via ModeConfig. The apikey/Authorization header
+        // adds elsewhere in this file remain unchanged — local routes accept
+        // (and ignore) those headers.
+        private static string SUPABASE_URL => ModeConfig.Endpoint;
+        private static string SUPABASE_ANON_KEY => ModeConfig.ApiKey;
 
-        /// <summary>PostgREST endpoint for the trade_zones table</summary>
-        private static string ZONES_ENDPOINT { get { return SUPABASE_URL + "/rest/v1/trade_zones"; } }
+        /// <summary>Endpoint for the trade_zones table.
+        /// Resolves to `<endpoint>/rest/v1/trade_zones` in cloud mode and
+        /// `<endpoint>/api/nt8/trade_zones` in local mode.</summary>
+        private static string ZONES_ENDPOINT => ModeConfig.TableUrl("trade_zones");
 
-        /// <summary>PostgREST endpoint for the trade_zone_bars table</summary>
-        private static string BARS_ENDPOINT { get { return SUPABASE_URL + "/rest/v1/trade_zone_bars"; } }
+        /// <summary>Endpoint for the trade_zone_bars table.</summary>
+        private static string BARS_ENDPOINT => ModeConfig.TableUrl("trade_zone_bars");
 
         // ─── Internal Data Struct ────────────────────────────────────────────────
 

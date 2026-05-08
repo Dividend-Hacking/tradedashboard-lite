@@ -28,20 +28,27 @@ namespace NinjaTrader.NinjaScript.AddOns
     /// </summary>
     public class SupabaseWriter
     {
-        // ─── Supabase Connection ─────────────────────────────────────────────────
-        // URL + anon key are loaded at runtime from livebridge.config.json
-        // (see LiveBridgeConfig.cs) so this repo ships with no hardcoded
-        // credentials. Endpoints are computed properties because they depend
-        // on the runtime-loaded base URL.
+        // ─── Endpoint resolution ─────────────────────────────────────────────────
+        // These were hardcoded Supabase URLs; they now resolve through
+        // ModeConfig so the same AddOn works against the production Supabase
+        // database (cloud mode) or the dashboard's local SQLite via /api/nt8/*
+        // (local mode). Mode-flips take effect on the next polling tick.
 
-        private static string SUPABASE_URL { get { return LiveBridgeConfig.Url; } }
-        private static string SUPABASE_ANON_KEY { get { return LiveBridgeConfig.AnonKey; } }
+        private static string SUPABASE_URL => ModeConfig.Endpoint;
+        private static string SUPABASE_ANON_KEY => ModeConfig.ApiKey;
 
-        /// <summary>Full REST endpoint for the trades table.</summary>
-        private static string TRADES_ENDPOINT { get { return SUPABASE_URL + "/rest/v1/trades"; } }
+        /// <summary>
+        /// REST endpoint for the trades table. Resolves to
+        /// `<endpoint>/rest/v1/trades` in cloud mode and
+        /// `<endpoint>/api/nt8/trades` in local mode.
+        /// </summary>
+        private static string TRADES_ENDPOINT => ModeConfig.TableUrl("trades");
 
-        /// <summary>Endpoint for trade_bars — OHLC candles captured around each live trade.</summary>
-        private static string TRADE_BARS_ENDPOINT { get { return SUPABASE_URL + "/rest/v1/trade_bars"; } }
+        /// <summary>
+        /// Endpoint for trade_bars — OHLC candles captured around each live trade.
+        /// Populated after the parent trade row exists so we can key bars by trade_id FK.
+        /// </summary>
+        private static string TRADE_BARS_ENDPOINT => ModeConfig.TableUrl("trade_bars");
 
         // ─── Public API ──────────────────────────────────────────────────────────
 

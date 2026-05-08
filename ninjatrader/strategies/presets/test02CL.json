@@ -1,0 +1,89 @@
+{
+  "version": 1,
+  "id": "moj7ynx6-ohgc4cfa",
+  "name": "test02 CL",
+  "createdAt": "2026-04-28T22:50:18.138+00:00",
+  "updatedAt": "2026-04-28T22:50:18.138+00:00",
+  "strategyId": "signal_v2",
+  "params": {
+    "lookback": 20,
+    "atrPeriod": 14,
+    "zoneExitV2": 0.3,
+    "zoneEnterV2": 0.5,
+    "staleBarsBack": 15,
+    "cooldownBarsV2": 30,
+    "atEdgeThreshold": 0.85,
+    "baseRangeAtrMax": 4,
+    "baseRangeAtrMin": 1.5,
+    "flatAtrFraction": 0.2,
+    "baseDriftFraction": 0.5,
+    "nearEdgeThreshold": 0.5,
+    "pullbackAtrFraction": 0.4,
+    "staleBreakThreshold": 1.05
+  },
+  "rules": {
+    "fillMode": "next_open",
+    "pointValue": 20,
+    "beAtrAdjust": 0,
+    "slAtrAdjust": 4.5,
+    "tpAtrAdjust": 4.5,
+    "positionMode": "add-null",
+    "extensionBars": 20,
+    "timedExitBars": 40,
+    "exitAtBarClose": false,
+    "scalingEnabled": false,
+    "scalingMaxSize": 5,
+    "scalingMinSize": 1,
+    "scalingWinStep": 1,
+    "slippagePoints": 0,
+    "stopLossPoints": 0,
+    "trailAtrAdjust": 6,
+    "scalingLossStep": 2,
+    "stopLossEnabled": true,
+    "breakEvenEnabled": false,
+    "breakEvenTrigger": 5,
+    "scalingStartSize": 1,
+    "takeProfitPoints": 0,
+    "timedExitEnabled": false,
+    "scalingResetDaily": false,
+    "takeProfitEnabled": true,
+    "trailingStopPoints": 0,
+    "dailyLimitExactMode": true,
+    "dailyStopLossPoints": 0.3,
+    "trailingStopEnabled": false,
+    "dailyStopLossEnabled": true,
+    "extensionBarsEnabled": false,
+    "dailyTakeProfitPoints": 50,
+    "commissionPerRoundTrip": 0,
+    "dailyTakeProfitEnabled": false
+  },
+  "filters": {
+    "adx": {
+      "max": 20,
+      "min": 0,
+      "enabled": false
+    },
+    "atr": {
+      "max": 0.02,
+      "min": 0,
+      "enabled": false
+    },
+    "time": {
+      "to": "08:00",
+      "from": "00:00",
+      "enabled": true
+    },
+    "trend": {
+      "enabled": false,
+      "ema20Mode": "any",
+      "ema200Mode": "with"
+    },
+    "bollinger": {
+      "allowed": [
+        "above_upper",
+        "inside"
+      ],
+      "enabled": false
+    }
+  }
+}
