@@ -2621,6 +2621,13 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
     let strategyOverrideForRun: {
       stmts: StrategyStmt[];
       paramOverrides: Record<string, number>;
+      // Per-`let` encoded KALMAN_OU args, threaded into the engine so
+      // `kf.<field>` references inside `exit.if`, `filter.if`,
+      // `ontrade.print`, and `rules.X` exprs can be rewritten the same
+      // way the strategy parser already rewrites them in signal/let
+      // stmts. Without this bridge the dotted ident resolves to NaN
+      // at runtime and the affected directive silently no-ops.
+      kalmanArgsByLet?: Map<string, ScriptExpr[]>;
     } | null = null;
     let strategyOverrideKey: string | null = null;
     if (appliedScriptText) {
@@ -2666,9 +2673,17 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
             paramOverrides[key] = defaulted;
           }
         }
-        strategyOverrideForRun = { stmts, paramOverrides };
+        strategyOverrideForRun = {
+          stmts,
+          paramOverrides,
+          kalmanArgsByLet: parsedStrategy.kalmanArgsByLet,
+        };
         // Cache key — sources are stable across parses since
-        // parseStrategyScript is deterministic on a given text.
+        // parseStrategyScript is deterministic on a given text. The
+        // kalman entries are derived from the same `let` sources so
+        // they're already covered transitively, but we serialize them
+        // explicitly so a future change to the encoding (e.g. trust
+        // default) invalidates the cache without needing source edits.
         strategyOverrideKey = JSON.stringify({
           sources: stmts.map((s) =>
             s.kind === "signal"
@@ -2676,6 +2691,12 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
               : `let.${s.name}:${s.source}`
           ),
           paramOverrides,
+          kalman: Array.from(parsedStrategy.kalmanArgsByLet.entries()).map(
+            ([name, args]) => [
+              name,
+              args.map((a) => (a.kind === "num" ? a.value : null)),
+            ],
+          ),
         });
       }
     }
@@ -3260,9 +3281,18 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
     // sync; if you add a let-substitution call in one, add it in the
     // other.
     if (overlayForFilterSim && appliedScriptText) {
-      const letBindings = buildLetBindings(parseStrategyScript(appliedScriptText).stmts);
-      if (letBindings.size > 0) {
-        overlayForFilterSim = applyBindingsToOverlay(overlayForFilterSim, letBindings);
+      const parsedForBindings = parseStrategyScript(appliedScriptText);
+      const letBindings = buildLetBindings(parsedForBindings.stmts);
+      // Bridge KALMAN_OU dotted-ident rewrites the same way runBacktestForSession
+      // does — without this, `kf.x` in filter.if/exit.if/ontrade.print on the
+      // filter-sim path resolves to NaN. Apply when EITHER the let bindings
+      // OR the kalman map is non-empty; the helper now handles both.
+      if (letBindings.size > 0 || parsedForBindings.kalmanArgsByLet.size > 0) {
+        overlayForFilterSim = applyBindingsToOverlay(
+          overlayForFilterSim,
+          letBindings,
+          parsedForBindings.kalmanArgsByLet,
+        );
       }
     }
 
@@ -3494,9 +3524,17 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
     // memo. Without this, the optimizer's filter-sim emits NaN for every
     // print/filter.if/rule expression that references a let.
     if (appliedScriptText) {
-      const letBindings = buildLetBindings(parseStrategyScript(appliedScriptText).stmts);
-      if (letBindings.size > 0) {
-        overlayForFilterSim = applyBindingsToOverlay(overlayForFilterSim, letBindings);
+      const parsedForBindings = parseStrategyScript(appliedScriptText);
+      const letBindings = buildLetBindings(parsedForBindings.stmts);
+      // Same bridge as the tradesAndOptimization memo above — bring KALMAN_OU
+      // rewrites along with let substitutions so the optimizer's filter-sim
+      // path sees rewritten exprs and `kf.x` doesn't collapse to NaN.
+      if (letBindings.size > 0 || parsedForBindings.kalmanArgsByLet.size > 0) {
+        overlayForFilterSim = applyBindingsToOverlay(
+          overlayForFilterSim,
+          letBindings,
+          parsedForBindings.kalmanArgsByLet,
+        );
       }
     }
     if (

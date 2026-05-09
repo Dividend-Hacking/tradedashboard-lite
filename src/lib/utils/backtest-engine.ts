@@ -1329,6 +1329,7 @@ import {
   parseStrategyScript,
   evaluateStrategyScript,
   buildLetBindings,
+  rewriteKalmanRefs,
   type Stmt,
 } from "./strategy-evaluator";
 
@@ -1495,9 +1496,24 @@ function collectOverlayExprs(
 export function applyBindingsToOverlay(
   overlay: import("./zone-simulator").ScriptOverlay,
   bindings: Map<string, Expr>,
+  kalmanArgsByLet?: Map<string, Expr[]>,
 ): import("./zone-simulator").ScriptOverlay {
-  if (bindings.size === 0) return overlay;
-  const ab = (e: Expr): Expr => applyBindings(e, bindings);
+  // Two transforms travel together here: the let-binding substitution
+  // (the original purpose of this helper) and the KALMAN_OU dotted-ident
+  // rewrite (`kf.x` → `KALMAN_OU_x(…)`). Both bridge strategy-DSL state
+  // into entry-context exprs (`exit.if`, `filter.if`, `ontrade.print`,
+  // `rules.X`); without the Kalman half, a script that writes
+  // `exit.long.if = cross_up(close, kf.x)` would never fire because
+  // `kf.x` resolves to NaN in the entry-context evaluator. Order
+  // matters: substitute first, then rewrite — so any `kf.<field>`
+  // appearing inside a let body that gets substituted in is also
+  // caught by the dotted-ident walker.
+  const hasKalman = !!kalmanArgsByLet && kalmanArgsByLet.size > 0;
+  if (bindings.size === 0 && !hasKalman) return overlay;
+  const ab = (e: Expr): Expr => {
+    const sub = bindings.size > 0 ? applyBindings(e, bindings) : e;
+    return hasKalman ? rewriteKalmanRefs(sub, kalmanArgsByLet!) : sub;
+  };
   const rewriteOptimizeSpec = (spec: OptimizeSpec): OptimizeSpec => {
     if (spec.kind === "optimize-categorical") return spec;
     return {
@@ -1711,6 +1727,14 @@ export function runBacktestForSession(args: {
   strategyOverride?: {
     stmts: import("./strategy-evaluator").Stmt[];
     paramOverrides: Record<string, number>;
+    /** Per-`let` encoded args for any `let X = KALMAN_OU(…)` bindings
+     *  in the script. Populated by `parseStrategyScript` so the engine
+     *  can apply the same `kf.<field>` → `KALMAN_OU_<field>(…)` rewrite
+     *  to entry-context overlay exprs that the strategy parser already
+     *  applied to signal/let stmts. Optional for backwards compat —
+     *  callers that omit it just lose Kalman support in
+     *  exit.if/filter.if/ontrade.print/rules.X (the pre-fix behavior). */
+    kalmanArgsByLet?: Map<string, Expr[]>;
   } | null;
   /** Optional tick-resolution data for the session. When provided,
    *  tick-driven indicators (POC/VAH/VAL, vwap_tick, large_trade_count,
@@ -1779,7 +1803,11 @@ export function runBacktestForSession(args: {
     ? buildLetBindings(strategyOverride.stmts)
     : new Map<string, Expr>();
   const effectiveOverlay = scriptOverlay
-    ? applyBindingsToOverlay(scriptOverlay, letBindings)
+    ? applyBindingsToOverlay(
+        scriptOverlay,
+        letBindings,
+        strategyOverride?.kalmanArgsByLet,
+      )
     : null;
 
   const overlayExprs = effectiveOverlay ? collectOverlayExprs(effectiveOverlay) : [];
@@ -2207,6 +2235,9 @@ export function runBacktestAcrossSessions(args: {
   strategyOverride?: {
     stmts: import("./strategy-evaluator").Stmt[];
     paramOverrides: Record<string, number>;
+    /** Per-`let` encoded KALMAN_OU args. See runBacktestForSession's
+     *  identically-named field for rationale. */
+    kalmanArgsByLet?: Map<string, Expr[]>;
   } | null;
 }): BacktestRunResult {
   const {

@@ -98,6 +98,17 @@ export interface ParsedStrategyScript {
    *  uses this list to drive the inferred-param sidebar. Stable across
    *  re-parses (ordered by first appearance). */
   paramRefs: string[];
+  /** Per-`let` encoded args for any `let X = KALMAN_OU(source, calib, trust)`
+   *  bindings the script declared. Empty when the script uses no Kalman
+   *  bindings. The strategy parser already applies the dotted-ident
+   *  rewrite (`kf.x` → `KALMAN_OU_x(…)`) to its own stmts, but downstream
+   *  consumers — notably `applyBindingsToOverlay` in backtest-engine.ts —
+   *  need the same map so they can rewrite `kf.x` references that appear
+   *  in entry-context exprs (`exit.if`, `filter.if`, `ontrade.print`,
+   *  `rules.X`). Without bridging this map, those exprs see a bare
+   *  dotted ident `"kf.x"` that resolves to NaN at runtime and silently
+   *  kills every exit/filter/print that depends on it. */
+  kalmanArgsByLet: Map<string, Expr[]>;
 }
 
 // Reserved binding names that conflict with built-in idents — refuse `let`
@@ -284,7 +295,7 @@ export function parseStrategyScript(text: string): ParsedStrategyScript {
     });
   }
 
-  return { stmts: rewritten, errors, paramRefs };
+  return { stmts: rewritten, errors, paramRefs, kalmanArgsByLet };
 }
 
 /** Encode KALMAN_OU's argument list — `(source, calib, trust)` — into the
@@ -354,8 +365,18 @@ const KALMAN_FIELDS = new Set(["x", "mu", "sigma", "phi", "P", "x_pred"]);
  *  `<kalmanLet>.<field>` with a synthetic `call("KALMAN_OU_<field>",
  *  encodedArgs)`. Idents that don't match a known Kalman binding are
  *  left alone (they may be `params.X`, `signal.long`, or just unrelated
- *  dotted names). Pure: returns a new tree, never mutates input. */
-function rewriteKalmanRefs(expr: Expr, kalmanArgsByLet: Map<string, Expr[]>): Expr {
+ *  dotted names). Pure: returns a new tree, never mutates input.
+ *
+ *  Exported so the backtest engine's `applyBindingsToOverlay` can run
+ *  the same transform on entry-context exprs (`exit.if`, `filter.if`,
+ *  `ontrade.print`, `rules.X`). The strategy parser already runs it on
+ *  signal/let stmts; the overlay path needs it too because the
+ *  line-based DSL parser (`parseBacktestScript`) doesn't know about
+ *  KALMAN_OU and would otherwise leave `kf.x` as an unresolvable
+ *  bare dotted ident. Idempotent: a second pass walks past already-
+ *  rewritten nodes harmlessly (the rewrite produces `call` nodes,
+ *  not idents, so the dotted-ident match misses on a re-walk). */
+export function rewriteKalmanRefs(expr: Expr, kalmanArgsByLet: Map<string, Expr[]>): Expr {
   if (kalmanArgsByLet.size === 0) return expr;
   switch (expr.kind) {
     case "num":
