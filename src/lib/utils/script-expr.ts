@@ -624,6 +624,24 @@ export interface EntryEvalCtx {
   barIndex: number;
   indicatorByKey: Map<string, number[]>;
   zone: TradeZone;
+  /** The trade's bar array — used by `cross_up` / `cross_down` (and any
+   *  future helper that needs to re-evaluate args at a previous bar) to
+   *  look up the prior bar's OHLCV. The cross helpers clone the ctx
+   *  with `bar: bars[barIndex - 1]` and `barIndex - 1` so bare-name
+   *  bar fields (close/open/high/low/volume) resolve at the prior bar
+   *  while indicator series — already barIndex-indexed in
+   *  `indicatorByKey` — also shift back transparently.
+   *
+   *  Optional because non-walker callers (entry-time `filter.if`,
+   *  single-bar `ontrade.print`) have no meaningful previous bar at
+   *  the entry point of evaluation. The cross helpers return 0 when
+   *  this is absent — same outcome as strategy-evaluator's
+   *  `barIndex < 1` short-circuit.
+   *
+   *  Convention: `bars[i].bar_index === i` (matches the zone
+   *  simulator's `sorted` array). Callers that pass a bars array with
+   *  a different index alignment will mis-index the prev bar. */
+  bars?: TradeZoneBar[];
   /** Global tick/point config — populated by the simulator from the
    *  active SimRules. Powers the `ticks(n)` and `point(n)` script
    *  helpers and exposes `tickValue` / `pointValue` / `ticksPerPoint`
@@ -1225,6 +1243,41 @@ export function applyArgDefaults(name: string, args: number[]): number[] {
 }
 
 function evalCallEntry(name: string, args: Expr[], ctx: EntryEvalCtx & { kind: "entry" }): number {
+  // cross_up(a, b) / cross_down(a, b) — bar-over-bar comparison. True
+  // (returns 1) when a crossed above/below b between the prior bar and
+  // the current bar; 0 otherwise. Mirrors the strategy-evaluator
+  // implementation at strategy-evaluator.ts:1097-1122 so signal-side
+  // and exit-side semantics match.
+  //
+  // Needs prior-bar context, which only the per-bar exit walker
+  // provides (via `ctx.bars`). When called from entry-time evaluation
+  // (filter.if, single-bar ontrade.print) `ctx.bars` is absent — we
+  // return 0, matching the strategy walker's `barIndex < 1` short-
+  // circuit. Caller can detect "no decision" by adding an explicit
+  // bar-index guard if needed.
+  //
+  // Spread on prevCtx preserves `kind: "entry"` so the recursive
+  // `evaluate` call routes back through this function for nested
+  // helper references (e.g. cross_up of an EMA call).
+  if (name === "cross_up" || name === "cross_down") {
+    if (args.length !== 2) return NaN;
+    if (ctx.barIndex < 1 || !ctx.bars) return 0;
+    const prevBar = ctx.bars[ctx.barIndex - 1];
+    if (!prevBar) return 0;
+    const aNow = evaluate(args[0], ctx);
+    const bNow = evaluate(args[1], ctx);
+    const prevCtx = { ...ctx, bar: prevBar, barIndex: ctx.barIndex - 1 };
+    const aPrev = evaluate(args[0], prevCtx);
+    const bPrev = evaluate(args[1], prevCtx);
+    if (
+      !Number.isFinite(aNow) || !Number.isFinite(bNow) ||
+      !Number.isFinite(aPrev) || !Number.isFinite(bPrev)
+    ) {
+      return NaN;
+    }
+    if (name === "cross_up") return aPrev < bPrev && aNow >= bNow ? 1 : 0;
+    return aPrev > bPrev && aNow <= bNow ? 1 : 0;
+  }
   // Tick helpers — special-cased before MATH_FNS because they need
   // ctx.tickConfig. ticks(n) returns the price-point distance covered
   // by n ticks (= n / ticksPerPoint). point(n) is the inverse — how

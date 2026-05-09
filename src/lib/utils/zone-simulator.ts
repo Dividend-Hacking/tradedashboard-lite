@@ -740,6 +740,11 @@ export function simulateZone(
           zone,
           tickConfig: exitCtx.tickConfig,
           varValues: exitCtx.varValues,
+          // Pass the trade's full bar array so cross_up/cross_down can
+          // reach back to bar `barIndex - 1` for the prior-bar leg of
+          // the comparison. Constant for the whole trade walk — only
+          // `bar` and `barIndex` mutate per iteration below.
+          bars: sorted,
         }
       : null;
 
