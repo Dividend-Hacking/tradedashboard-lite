@@ -20,7 +20,7 @@ import {
   type NumericValue as ScriptNumericValue,
   type Expr as ScriptExpr,
 } from "./script-expr";
-import type { FilterIfDirective, FilterIfStatement } from "./backtest-script";
+import type { FilterIfDirective, FilterIfStatement, ExitIfDirective } from "./backtest-script";
 
 // ─── Rule Configuration ──────────────────────────────────────────────────────
 //
@@ -355,7 +355,7 @@ export function resolveTickConfig(
 
 // ─── Result Types ────────────────────────────────────────────────────────────
 
-export type ExitReason = "tp" | "sl" | "trail" | "be" | "timer" | "end" | "next" | "daily";
+export type ExitReason = "tp" | "sl" | "trail" | "be" | "timer" | "end" | "next" | "daily" | "signal";
 
 /**
  * How the simulator should handle the case where a new zone opens while a
@@ -568,6 +568,37 @@ export interface SimSummary {
 
 // ─── Core Bar-Walk Engine ────────────────────────────────────────────────────
 
+/** Per-trade context bundle for `exit.if[.long|.short]` evaluation. The
+ *  simulator builds a `EntryEvalCtx` per bar from this struct's fields —
+ *  the only thing that varies bar-to-bar is the current bar + barIndex,
+ *  which simulateZone fills in before each call. When this is undefined
+ *  or `exitIfs` is empty, the per-bar exit-signal check is a no-op and
+ *  the trade walk stays byte-identical to the pre-exit.if path. */
+export interface ExitSignalCtx {
+  /** Compiled exit directives to evaluate. The simulator filters to
+   *  matching scope (any + long for Long trades, any + short for Short)
+   *  before the per-bar loop so we don't pay per-bar filter overhead. */
+  exitIfs: ExitIfDirective[];
+  /** Same precomputed indicator series the entry bar uses for filter.if /
+   *  ontrade.print resolution. Indices align 1-to-1 with the zone's
+   *  bars, so series[bar.bar_index] gives the right value at any bar
+   *  the per-bar exit check looks up. */
+  indicatorByKey: Map<string, number[]>;
+  /** Resolved tick/point config for this zone (auto from instrument or
+   *  manual override). Powers `ticks(n)` / `point(n)` script helpers
+   *  inside an exit cond, same as in filter.if. */
+  tickConfig?: {
+    ticksPerPoint: number;
+    pointValue: number;
+    tickValue: number;
+  };
+  /** Resolved Optimize var values for this trade. Held constant across
+   *  the per-bar walk — vars are trade-scoped, not bar-scoped, so an
+   *  exit cond using `var x = Optimize.X.Y(...)` sees the same value at
+   *  every bar of the trade. Mirrors how filter.if evaluates them. */
+  varValues?: Map<string, number>;
+}
+
 /**
  * Simulates a single zone bar-by-bar with the given rules.
  * Computes P&L from raw OHLCV to handle null pre-computed columns.
@@ -576,12 +607,20 @@ export interface SimSummary {
  *   rules.atrModeEnabled is true, all point-based rule fields are multiplied
  *   by this ATR before being applied. If null/undefined and ATR mode is on,
  *   the rule values fall back to their raw point values for that zone.
+ * @param exitCtx - Optional per-trade context for `exit.if[.long|.short]`
+ *   evaluation. When present and any directive matches the trade's
+ *   direction, the per-bar walk evaluates each cond at the bar's close
+ *   AFTER the SL/TP/trail/timed exits — so a traditional exit always
+ *   wins on the same bar. On a finite-truthy cond, the trade closes at
+ *   that bar's close with exitReason "signal". Empty/absent → no signal
+ *   exits and the per-bar walk is unchanged.
  */
 export function simulateZone(
   zone: TradeZone,
   bars: TradeZoneBar[],
   rules: SimRules,
-  zoneAtr?: number | null
+  zoneAtr?: number | null,
+  exitCtx?: ExitSignalCtx | null,
 ): SimZoneResult | null {
   if (bars.length === 0) return null;
 
@@ -629,6 +668,43 @@ export function simulateZone(
   let runningPeak = 0; // Best favorable P&L so far
   let runningDrawdown = 0; // Worst adverse P&L so far
   let beActivated = false;
+
+  // ── exit.if pre-filter ─────────────────────────────────────────────
+  // Narrow the directive list to the ones that apply to THIS trade's
+  // direction, once. Three cases:
+  //   - undefined scope    → applies to both, always included
+  //   - "long"  + isLong   → included
+  //   - "short" + !isLong  → included
+  //   - mismatched scope   → dropped
+  // Done up front so the per-bar loop just walks the filtered array;
+  // no per-bar scope check, no per-bar allocation. When the filtered
+  // list is empty, the entire exit-signal path is skipped (the
+  // `applicableExits.length > 0` guard at evaluation time).
+  const applicableExits =
+    exitCtx && exitCtx.exitIfs.length > 0
+      ? exitCtx.exitIfs.filter(
+          (d) =>
+            !d.scope ||
+            (d.scope === "long" && isLong) ||
+            (d.scope === "short" && !isLong)
+        )
+      : [];
+  // Reusable EntryEvalCtx — every field except `bar`/`barIndex` is
+  // constant across the trade walk. Mutated in place per bar to dodge
+  // a fresh allocation on every cond eval (most bars don't trigger,
+  // so this hot path matters for long trades). Built only when at
+  // least one exit directive is in scope.
+  const reuseExitEvalCtx: EntryEvalCtx | null =
+    exitCtx && applicableExits.length > 0
+      ? {
+          bar: sorted[0],
+          barIndex: 0,
+          indicatorByKey: exitCtx.indicatorByKey,
+          zone,
+          tickConfig: exitCtx.tickConfig,
+          varValues: exitCtx.varValues,
+        }
+      : null;
 
   for (const bar of sorted) {
     // Compute direction-aware P&L from raw OHLCV
@@ -730,6 +806,43 @@ export function simulateZone(
     }
 
     if (exitResult) return exitResult;
+
+    // ── exit.if per-bar check ── (at bar close, before timed exit)
+    // SL/TP/trail/BE already had their crack at this bar above; they're
+    // intra-bar exits with priority because they reflect a price the
+    // market actually printed. Signal-based exits resolve at the close,
+    // so they go here. Timed exit fires AFTER this — exit.if is a more
+    // deliberate user signal and should win on the same bar.
+    //
+    // Multiple directives OR together: the FIRST cond to evaluate
+    // truthy wins (no need to evaluate the rest). NaN propagates as
+    // "no decision, keep walking" — same NaN-as-fail discipline the
+    // rest of the engine uses.
+    if (reuseExitEvalCtx) {
+      reuseExitEvalCtx.bar = bar;
+      reuseExitEvalCtx.barIndex = bar.bar_index;
+      for (const d of applicableExits) {
+        // Optimizer-warmup gate: when a directive references an
+        // Optimize-driven var that hasn't resolved yet, skip the
+        // directive entirely instead of NaN-rejecting every bar.
+        // Mirrors the same protection filter.if uses at trade entry.
+        if (d.referencedVarNames && d.referencedVarNames.size > 0) {
+          let unresolved = false;
+          for (const name of d.referencedVarNames) {
+            const v = reuseExitEvalCtx.varValues?.get(name);
+            if (v === undefined || !Number.isFinite(v)) {
+              unresolved = true;
+              break;
+            }
+          }
+          if (unresolved) continue;
+        }
+        const v = evaluateExpr(d.cond, { kind: "entry", ...reuseExitEvalCtx });
+        if (Number.isFinite(v) && v !== 0) {
+          return result(zone, bar, closePnl, "signal", runningPeak, runningDrawdown, sorted, slipRoundTrip, rules, effSl, effTp, effTrail, effBe);
+        }
+      }
+    }
 
     // ── Timed Exit ── (always at close regardless of bar type)
     if (rules.timedExitEnabled && bar.bar_index >= rules.timedExitBars - 1) {
@@ -941,6 +1054,14 @@ export interface ScriptOverlay {
    *  empty, the simulator behaves byte-identically to the
    *  pre-filter.if path. */
   filterIfs?: FilterIfDirective[];
+  /** `exit.if[.long|.short] = ...` directives — evaluated at the END
+   *  of every bar after entry. Multiple directives OR together (any
+   *  truthy expression closes the trade). Each carries an optional
+   *  `scope` ("long"/"short") that auto-skips it on the wrong-direction
+   *  trade. Exit price is the bar's close; exit reason is "signal".
+   *  Independent of the SL/TP/trail/timer family — whichever exit
+   *  triggers first wins. Empty/absent → no signal-based exits. */
+  exitIfs?: ExitIfDirective[];
   /** Pre-computed indicator series, keyed by (zone.id, indicator-key).
    *  Built once per run by `precomputeIndicators`, not per trade. Empty
    *  map means "no expressions need indicator data" — evaluator returns
@@ -1222,11 +1343,20 @@ export function simulateAllZones(
     // call below is byte-identical to v1.
     let perTradeRules: SimRules = rules;
     let prints: Record<string, number> | undefined;
+    // Per-trade exit-signal context (built only when at least one
+    // exit.if directive is in scope). Threaded into simulateZone so the
+    // per-bar walk can evaluate signal-based exits without rebuilding
+    // an EvalCtx from scratch each bar. Hoisted out of the overlay
+    // block so callers using only `exit.if` (no filter.if, no
+    // numericOverrides, no tradePrints) still get the indicator
+    // precompute path executed.
+    let perTradeExitCtx: ExitSignalCtx | null = null;
     if (
       scriptOverlay &&
       (scriptOverlay.numericOverrides ||
         scriptOverlay.tradePrints ||
-        (scriptOverlay.filterIfs && scriptOverlay.filterIfs.length > 0))
+        (scriptOverlay.filterIfs && scriptOverlay.filterIfs.length > 0) ||
+        (scriptOverlay.exitIfs && scriptOverlay.exitIfs.length > 0))
     ) {
       // Entry bar = bar with bar_index 0 (the trigger bar). When the
       // run uses fillMode="next_open" this is still the bar we
@@ -1314,9 +1444,22 @@ export function simulateAllZones(
           }
         }
       }
+      // Build the per-bar exit context. Snapshot tickConfig + indicators
+      // + varValues from the entry-context ctx so simulateZone reuses
+      // them across the whole walk. The directives themselves are
+      // direction-filtered inside simulateZone (it sees `zone.direction`
+      // first-hand; we'd duplicate the work doing it here).
+      if (scriptOverlay.exitIfs && scriptOverlay.exitIfs.length > 0) {
+        perTradeExitCtx = {
+          exitIfs: scriptOverlay.exitIfs,
+          indicatorByKey,
+          tickConfig: ctx.tickConfig,
+          varValues: ctx.varValues,
+        };
+      }
     }
 
-    const r = simulateZone(zone, bars, perTradeRules, zoneAtr);
+    const r = simulateZone(zone, bars, perTradeRules, zoneAtr, perTradeExitCtx);
     if (r) {
       if (prints) r.script_prints = prints;
       results.push(r);

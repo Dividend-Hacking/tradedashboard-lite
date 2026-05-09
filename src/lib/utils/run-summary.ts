@@ -126,6 +126,12 @@ export interface BuildRunSummaryArgs {
   /** Live filter.if list at apply time — used to label each rejection
    *  entry with its directive's source line. */
   filterIfs: FilterIfDirective[];
+  /** Live exit.if list at apply time. Optional — undefined or empty
+   *  means no signal-based exits this run. Currently surfaced only in
+   *  the summary's directive listing (no per-exit metrics yet); kept
+   *  on the signature so future "trades closed by signal" attribution
+   *  has a place to land. */
+  exitIfs?: import("./backtest-script").ExitIfDirective[];
   /** From the optimizer's output, when present. */
   optimizationHistory?: Record<string, OptimizationRecord[]>;
   optimizationWarnings?: string[];

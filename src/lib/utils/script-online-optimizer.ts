@@ -51,7 +51,7 @@ import {
   NUMERIC_RULE_KEYS,
   evaluate as evaluateExpr,
 } from "./script-expr";
-import type { FilterIfDirective } from "./backtest-script";
+import type { FilterIfDirective, ExitIfDirective } from "./backtest-script";
 import {
   type ParamSpec,
   type TpeState,
@@ -119,6 +119,13 @@ export interface OnlineOptimizerInput {
    *  resolved rules. Empty/undefined means no filter.if logic — the
    *  optimizer behaves byte-identically to its pre-filter.if path. */
   filterIfs?: FilterIfDirective[];
+  /** `exit.if[.long|.short] = ...` directives. Evaluated per-bar inside
+   *  every emitted trade — including the lookback re-simulations that
+   *  drive TPE's objective — so the optimizer searches against the
+   *  same exit semantics live trades will see. Empty/undefined → no
+   *  signal-based exits and the optimizer's exit handling stays
+   *  byte-identical to its pre-exit.if path. */
+  exitIfs?: ExitIfDirective[];
   /** `Warmup` flag from the script — controls whether trades fired
    *  before the optimizer's lookback fills are included in the final
    *  returned trades array. Default true (include them, current
@@ -215,6 +222,7 @@ export async function runOnlineOptimizedBacktest(
   const tradePrints = input.tradePrints;
   const indicatorByZone = input.indicatorByZone;
   const filterIfs = input.filterIfs;
+  const exitIfs = input.exitIfs;
   const includeWarmupTrades = input.warmup !== false; // default true
   const metricsOut = input.metricsOut;
   // Seed `zonesConsidered` once with the input zone count so the funnel
@@ -296,6 +304,38 @@ export async function runOnlineOptimizedBacktest(
     };
   };
 
+  // Build a per-trade exit-signal context from the same indicators +
+  // tickConfig + varValues a buildEntryCtx call would produce. Returns
+  // null when no exit.if directives are configured so the simulateZone
+  // call falls back to its byte-identical pre-exit.if path. Mirrors the
+  // construction in simulateAllZones (zone-simulator.ts) so both
+  // simulator paths emit the same exit decisions for the same inputs.
+  const buildExitCtx = (
+    zone: TradeZone,
+    bars: TradeZoneBar[],
+    varValues: Map<string, number> | null
+  ): import("./zone-simulator").ExitSignalCtx | null => {
+    if (!exitIfs || exitIfs.length === 0) return null;
+    const indicatorByKey =
+      indicatorByZone?.get(zone.id) ?? new Map<string, number[]>();
+    const tickCfg = resolveTickConfig(zone.instrument, baseRules);
+    return {
+      exitIfs,
+      indicatorByKey,
+      tickConfig: {
+        ticksPerPoint: tickCfg.ticksPerPoint,
+        tickValue: tickCfg.tickValue,
+        pointValue: tickCfg.pointValue,
+      },
+      varValues: varValues ?? undefined,
+    };
+    // Bars param is unused here — exit-signal eval indexes into the
+    // already-precomputed indicator series via bar_index, not bar
+    // contents. Kept in the signature for parity with buildEntryCtx
+    // and to make future "exit needs bar context" extensions cheap.
+    void bars;
+  };
+
   // Evaluate `ontrade.print` directives at a zone's entry bar and
   // attach the resulting label→value map to the SimZoneResult. Mirrors
   // the per-trade print pass in simulateAllZones (zone-simulator.ts) so
@@ -366,7 +406,7 @@ export async function runOnlineOptimizedBacktest(
       const z = sortedZones[i];
       const bars = barsByZoneId.get(z.id);
       if (!bars || bars.length === 0) continue;
-      const r = simulateZone(z, bars, baseRules, atrByZoneId?.get(z.id) ?? null);
+      const r = simulateZone(z, bars, baseRules, atrByZoneId?.get(z.id) ?? null, buildExitCtx(z, bars, null));
       if (r) {
         const ctx = buildEntryCtx(z, bars, null);
         attachPrints(ctx, r, null);
@@ -486,6 +526,15 @@ export async function runOnlineOptimizedBacktest(
       // No directive resolved cleanly → skip optimization, use literals.
       if (dynamicSpace.length > 0) {
         const activePaths = dynamicSpace.map((p) => p.name);
+        // Builder for the TPE re-sim path. We pass `null` for varValues
+        // because each lookback re-sim reflects a candidate rule trial,
+        // not a re-replay of the historical optimizer state — so any
+        // exit.if cond that depends on an Optimize-driven var skips
+        // (via the unresolved-var gate inside simulateZone's per-bar
+        // check) rather than firing on stale data. Static exit conds
+        // (the common case) work normally.
+        const tpeBuildExitCtx = (zone: TradeZone, bars: TradeZoneBar[]) =>
+          buildExitCtx(zone, bars, null);
         const result = effectiveJoint
           ? optimizeJoint(
               dynamicSpace,
@@ -499,7 +548,8 @@ export async function runOnlineOptimizedBacktest(
               nTrialsPerSignal,
               warmupTrials,
               rng,
-              i
+              i,
+              tpeBuildExitCtx
             )
           : optimizeIndependent(
               activePaths,
@@ -513,7 +563,8 @@ export async function runOnlineOptimizedBacktest(
               nTrialsPerSignal,
               warmupTrials,
               rng,
-              i
+              i,
+              tpeBuildExitCtx
             );
         // SMA pass — replace each path's raw best-trial value with the
         // mean of the last K raws (K = directive's smooth window). The
@@ -679,7 +730,7 @@ export async function runOnlineOptimizedBacktest(
       if (accumulatedPrints.size > 0) filterPrints = accumulatedPrints;
     }
 
-    const r = simulateZone(z, bars, rulesForSignal, atrByZoneId?.get(z.id) ?? null);
+    const r = simulateZone(z, bars, rulesForSignal, atrByZoneId?.get(z.id) ?? null, buildExitCtx(z, bars, varValues));
     if (r) {
       // Tag this trade as warmup vs post-warmup BEFORE the push — the
       // length check uses the array AS IT WAS just before this trade
@@ -737,7 +788,17 @@ function optimizeJoint(
   /** Index in sortedZones of the signal we're about to fire — used to
    *  identify which past zones to re-simulate (the lookback window's
    *  source zones). */
-  signalIdx: number
+  signalIdx: number,
+  /** Builder for the per-zone exit-signal context used inside TPE
+   *  re-simulation. Captured from the caller's closure so the optimizer's
+   *  scoring objective honors `exit.if` directives without leaking the
+   *  optimizer state into this top-level helper. Undefined → no
+   *  signal-based exits in TPE re-sim (objective scoring matches the
+   *  pre-exit.if behavior). */
+  buildExitCtxFn?: (
+    zone: TradeZone,
+    bars: TradeZoneBar[]
+  ) => import("./zone-simulator").ExitSignalCtx | null
 ): OptimizeStepResult {
   const tpe = createTpe(space, { warmupTrials });
   // Lookback for joint mode = max across all directives — needs enough
@@ -751,7 +812,7 @@ function optimizeJoint(
   for (let t = 0; t < nTrials; t++) {
     const params = suggest(tpe, rng) as Record<string, number>;
     const trialRules = applyParamsToRules(baseRules, params, overrides);
-    const reSimmed = reSimulateZones(lookbackZones, barsByZoneId, atrByZoneId, trialRules);
+    const reSimmed = reSimulateZones(lookbackZones, barsByZoneId, atrByZoneId, trialRules, buildExitCtxFn);
     const summary = computeSimSummary(reSimmed);
     const obj = pickObjective(summary, objective);
     if (Number.isFinite(obj)) {
@@ -785,7 +846,13 @@ function optimizeIndependent(
   nTrials: number,
   warmupTrials: number,
   rng: () => number,
-  signalIdx: number
+  signalIdx: number,
+  /** Same builder semantics as optimizeJoint above — captured from the
+   *  caller's closure so TPE re-sim honors `exit.if` directives. */
+  buildExitCtxFn?: (
+    zone: TradeZone,
+    bars: TradeZoneBar[]
+  ) => import("./zone-simulator").ExitSignalCtx | null
 ): OptimizeStepResult {
   const params: Record<string, number> = {};
   const objectivePerPath: Record<string, number> = {};
@@ -805,7 +872,7 @@ function optimizeIndependent(
       // THIS path. baseRules already holds the literal for the
       // dashboard's current state.
       const trialRules = applyParamsToRules(baseRules, candidate, overrides);
-      const reSimmed = reSimulateZones(lookbackZones, barsByZoneId, atrByZoneId, trialRules);
+      const reSimmed = reSimulateZones(lookbackZones, barsByZoneId, atrByZoneId, trialRules, buildExitCtxFn);
       const summary = computeSimSummary(reSimmed);
       const obj = pickObjective(summary, spec.objective);
       if (Number.isFinite(obj)) {
@@ -825,18 +892,29 @@ function optimizeIndependent(
 /** Re-simulate a slice of past zones under candidate rules. Returns the
  *  simulated trade results — the caller summarizes them and feeds the
  *  objective back to TPE. Skips zones missing bars (defensive — the
- *  lookback slice may include zones without cached bars). */
+ *  lookback slice may include zones without cached bars).
+ *
+ *  When `buildExitCtxFn` is provided, the per-zone exit-signal context
+ *  is built and passed to simulateZone so TPE objective scoring honors
+ *  `exit.if` directives — same exit semantics live trades will see.
+ *  Caller's closure is the natural source for the builder since it has
+ *  the indicatorByZone + tickConfig + exitIfs already available. */
 function reSimulateZones(
   zones: TradeZone[],
   barsByZoneId: Map<number, TradeZoneBar[]>,
   atrByZoneId: Map<number, number> | null,
-  rules: SimRules
+  rules: SimRules,
+  buildExitCtxFn?: (
+    zone: TradeZone,
+    bars: TradeZoneBar[]
+  ) => import("./zone-simulator").ExitSignalCtx | null
 ): SimZoneResult[] {
   const out: SimZoneResult[] = [];
   for (const z of zones) {
     const bars = barsByZoneId.get(z.id);
     if (!bars || bars.length === 0) continue;
-    const r = simulateZone(z, bars, rules, atrByZoneId?.get(z.id) ?? null);
+    const exitCtx = buildExitCtxFn ? buildExitCtxFn(z, bars) : null;
+    const r = simulateZone(z, bars, rules, atrByZoneId?.get(z.id) ?? null, exitCtx);
     if (r) out.push(r);
   }
   return out;

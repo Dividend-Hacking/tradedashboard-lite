@@ -1225,6 +1225,16 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
   const [scriptFilterIfs, setScriptFilterIfs] = useState<
     import("@/lib/utils/backtest-script").FilterIfDirective[]
   >([]);
+  // ── Script v2.2: exit.if directives ────────────────────────────────
+  // Signal-based exits — `exit.if[.long|.short] = <bool>` evaluated at
+  // the END of every bar after entry. Captured at Apply and threaded
+  // through ScriptOverlay so simulateZone can OR-evaluate them per bar
+  // and close the trade with reason "signal" on a truthy result. Empty
+  // array → no signal exits and the per-bar walk is byte-identical to
+  // the pre-exit.if path.
+  const [scriptExitIfs, setScriptExitIfs] = useState<
+    import("@/lib/utils/backtest-script").ExitIfDirective[]
+  >([]);
   // ── Script Run loading state ──────────────────────────────────────
   // Lights up between the user clicking Run and the next backtest run
   // memo settling. Backtest compute is synchronous on the main thread
@@ -1792,6 +1802,9 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
     // ── Script v2.1: capture filter.if directives. Always replace —
     // empty array means "no conditional filters this run".
     setScriptFilterIfs(cfg.filterIfs ?? []);
+    // ── Script v2.2: capture exit.if directives. Same replace-always
+    // semantics — empty array → no signal-based exits this run.
+    setScriptExitIfs(cfg.exitIfs ?? []);
 
     // Strategy first — it determines which params the dashboard expects.
     let strategyChanged = false;
@@ -2681,11 +2694,13 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
     const hasOptimize =
       scriptOptimizeOverrides && Object.keys(scriptOptimizeOverrides).length > 0;
     const hasFilterIfs = scriptFilterIfs.length > 0;
+    const hasExitIfs = scriptExitIfs.length > 0;
     const overlayForRun: import("@/lib/utils/zone-simulator").ScriptOverlay | null =
       scriptNumericOverrides ||
       scriptTradePrints.length > 0 ||
       hasOptimize ||
-      hasFilterIfs
+      hasFilterIfs ||
+      hasExitIfs
         ? {
             numericOverrides: scriptNumericOverrides ?? undefined,
             tradePrints: scriptTradePrints.map((p) => ({
@@ -2696,6 +2711,7 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
             optimizeAll: scriptOptimizeAll,
             warmup: scriptWarmup,
             filterIfs: hasFilterIfs ? scriptFilterIfs : undefined,
+            exitIfs: hasExitIfs ? scriptExitIfs : undefined,
             // Seed: stable hash of the script text + sorted session IDs.
             // Computed inline so the memo's cache key sees consistent
             // values; the engine uses this directly via the overlay.
@@ -2762,6 +2778,9 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
             // with scope so `filter.long.if = X` and `filter.short.if = X`
             // get distinct cache keys despite sharing RHS text.
             filterIfs: scriptFilterIfs.map((d) => `${d.scope ?? "both"}|${d.source}`),
+            // Same scope-prefix trick for exit.if so direction-scoped
+            // variants stay distinct in the cache key.
+            exitIfs: scriptExitIfs.map((d) => `${d.scope ?? "both"}|${d.source}`),
           }
         : null,
     });
@@ -2961,7 +2980,7 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
       optimizationWarnings:
         allOptimizationWarnings.length > 0 ? allOptimizationWarnings : undefined,
     };
-  }, [selectedSessionIds, sessions, barsBySessionId, currentStrategy, params, rules, indicatorConfig, scriptNumericOverrides, scriptTradePrints, scriptOptimizeOverrides, scriptOptimizeAll, scriptWarmup, scriptFilterIfs, appliedScriptText, scriptParams, scriptParamMeta]);
+  }, [selectedSessionIds, sessions, barsBySessionId, currentStrategy, params, rules, indicatorConfig, scriptNumericOverrides, scriptTradePrints, scriptOptimizeOverrides, scriptOptimizeAll, scriptWarmup, scriptFilterIfs, scriptExitIfs, appliedScriptText, scriptParams, scriptParamMeta]);
 
   // ─── Apply context filters (ADX / ATR / Trend / Bollinger) ────────
   // Runs BEFORE the time filter so the chain is:
@@ -3185,6 +3204,7 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
     const hasOpt =
       scriptOptimizeOverrides && Object.keys(scriptOptimizeOverrides).length > 0;
     const hasFilterIfsHere = scriptFilterIfs.length > 0;
+    const hasExitIfsHere = scriptExitIfs.length > 0;
     const noFilter = timeFilteredZones === runResult.syntheticZones;
     // Fast path: no overlay, no filter. Return runResult straight
     // through — preserves the byte-identical legacy behavior.
@@ -3193,7 +3213,8 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
       !scriptNumericOverrides &&
       scriptTradePrints.length === 0 &&
       !hasOpt &&
-      !hasFilterIfsHere
+      !hasFilterIfsHere &&
+      !hasExitIfsHere
     ) {
       return {
         trades: runResult.trades,
@@ -3214,7 +3235,8 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
       scriptNumericOverrides ||
       scriptTradePrints.length > 0 ||
       hasOpt ||
-      hasFilterIfsHere
+      hasFilterIfsHere ||
+      hasExitIfsHere
         ? {
             numericOverrides: scriptNumericOverrides ?? undefined,
             tradePrints: scriptTradePrints.map((p) => ({
@@ -3225,6 +3247,7 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
             optimizeAll: scriptOptimizeAll,
             warmup: scriptWarmup,
             filterIfs: hasFilterIfsHere ? scriptFilterIfs : undefined,
+            exitIfs: hasExitIfsHere ? scriptExitIfs : undefined,
           }
         : null;
 
@@ -3346,6 +3369,7 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
     scriptOptimizeAll,
     scriptWarmup,
     scriptFilterIfs,
+    scriptExitIfs,
     appliedScriptText,
     selectedSessionIds,
     asyncOptResult,
@@ -3456,6 +3480,7 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
     // branch used to build. Mirrors lines 2620-2698 above so the
     // optimizer sees an identical input.
     const hasFilterIfsHere = scriptFilterIfs.length > 0;
+    const hasExitIfsHere = scriptExitIfs.length > 0;
     let overlayForFilterSim: import("@/lib/utils/zone-simulator").ScriptOverlay = {
       numericOverrides: scriptNumericOverrides ?? undefined,
       tradePrints: scriptTradePrints.map((p) => ({ label: p.label, expr: p.expr })),
@@ -3463,6 +3488,7 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
       optimizeAll: scriptOptimizeAll,
       warmup: scriptWarmup,
       filterIfs: hasFilterIfsHere ? scriptFilterIfs : undefined,
+      exitIfs: hasExitIfsHere ? scriptExitIfs : undefined,
     };
     // Inline strategy-DSL `let` bindings — see comment in tradesAndOptimization
     // memo. Without this, the optimizer's filter-sim emits NaN for every
@@ -3476,7 +3502,8 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
     if (
       overlayForFilterSim.numericOverrides ||
       (overlayForFilterSim.tradePrints && overlayForFilterSim.tradePrints.length > 0) ||
-      (overlayForFilterSim.filterIfs && overlayForFilterSim.filterIfs.length > 0)
+      (overlayForFilterSim.filterIfs && overlayForFilterSim.filterIfs.length > 0) ||
+      (overlayForFilterSim.exitIfs && overlayForFilterSim.exitIfs.length > 0)
     ) {
       overlayForFilterSim = {
         ...overlayForFilterSim,
@@ -3528,6 +3555,7 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
           )
         : null,
       filterIfs: scriptFilterIfs.map((d) => `${d.scope ?? "both"}|${d.source}`),
+      exitIfs: scriptExitIfs.map((d) => `${d.scope ?? "both"}|${d.source}`),
       seed: deriveSeed(appliedScriptText, Array.from(selectedSessionIds)),
     });
 
@@ -3603,6 +3631,7 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
           tradePrints: overlayForFilterSim.tradePrints,
           indicatorByZone: overlayForFilterSim.indicatorByZone,
           filterIfs: overlayForFilterSim.filterIfs,
+          exitIfs: overlayForFilterSim.exitIfs,
           warmup: overlayForFilterSim.warmup,
           cancelRef: myCancel,
           metricsOut: optMetrics,
@@ -3664,6 +3693,7 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
     scriptOptimizeAll,
     scriptWarmup,
     scriptFilterIfs,
+    scriptExitIfs,
     appliedScriptText,
     selectedSessionIds,
   ]);
@@ -3878,6 +3908,7 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
         sessions,
         metrics: tradesAndOptimization.metrics,
         filterIfs: scriptFilterIfs,
+        exitIfs: scriptExitIfs,
         optimizationHistory: tradesAndOptimization.optimizationHistory,
         optimizationWarnings: tradesAndOptimization.optimizationWarnings,
       });

@@ -1593,6 +1593,51 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     ],
   },
 
+  // ── Signal-based exits (Script v2.2) ──────────────────────────────────
+  // `exit.if = <bool-expr>` closes the open trade at the END of any bar
+  // (after the entry bar) where the expression is truthy. Mirrors the
+  // filter.if family in shape — three path variants control direction,
+  // multiple lines OR together. Independent of and complementary to
+  // SL/TP/trail/timer; whichever exit triggers first wins. The bar's
+  // close is the exit price; the trade reports exitReason "signal".
+  {
+    path: "exit.if",
+    type: "directive",
+    section: "Risk rules — Exits",
+    description:
+      "Close the trade at the end of any bar (after entry) where this expression is truthy. The most flexible exit — write any boolean expression you'd put in a filter and the simulator will check it bar-by-bar. Multiple `exit.if` lines all OR together — any one firing closes the trade. NaN values fall through (the bar walk continues), same as filter.if. Independent of SL/TP/trail; whichever fires first wins.",
+    default: "",
+    examples: [
+      { snippet: "exit.if = ADX(14) < 18", scenario: "Bail out when the trend dies — exit as soon as ADX falls below 18." },
+      { snippet: "exit.if = close < EMA(20)", scenario: "Trend-follow exit: close the moment price loses the 20-bar trend line." },
+      { snippet: "let kf = KALMAN_OU(close, 60, 0.5)\nexit.if = abs((close - kf.x) / kf.sigma) < 0.25", scenario: "Mean-reversion exit — close once price has reverted within 0.25σ of the Kalman fair-value estimate." },
+    ],
+  },
+  {
+    path: "exit.long.if",
+    type: "directive",
+    section: "Risk rules — Exits",
+    description:
+      "Same as `exit.if` but ONLY applies to long trades. Saves you from writing `direction > 0 && ...` everywhere when the exit logic is direction-specific. Short trades skip this directive entirely.",
+    default: "",
+    examples: [
+      { snippet: "exit.long.if = close < EMA(50)", scenario: "Close longs the moment price drops back below the 50-bar EMA." },
+      { snippet: "let kf = KALMAN_OU(close, 60, 0.5)\nexit.long.if = cross_up(close, kf.x)", scenario: "Mean-reversion long exit — close when price crosses back up through the Kalman fair value." },
+    ],
+  },
+  {
+    path: "exit.short.if",
+    type: "directive",
+    section: "Risk rules — Exits",
+    description:
+      "Same as `exit.if` but ONLY applies to short trades. Long trades skip this directive entirely.",
+    default: "",
+    examples: [
+      { snippet: "exit.short.if = close > EMA(50)", scenario: "Close shorts the moment price reclaims the 50-bar EMA." },
+      { snippet: "let kf = KALMAN_OU(close, 60, 0.5)\nexit.short.if = cross_down(close, kf.x)", scenario: "Mean-reversion short exit — close when price crosses back down through the Kalman fair value." },
+    ],
+  },
+
   // ── Optimization (Script v3) ─────────────────────────────────────────
   {
     path: "OptimizeAll",
@@ -1729,6 +1774,13 @@ export type PartialBacktestConfig = {
   // the taken branch stack on top of numericOverrides for the resolved
   // trade. See FilterIfDirective for the action statement shape.
   filterIfs?: FilterIfDirective[];
+  // Conditional exits — multiple `exit.if[.long|.short] = ...` lines
+  // accumulate. ANY of them firing at any bar (after entry) closes the
+  // trade with reason "signal" (OR semantics). See ExitIfDirective for
+  // the per-direction scope semantics. Empty/absent → no signal-based
+  // exits and the simulator's traditional SL/TP/trail/timer rules are
+  // the only exit paths.
+  exitIfs?: ExitIfDirective[];
   // ── Script Optimize directives ────────────────────────────────────
   // When a field's RHS is `Optimize.<Obj>.<Unit>(...)`, the spec lands
   // here keyed by full path (e.g. `rules.stopLossPoints`). The online
@@ -1852,6 +1904,43 @@ export interface FilterIfDirective {
    *  "short" (skipped on long trades — auto-pass). The runtime checks
    *  this against `zone.direction` before evaluating the cond. */
   scope?: "long" | "short";
+}
+
+// ─── exit.if directive types ───────────────────────────────────────────
+//
+// `exit.if = <bool-expression>` closes the current trade at the END of any
+// bar (after the entry bar) where the expression is truthy. Same NaN-as-
+// fail discipline as filter.if — NaN means "no decision, keep walking."
+// Three path variants control which trades the directive applies to:
+//
+//   exit.if         → both long and short trades
+//   exit.long.if    → long-only (skipped on short trades)
+//   exit.short.if   → short-only
+//
+// Multiple lines of the same path accumulate and OR together: ANY truthy
+// expression triggers the exit. The exit price is the bar's CLOSE (same
+// convention as the timed exit) and the exit reason is "signal".
+//
+// The shape is deliberately a stripped-down FilterIfDirective — same
+// `cond + scope + source + referencedVarNames` core, but no actions, no
+// nested directives, no verdict markers. An exit signal has only one
+// effect (close the trade), so the action sub-DSL would be dead weight.
+
+/** A parsed `exit.if[.long|.short] = <bool-expr>` directive. The runtime
+ *  evaluates `cond` at every bar after entry; on a finite-truthy result
+ *  the trade closes at that bar's close. NaN/0/missing-data falls
+ *  through and the bar walk continues. */
+export interface ExitIfDirective {
+  source: string;
+  cond: Expr;
+  /** Direction this exit applies to. undefined → both. Mirrors the
+   *  filter.if scope semantics so users learn one rule, not two. */
+  scope?: "long" | "short";
+  /** Bare-ident names in `cond` resolved by the optimizer's var system
+   *  (paths under `var.*` in `optimizeOverrides`). The runtime skips
+   *  the directive when any referenced var is unresolved — same
+   *  discipline as filter.if. Empty/undefined → no var dependencies. */
+  referencedVarNames?: Set<string>;
 }
 
 /** Strip a trailing inline comment from `s`, respecting double-quoted
@@ -2577,6 +2666,12 @@ export function collectOverlayExprs(
     };
     for (const d of overlay.filterIfs) walkDirective(d);
   }
+  // exit.if conds — included so the indicator pre-compute covers per-bar
+  // exit checks. Without this, indicator references inside exit.if would
+  // miss the precompute and resolve to NaN at every bar.
+  if (overlay.exitIfs) {
+    for (const d of overlay.exitIfs) out.push(d.cond);
+  }
   return out;
 }
 
@@ -3257,6 +3352,48 @@ export function parseBacktestScript(text: string): ParseResult {
         }
         if (scope) bound.scope = scope;
         config.filterIfs.push(bound);
+        continue;
+      }
+      if (path === "exit.if" || path === "exit.long.if" || path === "exit.short.if") {
+        // Per-direction variants share the same simulator hook — only the
+        // `scope` field differs. The runtime auto-skips a scoped directive
+        // on the wrong-direction trade. RHS is a single boolean expression
+        // (no 3-arg form, no actions); same compile path the entry-context
+        // evaluator uses elsewhere, so KALMAN_OU/EMA/etc. all work.
+        const scope: "long" | "short" | undefined =
+          path === "exit.long.if" ? "long" : path === "exit.short.if" ? "short" : undefined;
+        // Lift inline Optimize() calls to synthetic vars first, same as
+        // filter.if, so users can write `exit.if = close < EMA(Optimize.X.Y(...))`.
+        const lifted = liftInlineOptimize(rhs, config, inlineOptimizeCounter);
+        if (!lifted.ok) {
+          errors.push({ line: lineNo, message: `${path}: ${lifted.error}`, severity: "error" });
+          continue;
+        }
+        const c = compileExpr(lifted.text);
+        if (!c.ok) {
+          errors.push({ line: lineNo, message: `${path}: ${c.error}`, severity: "error" });
+          continue;
+        }
+        // Inline active var bindings so the per-bar evaluator sees a
+        // fully resolved tree (mirrors the filter.if treatment).
+        const boundCond = applyBindings(c.expr, bindings);
+        const directive: ExitIfDirective = {
+          source: lifted.text.trim(),
+          cond: boundCond,
+        };
+        if (scope) directive.scope = scope;
+        // Same optimizer-warmup gate as filter.if — when the cond
+        // references a var that hasn't warmed up, the runtime skips
+        // this directive instead of NaN-rejecting every bar.
+        const referencedVarNames = collectReferencedVarNames(
+          boundCond,
+          config.optimizeOverrides
+        );
+        if (referencedVarNames.size > 0) {
+          directive.referencedVarNames = referencedVarNames;
+        }
+        config.exitIfs ??= [];
+        config.exitIfs.push(directive);
         continue;
       }
       const d = parseDirectiveRhs(rhs);

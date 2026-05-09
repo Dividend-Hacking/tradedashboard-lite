@@ -47,6 +47,10 @@ const REASON_LABELS: Record<ExitReason, { label: string; color: string }> = {
   next: { label: "Next", color: "bg-orange-500/20 text-orange-400" },
   // Force-closed by the daily-limit exact-mode kill switch
   daily: { label: "Daily", color: "bg-pink-500/20 text-pink-400" },
+  // Closed by an `exit.if[.long|.short]` boolean expression — user-
+  // written signal exit. Cyan distinguishes it from the OHLC-driven
+  // exits (SL/TP/trail/BE) and from the time/regime exits.
+  signal: { label: "Signal", color: "bg-cyan-500/20 text-cyan-400" },
 };
 
 export function SimulatorTable({

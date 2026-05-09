@@ -1473,6 +1473,13 @@ function collectOverlayExprs(
     };
     for (const d of overlay.filterIfs) walkDirective(d);
   }
+  // exit.if conds are per-bar boolean expressions; precomputing the
+  // indicators they reference is what lets the bar-walk evaluator hit
+  // the same indicatorByKey cache as filter.if/ontrade.print without
+  // doing per-bar work.
+  if (overlay.exitIfs) {
+    for (const d of overlay.exitIfs) out.push(d.cond);
+  }
   return out;
 }
 
@@ -1562,6 +1569,11 @@ export function applyBindingsToOverlay(
   }
   if (overlay.filterIfs) {
     next.filterIfs = overlay.filterIfs.map((d) => rewriteFilterIf(d));
+  }
+  // exit.if shape is a stripped-down filter.if (cond + scope + source);
+  // applying bindings touches only the cond — nothing else to walk.
+  if (overlay.exitIfs) {
+    next.exitIfs = overlay.exitIfs.map((d) => ({ ...d, cond: ab(d.cond) }));
   }
   return next;
 }
