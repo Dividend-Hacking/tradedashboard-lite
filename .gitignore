@@ -50,3 +50,7 @@ next-env.d.ts
 # Generated locally for Claude Code analysis — not part of the codebase.
 /backtests/dashboard-results/*
 !/backtests/dashboard-results/.gitkeep
+
+# Cursor file written by scripts/sync-from-main.sh — records the last
+# upstream commit synced. Per-clone state, not shared.
+/scripts/.sync-state

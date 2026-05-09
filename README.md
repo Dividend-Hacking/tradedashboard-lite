@@ -206,6 +206,41 @@ backtests/
   scripts/             Example .dsl scripts
 ```
 
+## Syncing updates from the main repo
+
+This lite repo is a curated subset of the full
+[`tradedashboard`](https://github.com/Dividend-Hacking/tradedashboard) repo.
+Updates from main are cherry-picked over rather than merged, since lite
+intentionally diverges from main on a handful of features (e.g. the
+embedded terminal, the `/assistant` page).
+
+To bring in new commits from main:
+
+```bash
+./scripts/sync-from-main.sh             # apply all new commits
+./scripts/sync-from-main.sh --dry-run   # preview only, no changes
+```
+
+The script expects the main repo to be cloned at
+`/Users/jordanscott/Desktop/tradedashboard`. Override with
+`MAIN_REPO_PATH=/some/other/path` or `--main-repo /some/other/path`.
+
+**To skip a commit category permanently** (e.g. all `/assistant` work),
+add path globs to `scripts/.sync-exclude` — one glob per line. If every
+file an upstream commit touches matches the exclude list, the commit is
+auto-skipped.
+
+**On conflict**, the script stops and leaves you in a normal cherry-pick
+conflict state. Resolve in the editor, then:
+
+```bash
+git cherry-pick --continue
+./scripts/sync-from-main.sh             # resume — picks up where it stopped
+```
+
+The last successfully synced commit is recorded in
+`scripts/.sync-state` (gitignored — local cursor only).
+
 ## Troubleshooting
 
 - **"Failed to load trades"** in cloud mode → your Supabase env vars are

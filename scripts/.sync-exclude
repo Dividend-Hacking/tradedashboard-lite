@@ -1,0 +1,24 @@
+# scripts/.sync-exclude — paths to skip when running scripts/sync-from-main.sh
+#
+# One bash glob per line. If EVERY file touched by an upstream commit
+# matches at least one of these globs, the commit is auto-skipped during
+# `./scripts/sync-from-main.sh`. Lines starting with `#` and blank lines
+# are ignored.
+#
+# Globs use bash `[[ "$file" == $pat ]]` semantics:
+#   src/app/foo/*           — direct children of src/app/foo (one level)
+#   src/app/foo/**          — anything under src/app/foo (any depth)
+#   *.md                    — any markdown file at any depth (NOT what bash
+#                             does by default — use **/*.md instead)
+#   **/*.md                 — markdown files anywhere
+#
+# These are the directories the lite repo has historically opted out of.
+# Uncomment to activate. Leave commented (the default) to track main 1:1.
+#
+# src/app/assistant/**
+# src/components/assistant/**
+# src/components/embedded-terminal.tsx
+# src/components/terminal-drawer.tsx
+#
+# Touch this file from the project root to make changes visible to git
+# (it's tracked); ./scripts/.sync-state is gitignored.
