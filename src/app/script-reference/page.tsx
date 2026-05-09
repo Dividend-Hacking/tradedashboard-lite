@@ -741,6 +741,36 @@ const INDICATOR_FAMILIES: IndicatorFamily[] = [
       },
     ],
   },
+
+  // ─── Kalman-filtered Ornstein-Uhlenbeck (strategy DSL only) ─────────
+  // Member access (`kf.x`, `kf.sigma`, …) only works inside a strategy
+  // script via a `let X = KALMAN_OU(...)` binding — the parser rewrites
+  // dotted ident references into direct calls against five hidden
+  // sibling indicators. Five fields share one filter pass per parameter
+  // tuple via a per-zone bundle cache.
+  {
+    headline: "KALMAN_OU (mean-reversion estimator)",
+    forms: [
+      "let kf = KALMAN_OU(source, calib, trust)",
+      "kf.x       (filtered fair-value estimate)",
+      "kf.mu      (long-run mean)",
+      "kf.sigma   (long-run unconditional std — z-score divisor)",
+      "kf.phi     (AR(1) persistence)",
+      "kf.P       (current posterior variance)",
+    ],
+    description:
+      "Kalman-filtered Ornstein-Uhlenbeck mean-reversion estimator — gives you a smoothed \"fair value\" line that price reverts toward, plus the natural standard-deviation scale to size mean-reversion entries. STRATEGY DSL ONLY: must be assigned to a `let` and then accessed via `kf.x`-style member syntax (the parser rewrites those into direct sub-indicator calls). `source` is one of close/open/high/low/typical/median_price/weighted_close. `calib` is the calibration window in bars and must be a literal number (60 is a sensible default). `trust` ∈ (0,1) controls how much weight the filter puts on each new bar's price vs its own prediction — small (0.1–0.3) = very smooth slow line, large (0.7–0.9) = follows price closely. Recalibration is currently 'once' — the (mu, phi, sigma) parameters are estimated from the first `calib` bars and frozen.",
+    examples: [
+      {
+        snippet: "let kf = KALMAN_OU(close, 60, 0.5)\nlet z = (close - kf.x) / kf.sigma\nsignal.long.if = cross_down(z, -params.entryZ)\nsignal.short.if = cross_up(z, params.entryZ)",
+        scenario: "Mean-reversion: go long when price drops more than entryZ standard deviations below the Kalman fair-value estimate; symmetric short on the overshoot.",
+      },
+      {
+        snippet: "let kf = KALMAN_OU(typical, 90, 0.3)\nrules.takeProfitPoints = abs(close - kf.x)",
+        scenario: "Use the Kalman estimate as a mean-reversion target — TP equals the distance from price back to the filter's fair value.",
+      },
+    ],
+  },
 ];
 
 const BAR_FIELDS = EXPR_SYMBOLS.filter(

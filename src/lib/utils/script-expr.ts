@@ -2794,6 +2794,30 @@ export const EXPR_SYMBOLS: ExprSymbol[] = [
     description: "True VWAP built from raw individual trades — finer than VWAP(N) which uses bar averages. Needs ticks.",
     context: "entry",
   },
+
+  // ─── Kalman-filtered Ornstein-Uhlenbeck (strategy-DSL only) ─────────
+  // Member access (`kf.x`, `kf.sigma`, …) is implemented by a parse-time
+  // rewrite in parseStrategyScript — it only fires for `let X = KALMAN_OU(...)`
+  // bindings inside a strategy script. Standalone use in a filter.if is
+  // not supported (the rewrite needs the let context to identify the
+  // binding name).
+  {
+    name: "KALMAN_OU",
+    kind: "call",
+    signature: "KALMAN_OU(source, calib=60, trust=0.5)",
+    description: "Kalman-filtered Ornstein-Uhlenbeck mean-reversion estimator. STRATEGY DSL ONLY — must be assigned to a `let` and accessed via member syntax. Five fields: `kf.x` (filtered fair-value estimate), `kf.mu` (long-run mean from calibration), `kf.sigma` (long-run unconditional std — natural z-score divisor), `kf.phi` (AR(1) persistence), `kf.P` (current posterior variance). `source` is one of close/open/high/low/typical/median_price/weighted_close. `calib` is the calibration window in bars (must be a literal). `trust` ∈ (0,1) sets the steady-state Kalman gain — small = heavy smoothing toward the OU prediction, large = closer to raw price. All five fields share one filter pass per (source, calib, trust) tuple via a shared bundle cache. Recalibration is currently 'once' — parameters are frozen after the calib window.",
+    context: "entry",
+    examples: [
+      {
+        snippet: "let kf = KALMAN_OU(close, 60, 0.5)\nlet z = (close - kf.x) / kf.sigma\nsignal.long.if = cross_down(z, -params.entryZ)\nsignal.short.if = cross_up(z, params.entryZ)",
+        scenario: "Mean-reversion: go long when price drops more than entryZ standard deviations below the Kalman fair-value estimate; short on the symmetric overshoot.",
+      },
+      {
+        snippet: "let kf = KALMAN_OU(typical, 90, 0.3)\nrules.takeProfitPoints = abs(close - kf.x)",
+        scenario: "Use the Kalman estimate as a mean-reversion target — TP equals the distance from price back to the filter's fair value.",
+      },
+    ],
+  },
 ];
 
 /** Identifiers available in summary (`print = ...`) context. */
