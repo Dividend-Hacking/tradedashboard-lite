@@ -280,6 +280,25 @@ export function csIndicatorMethod(name: string): string | null {
       return "LargeTradeCount";
     case "vwap_tick":
       return "VwapTick";
+    // Kalman-OU bundle — six sibling indicators that all share one
+    // filter pass internally on the C# side. The DSL `let kf =
+    // KALMAN_OU(close, 60, 0.5); kf.x_pred` syntax is rewritten at
+    // parse time (strategy-evaluator.ts:231-272) into flat calls like
+    // `KALMAN_OU_x_pred(1, 60, 0.5)`, so the transpiler only ever
+    // sees these sibling names — never the bare `KALMAN_OU` or the
+    // `kf.field` member-access form.
+    case "KALMAN_OU_x":
+      return "KalmanOuX";
+    case "KALMAN_OU_mu":
+      return "KalmanOuMu";
+    case "KALMAN_OU_sigma":
+      return "KalmanOuSigma";
+    case "KALMAN_OU_phi":
+      return "KalmanOuPhi";
+    case "KALMAN_OU_P":
+      return "KalmanOuP";
+    case "KALMAN_OU_x_pred":
+      return "KalmanOuXPred";
     default:
       return null;
   }

@@ -27,6 +27,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.Runtime.CompilerServices;
 
 namespace NinjaTrader.NinjaScript.AddOns
 {
@@ -1623,5 +1624,321 @@ namespace NinjaTrader.NinjaScript.AddOns
 
         public static double VortexMinus(IList<DslBar> bars, int barsAgo, double periodD)
             => At(VortexLeg(bars, RoundI(periodD), false), barsAgo);
+
+        // ───────────────────── KALMAN_OU ────────────────────────────────────
+        // Kalman-filtered Ornstein–Uhlenbeck mean-reversion estimator.
+        // Mirrors src/lib/indicators/kalman-ou.ts line-for-line — that file
+        // is the math source of truth, do NOT diverge. The DSL surface is
+        // six sibling indicator names (KALMAN_OU_x, _mu, _sigma, _phi, _P,
+        // _x_pred) all keyed on the same (source, calib, trust) tuple; we
+        // run the filter once per tuple per bar count and hand back the
+        // requested field so reading all six fields costs one filter pass.
+        //
+        // Source codes (mirror kalman-ou.ts:43-51 exactly — drift here
+        // silently produces a different filter):
+        //   1=close, 2=open, 3=high, 4=low,
+        //   5=typical (H+L+C)/3, 6=median (H+L)/2, 7=weighted_close (H+L+2C)/4
+        //
+        // The `x` vs `x_pred` distinction is load-bearing for honest
+        // backtests:
+        //   - `x[i]`      = POST-fit Kalman posterior — already absorbed
+        //                   close[i]. Comparing close to `x` measures the
+        //                   post-fit residual, NOT the OU innovation, so
+        //                   z-scores built on it are biased toward easier
+        //                   triggers and flatter backtests vs live.
+        //   - `x_pred[i]` = PRE-fit prediction `mu + phi*(x[i-1] - mu)`,
+        //                   the OU forecast for bar i given everything
+        //                   known BEFORE bar i opens. The right baseline
+        //                   for innovation z-scores in entry rules.
+        // Do NOT collapse them into one field "for simplicity" — that
+        // distinction was added after a "too good to be true" backtest
+        // audit and is preserved deliberately.
+
+        /// <summary>Bundle of all six Kalman-OU output series, time-aligned
+        /// to the bar buffer. NaN slots fill the warmup window
+        /// (bars 0..calib-1) and any bar whose calibration window was
+        /// degenerate (constant prices, etc.).</summary>
+        private sealed class KalmanOuResult
+        {
+            public double[] X;
+            public double[] Mu;
+            public double[] Sigma;
+            public double[] Phi;
+            public double[] P;
+            public double[] XPred;
+        }
+
+        /// <summary>Per-bars-list Kalman-OU bundle cache. Keyed first
+        /// on the bars list reference (so two strategies running
+        /// concurrently never share each other's bundles even when
+        /// their (source, calib, trust, count) tuples collide), then
+        /// on (sourceCode, calib, trust, barCount) so the six sibling
+        /// indicator methods within a single bar update share one
+        /// filter pass. ConditionalWeakTable's weak-key semantics let
+        /// the inner dict get GC'd automatically when the strategy's
+        /// _bars list is collected — no manual cleanup needed.</summary>
+        private static readonly ConditionalWeakTable<IList<DslBar>, Dictionary<string, KalmanOuResult>> _kalmanCache
+            = new ConditionalWeakTable<IList<DslBar>, Dictionary<string, KalmanOuResult>>();
+
+        /// <summary>Read the configured price source from a bar.
+        /// Mirrors readSource() in kalman-ou.ts:58-69. Drift here
+        /// (e.g. swapping any pair of codes) silently produces a
+        /// different filter — keep this in lockstep with the TS side.</summary>
+        private static double ReadKalmanSource(DslBar bar, int code)
+        {
+            switch (code)
+            {
+                case 1: return bar.Close;
+                case 2: return bar.Open;
+                case 3: return bar.High;
+                case 4: return bar.Low;
+                case 5: return (bar.High + bar.Low + bar.Close) / 3.0;
+                case 6: return (bar.High + bar.Low) / 2.0;
+                case 7: return (bar.High + bar.Low + 2.0 * bar.Close) / 4.0;
+                default: return double.NaN;
+            }
+        }
+
+        /// <summary>Allocate an all-NaN bundle of length n — the standard
+        /// failure return so callers degrade cleanly via the
+        /// NaN-rejection paths every other indicator uses.</summary>
+        private static KalmanOuResult NanKalmanBundle(int n)
+        {
+            return new KalmanOuResult
+            {
+                X = FilledNaN(n),
+                Mu = FilledNaN(n),
+                Sigma = FilledNaN(n),
+                Phi = FilledNaN(n),
+                P = FilledNaN(n),
+                XPred = FilledNaN(n),
+            };
+        }
+
+        /// <summary>Compute the full Kalman-OU bundle for the bar series
+        /// with ROLLING calibration. At every bar i >= calib, the OU
+        /// parameters (mu, phi, sigma_long, Q, R) are refit via OLS over
+        /// the immediately preceding `calib` bars, then a single Kalman
+        /// step incorporates bar i. Path-independent and out-of-sample
+        /// throughout — see kalman-ou.ts:112-139 for the full rationale.
+        ///
+        /// Sufficient stats are maintained as O(1) rolling updates so
+        /// the per-bar cost is flat regardless of `calib`. Any failure
+        /// of preconditions returns an all-NaN bundle.</summary>
+        private static KalmanOuResult ComputeKalmanOu(
+            IList<DslBar> bars, int sourceCode, int calibN, double trust)
+        {
+            int n = bars.Count;
+            if (n == 0) return NanKalmanBundle(0);
+            if (sourceCode < 1 || sourceCode > 7) return NanKalmanBundle(n);
+            if (calibN < 3) return NanKalmanBundle(n);
+            if (!Dsl.IsFinite(trust) || trust <= 0.0 || trust >= 1.0) return NanKalmanBundle(n);
+            if (n < calibN + 1) return NanKalmanBundle(n);
+
+            // Pre-extract the source series so the rolling loop reads
+            // cheap array slots, not bar fields.
+            var y = new double[n];
+            for (int i = 0; i < n; i++) y[i] = ReadKalmanSource(bars[i], sourceCode);
+
+            var outB = NanKalmanBundle(n);
+
+            // Filter state — seeded from the last observation BEFORE the
+            // first emit bar so the very first Kalman step at i=calibN
+            // has a sensible prior. P is set after the first successful
+            // calibration to the long-run variance.
+            double x = y[calibN - 1];
+            double P = 0.0;
+            double mu = double.NaN, phi = double.NaN, Q = double.NaN;
+            double sigmaLong = double.NaN, R = double.NaN;
+
+            int pairs = calibN - 1;
+            int dof = pairs > 2 ? pairs - 2 : Math.Max(1, pairs - 1);
+
+            // O(1) rolling OLS sufficient stats over the y_t side of pairs.
+            // See kalman-ou.ts:189-213 for the algebra.
+            double sumX = 0, sumY = 0, sumXX = 0, sumXY = 0, sumYY = 0;
+            for (int t = 0; t < pairs; t++)
+            {
+                double yt = y[t];
+                double yt1 = y[t + 1];
+                sumX += yt;
+                sumY += yt1;
+                sumXX += yt * yt;
+                sumXY += yt * yt1;
+                sumYY += yt1 * yt1;
+            }
+
+            for (int i = calibN; i < n; i++)
+            {
+                // Step 1: rolling OLS fit. Window covers bars [i-calibN .. i-1].
+                double meanX = sumX / pairs;
+                double meanY = sumY / pairs;
+                double sxx = sumXX - sumX * meanX;
+                double sxy = sumXY - sumX * meanY;
+                bool stepOk = sxx > 0;
+                double xPred = double.NaN;
+
+                if (stepOk)
+                {
+                    double phiNew = sxy / sxx;
+                    if (!Dsl.IsFinite(phiNew))
+                    {
+                        stepOk = false;
+                    }
+                    else
+                    {
+                        // Stationarity guard — keep phi strictly inside
+                        // the unit circle so phi^2 in the sigma denominator
+                        // stays away from zero. MUST clamp at 0.999 to
+                        // match TS — 0.99 would drift mean-reversion
+                        // behavior near unit-root.
+                        if (phiNew >= 0.999) phiNew = 0.999;
+                        else if (phiNew <= -0.999) phiNew = -0.999;
+
+                        double aLin = meanY - phiNew * meanX;
+                        // SSE via the algebraic identity (cheaper than a
+                        // residual loop, same value):
+                        //   SSE = sumYY - 2*a*sumY - 2*b*sumXY
+                        //         + 2*a*b*sumX + a^2*pairs + b^2*sumXX
+                        double sse =
+                            sumYY
+                            - 2.0 * aLin * sumY
+                            - 2.0 * phiNew * sumXY
+                            + 2.0 * aLin * phiNew * sumX
+                            + aLin * aLin * pairs
+                            + phiNew * phiNew * sumXX;
+                        double Qnew = sse / dof;
+                        if (!(Qnew > 0))
+                        {
+                            stepOk = false;
+                        }
+                        else
+                        {
+                            phi = phiNew;
+                            Q = Qnew;
+                            mu = aLin / (1.0 - phi);
+                            sigmaLong = Math.Sqrt(Q / (1.0 - phi * phi));
+                            // R = Q * (1 - trust) / trust. Steady-state
+                            // Kalman gain converges to `trust`, so trust
+                            // is a friendly knob: small=heavy smoothing
+                            // toward the OU prediction, large=closer to
+                            // raw price.
+                            R = Q * (1.0 - trust) / trust;
+                            if (!Dsl.IsFinite(P) || P == 0.0)
+                            {
+                                P = sigmaLong * sigmaLong;
+                            }
+                        }
+                    }
+                }
+
+                if (!stepOk)
+                {
+                    // Degenerate calibration window. Emit NaN for this
+                    // bar and roll forward without updating filter state
+                    // — the next bar's window may recover.
+                    // (Bundle slots are already NaN from NanKalmanBundle.)
+                }
+                else
+                {
+                    // Step 2: predict — capture x_pred BEFORE the update
+                    // so it reflects the OU model's forecast given only
+                    // bars < i.
+                    xPred = mu + phi * (x - mu);
+                    double pPred = phi * phi * P + Q;
+
+                    // Step 3: update with observation y[i].
+                    double z = y[i];
+                    if (!Dsl.IsFinite(z))
+                    {
+                        // Missing observation — propagate without updating.
+                        x = xPred;
+                        P = pPred;
+                    }
+                    else
+                    {
+                        double innovVar = pPred + R;
+                        double K = innovVar > 0 ? pPred / innovVar : 0.0;
+                        x = xPred + K * (z - xPred);
+                        P = (1.0 - K) * pPred;
+                    }
+
+                    outB.X[i] = x;
+                    outB.Mu[i] = mu;
+                    outB.Sigma[i] = sigmaLong;
+                    outB.Phi[i] = phi;
+                    outB.P[i] = P;
+                    outB.XPred[i] = xPred;
+                }
+
+                // Step 4: slide the window forward by one bar.
+                if (i + 1 < n)
+                {
+                    int dropT = i - calibN;
+                    double yDrop = y[dropT];
+                    double yDropNext = y[dropT + 1];
+                    sumX -= yDrop;
+                    sumY -= yDropNext;
+                    sumXX -= yDrop * yDrop;
+                    sumXY -= yDrop * yDropNext;
+                    sumYY -= yDropNext * yDropNext;
+
+                    double yAdd = y[i - 1];
+                    double yAddNext = y[i];
+                    sumX += yAdd;
+                    sumY += yAddNext;
+                    sumXX += yAdd * yAdd;
+                    sumXY += yAdd * yAddNext;
+                    sumYY += yAddNext * yAddNext;
+                }
+            }
+
+            return outB;
+        }
+
+        /// <summary>Cache lookup: compute (or fetch) the bundle for this
+        /// (source, calib, trust, barCount) tuple. Sharing a bundle
+        /// across the six sibling methods saves 5 redundant filter
+        /// passes per bar update.</summary>
+        private static KalmanOuResult GetKalmanBundle(
+            IList<DslBar> bars, double sourceD, double calibD, double trustD)
+        {
+            int sourceCode = RoundI(sourceD);
+            int calibN = RoundI(calibD);
+            int n = bars.Count;
+            // "R" round-trip format keeps the trust key bit-precise
+            // across calls so 0.5 always hashes the same as 0.5.
+            string key = sourceCode.ToString() + "|" + calibN.ToString()
+                       + "|" + trustD.ToString("R") + "|" + n.ToString();
+            Dictionary<string, KalmanOuResult> perBars;
+            if (!_kalmanCache.TryGetValue(bars, out perBars))
+            {
+                perBars = new Dictionary<string, KalmanOuResult>();
+                _kalmanCache.Add(bars, perBars);
+            }
+            KalmanOuResult cached;
+            if (perBars.TryGetValue(key, out cached)) return cached;
+            cached = ComputeKalmanOu(bars, sourceCode, calibN, trustD);
+            perBars[key] = cached;
+            return cached;
+        }
+
+        public static double KalmanOuX(IList<DslBar> bars, int barsAgo, double sourceD, double calibD, double trustD)
+            => At(GetKalmanBundle(bars, sourceD, calibD, trustD).X, barsAgo);
+
+        public static double KalmanOuMu(IList<DslBar> bars, int barsAgo, double sourceD, double calibD, double trustD)
+            => At(GetKalmanBundle(bars, sourceD, calibD, trustD).Mu, barsAgo);
+
+        public static double KalmanOuSigma(IList<DslBar> bars, int barsAgo, double sourceD, double calibD, double trustD)
+            => At(GetKalmanBundle(bars, sourceD, calibD, trustD).Sigma, barsAgo);
+
+        public static double KalmanOuPhi(IList<DslBar> bars, int barsAgo, double sourceD, double calibD, double trustD)
+            => At(GetKalmanBundle(bars, sourceD, calibD, trustD).Phi, barsAgo);
+
+        public static double KalmanOuP(IList<DslBar> bars, int barsAgo, double sourceD, double calibD, double trustD)
+            => At(GetKalmanBundle(bars, sourceD, calibD, trustD).P, barsAgo);
+
+        public static double KalmanOuXPred(IList<DslBar> bars, int barsAgo, double sourceD, double calibD, double trustD)
+            => At(GetKalmanBundle(bars, sourceD, calibD, trustD).XPred, barsAgo);
     }
 }
