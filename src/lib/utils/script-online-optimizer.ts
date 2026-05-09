@@ -42,6 +42,7 @@ import {
   computeSimSummary,
   resolveTickConfig,
   evaluateFilterIfDirective,
+  tradeResultBindings,
 } from "./zone-simulator";
 import {
   type OptimizeSpec,
@@ -336,24 +337,40 @@ export async function runOnlineOptimizedBacktest(
     void bars;
   };
 
-  // Evaluate `ontrade.print` directives at a zone's entry bar and
-  // attach the resulting label→value map to the SimZoneResult. Mirrors
-  // the per-trade print pass in simulateAllZones (zone-simulator.ts) so
-  // optimizer-emitted trades surface prints in the Output panel just
-  // like the non-optimizer path. No-op when no directives are present.
+  // Evaluate `ontrade.print` directives AFTER simulateZone has
+  // populated `result` and attach the label→value map to it. Mirrors
+  // the per-trade print pass in simulateAllZones (zone-simulator.ts) —
+  // both paths now bind a TradeResultBindings under `ctx.tradeResult`
+  // so users can print `exit_points`, `exit_reason`, `bars_held`, etc.
+  // The optimizer doesn't run scaling/daily-limit post-passes (each
+  // trade returns straight from simulateZone with positionSize=1 and a
+  // size-1 netDollars), so those bindings reflect the per-contract
+  // outcome — same convention as the rest of the optimizer's output.
   // `extraPrints` is the bag accumulated by filter.if `print(...)`
   // statements during this signal's evaluation — those rows merge in
   // with ontrade.print results so users see both surfaces in one table.
   const attachPrints = (
     ctx: EntryEvalCtx,
     result: SimZoneResult,
-    extraPrints: Map<string, number> | null
+    extraPrints: Map<string, number> | null,
+    bars: TradeZoneBar[]
   ): void => {
     if ((!tradePrints || tradePrints.length === 0) && (!extraPrints || extraPrints.size === 0)) return;
     const prints: Record<string, number> = {};
-    if (tradePrints) {
+    if (tradePrints && tradePrints.length > 0) {
+      // Resolve entry price the same way simulateZone did (bar 1's
+      // open under fillMode="next_open", else zone.start_price). The
+      // optimizer doesn't currently take rules.fillMode here — fall
+      // back to "next_open" since that's the dashboard default and
+      // matches simulateZone's fillMode default.
+      let entryPrice = ctx.zone.start_price;
+      for (const b of bars) {
+        if (b.bar_index === 1) { entryPrice = b.bar_open; break; }
+      }
+      const tradeResult = tradeResultBindings(result, entryPrice);
+      const ctxWithResult: EntryEvalCtx = { ...ctx, tradeResult };
       for (const p of tradePrints) {
-        prints[p.label] = evaluateExpr(p.expr, { kind: "entry", ...ctx });
+        prints[p.label] = evaluateExpr(p.expr, { kind: "entry", ...ctxWithResult });
       }
     }
     if (extraPrints) {
@@ -409,7 +426,7 @@ export async function runOnlineOptimizedBacktest(
       const r = simulateZone(z, bars, baseRules, atrByZoneId?.get(z.id) ?? null, buildExitCtx(z, bars, null));
       if (r) {
         const ctx = buildEntryCtx(z, bars, null);
-        attachPrints(ctx, r, null);
+        attachPrints(ctx, r, null, bars);
         trades.push(r);
       }
       onProgress?.(i + 1, sortedZones.length);
@@ -738,7 +755,7 @@ export async function runOnlineOptimizedBacktest(
       // loop. Used downstream by the dashboard (label warmup trades)
       // and by the Warmup=false filter at the end of this function.
       r.isWarmup = trades.length < maxLookback;
-      attachPrints(ctxForSignal, r, filterPrints);
+      attachPrints(ctxForSignal, r, filterPrints, bars);
       trades.push(r);
     }
     onProgress?.(i + 1, sortedZones.length);

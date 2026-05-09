@@ -16,9 +16,11 @@ import {
   resolveRulesForTrade,
   evaluate as evaluateExpr,
   NUMERIC_RULE_KEYS,
+  EXIT_REASON_CODE,
   type EntryEvalCtx,
   type NumericValue as ScriptNumericValue,
   type Expr as ScriptExpr,
+  type TradeResultBindings,
 } from "./script-expr";
 import type { FilterIfDirective, FilterIfStatement, ExitIfDirective } from "./backtest-script";
 
@@ -456,6 +458,41 @@ export interface SimZoneResult {
   // scalingStartSize at the reverse, matching the user's mental model
   // ("on a reversal, sizing starts over").
   isReverseEntry?: boolean;
+}
+
+/** Convert a finalized SimZoneResult into the TradeResultBindings the
+ *  per-trade DSL evaluator binds when re-evaluating `ontrade.print`
+ *  expressions AFTER simulateZone + scaling/daily-limit post-passes
+ *  have settled. NaN-fallback for fields that may be undefined on
+ *  legacy results (effSlPoints/effTpPoints/effTrailPoints/effBePoints
+ *  predate the script overlay and stay undefined when called by the
+ *  pre-overlay simulator paths). exit_reason is mapped through
+ *  EXIT_REASON_CODE — must stay in sync with the canonical numeric
+ *  codes the user sees via `EXIT_TP`/`EXIT_SL`/... bare-name
+ *  constants in script-expr.ts. */
+export function tradeResultBindings(
+  r: SimZoneResult,
+  entryPrice: number
+): TradeResultBindings {
+  return {
+    exit_points: r.exitPoints,
+    scaled_points: r.scaledPoints,
+    bars_held: r.barsHeld,
+    peak_mfe: r.peakMfe,
+    max_drawdown: r.maxDrawdown,
+    net_dollars: r.netDollars,
+    position_size: r.positionSize,
+    commission_dollars: r.commissionDollars,
+    slippage_applied: r.slippageApplied,
+    exit_reason: EXIT_REASON_CODE[r.exitReason] ?? NaN,
+    is_winner: r.exitPoints > 0 ? 1 : 0,
+    is_loser: r.exitPoints < 0 ? 1 : 0,
+    eff_sl: r.effSlPoints ?? NaN,
+    eff_tp: r.effTpPoints ?? NaN,
+    eff_trail: r.effTrailPoints ?? NaN,
+    eff_be: r.effBePoints ?? NaN,
+    entry_price: entryPrice,
+  };
 }
 
 export interface SimSummary {
@@ -1332,6 +1369,21 @@ export function simulateAllZones(
   metricsOut?: SimulateMetrics
 ): SimZoneResult[] {
   const results: SimZoneResult[] = [];
+  // ── Deferred ontrade.print state ─────────────────────────────────
+  // Per-zone EvalCtx (built at entry time) and per-zone filter.if
+  // print bag, stashed so the FINAL ontrade.print evaluation can run
+  // AFTER scaling / daily-limit / position-mode post-passes have
+  // settled. That ordering is what lets users print exit-side fields
+  // (exit_points, exit_reason, net_dollars, position_size, ...) — the
+  // values aren't valid on `r` until those post-passes run, and
+  // `forceClosed = { ...t, ...closed }` from applyDailyLimits /
+  // applyPositionMode produces a NEW SimZoneResult with the SAME
+  // zoneId, so we look up by zoneId after the dust settles.
+  // filter.if prints stay frozen at entry-time semantics (the same
+  // way numericOverrides and var resolution do), so the per-zone
+  // bag is captured once during the entry pass and replayed verbatim.
+  const ctxByZoneId = new Map<number, EntryEvalCtx>();
+  const filterPrintsByZoneId = new Map<number, Map<string, number>>();
   // Seed the metrics population with the input zone count BEFORE we
   // start filtering. `zones.length` is the right denominator for the
   // funnel — it's the count of signals the strategy emitted that have
@@ -1346,7 +1398,8 @@ export function simulateAllZones(
     // overlay is active. Without an overlay, this is a no-op and the
     // call below is byte-identical to v1.
     let perTradeRules: SimRules = rules;
-    let prints: Record<string, number> | undefined;
+    let entryCtxForZone: EntryEvalCtx | null = null;
+    let filterPrintsForZone: Map<string, number> | null = null;
     // Per-trade exit-signal context (built only when at least one
     // exit.if directive is in scope). Threaded into simulateZone so the
     // per-bar walk can evaluate signal-based exits without rebuilding
@@ -1397,19 +1450,19 @@ export function simulateAllZones(
           warnings
         );
       }
-      // Per-trade prints → evaluate each, store under its label.
-      if (scriptOverlay.tradePrints && scriptOverlay.tradePrints.length > 0) {
-        prints = {};
-        for (const p of scriptOverlay.tradePrints) {
-          prints[p.label] = evaluateExpr(p.expr, { kind: "entry", ...ctx });
-        }
-      }
+      // ontrade.print evaluation is INTENTIONALLY DEFERRED here — see
+      // the ctxByZoneId / filterPrintsByZoneId comment at the top of
+      // simulateAllZones. We stash the EvalCtx for the surviving zone
+      // at the end of this overlay block (after filter.if has decided
+      // pass/reject) so the post-pass loop can re-evaluate the prints
+      // with `tradeResult` populated from the final SimZoneResult.
       // filter.if directives — evaluate AFTER numericOverrides resolution
       // so any rule overrides emitted by a taken branch can stack on
       // top of the baseline. A "reject" verdict drops the trade
       // entirely (skip simulateZone). On "pass", we layer the
-      // directive's rule overrides onto perTradeRules and merge its
-      // prints into the prints bag.
+      // directive's rule overrides onto perTradeRules and STASH its
+      // prints bag for the post-pass merge (filter.if prints don't
+      // need the trade outcome, so they're frozen at entry time).
       if (scriptOverlay.filterIfs && scriptOverlay.filterIfs.length > 0) {
         const warnings = scriptOverlay.warnings ?? [];
         // Pass the metrics out-param's filterRejections map so the
@@ -1441,13 +1494,12 @@ export function simulateAllZones(
           }
           perTradeRules = stamped as unknown as SimRules;
         }
-        if (fr.prints.size > 0) {
-          prints = prints ?? {};
-          for (const [label, val] of fr.prints) {
-            prints[label] = val;
-          }
-        }
+        if (fr.prints.size > 0) filterPrintsForZone = fr.prints;
       }
+      // Stash the entry-time ctx for THIS surviving zone. The post-pass
+      // ontrade.print evaluator will pull it back out and clone with
+      // `tradeResult` bound to the finalized SimZoneResult.
+      entryCtxForZone = ctx;
       // Build the per-bar exit context. Snapshot tickConfig + indicators
       // + varValues from the entry-context ctx so simulateZone reuses
       // them across the whole walk. The directives themselves are
@@ -1465,7 +1517,13 @@ export function simulateAllZones(
 
     const r = simulateZone(zone, bars, perTradeRules, zoneAtr, perTradeExitCtx);
     if (r) {
-      if (prints) r.script_prints = prints;
+      // Stash entry ctx + filter.if prints by zoneId so the post-pass
+      // ontrade.print evaluator can re-build a tradeResult-bound
+      // EvalCtx after scaling/daily-limit settle on the FINAL r.
+      // Both maps are populated only for zones we actually pushed —
+      // rejected-by-filter.if zones already `continue`d above.
+      if (entryCtxForZone) ctxByZoneId.set(zone.id, entryCtxForZone);
+      if (filterPrintsForZone) filterPrintsByZoneId.set(zone.id, filterPrintsForZone);
       results.push(r);
     }
   }
@@ -1545,6 +1603,57 @@ export function simulateAllZones(
   const provisional = applyScalingModifier(countCapped, rules);
   const survived = applyDailyLimits(provisional, zones, barsByZoneId, rules);
   const final = applyScalingModifier(survived, rules);
+
+  // ── Post-pass: evaluate ontrade.print with finalized trade outcomes ──
+  // Runs AFTER all the gating / dedupe / position-mode / scaling /
+  // daily-limit passes so each `r` carries its FINAL exitPoints,
+  // exitReason, positionSize, netDollars, etc. We re-build the
+  // EvalCtx by cloning the stashed entry-time ctx and binding
+  // `tradeResult` from `r`; ontrade.print expressions that reference
+  // entry-side names (close, ATR, etc.) still resolve correctly
+  // because the bar pointer is the entry bar. Filter.if prints layer
+  // on top with same-label-wins semantics — matches the previous
+  // (entry-time-only) merge order so existing scripts behave the same.
+  // No-op when no overlay is active OR no ontrade.print/filter prints
+  // were captured during the entry pass.
+  if (
+    scriptOverlay &&
+    (scriptOverlay.tradePrints?.length || filterPrintsByZoneId.size > 0)
+  ) {
+    for (const r of final) {
+      const ctx = ctxByZoneId.get(r.zoneId);
+      const filterPrints = filterPrintsByZoneId.get(r.zoneId);
+      if (!ctx && !filterPrints) continue;
+      const out: Record<string, number> = {};
+      if (ctx && scriptOverlay.tradePrints && scriptOverlay.tradePrints.length > 0) {
+        // Resolve entry price the same way simulateZone did: bar 1's
+        // open under fillMode="next_open" (the default), else
+        // zone.start_price. Falls back to start_price when bar 1 is
+        // unavailable — matches earlyCloseAtTime's defensive read.
+        const fillMode = rules?.fillMode || "next_open";
+        let entryPrice = ctx.zone.start_price;
+        if (fillMode === "next_open") {
+          const zb = barsByZoneId.get(r.zoneId);
+          if (zb) {
+            for (const b of zb) {
+              if (b.bar_index === 1) { entryPrice = b.bar_open; break; }
+            }
+          }
+        }
+        const tradeResult = tradeResultBindings(r, entryPrice);
+        const ctxWithResult: EntryEvalCtx = { ...ctx, tradeResult };
+        for (const p of scriptOverlay.tradePrints) {
+          out[p.label] = evaluateExpr(p.expr, { kind: "entry", ...ctxWithResult });
+        }
+      }
+      // Filter.if prints win on label collision — they're the more
+      // specific signal and historically overwrote ontrade.print.
+      if (filterPrints) {
+        for (const [label, val] of filterPrints) out[label] = val;
+      }
+      if (Object.keys(out).length > 0) r.script_prints = out;
+    }
+  }
 
   return final.sort((a, b) =>
     a.startTime < b.startTime ? -1 : a.startTime > b.startTime ? 1 : 0

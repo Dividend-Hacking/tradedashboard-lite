@@ -644,6 +644,72 @@ export interface EntryEvalCtx {
    *  filter.if conditions). Empty / undefined when the run isn't
    *  driven by the optimizer. */
   varValues?: Map<string, number>;
+  /** Per-trade outcome bindings — populated by the simulator AFTER
+   *  `simulateZone` returns and AFTER scaling/daily-limit post-passes
+   *  have settled, so `ontrade.print` expressions can reference
+   *  `exit_points`, `exit_reason`, `bars_held`, `peak_mfe`,
+   *  `max_drawdown`, `net_dollars`, `position_size`, `eff_sl`/`eff_tp`,
+   *  etc. Absent during entry-time evaluation (filter.if conditions,
+   *  numericOverrides resolution) — every exit-side bare name returns
+   *  NaN in that phase, matching the rest of the engine's NaN-as-fail
+   *  discipline. `exit_reason` is exposed as a numeric code (see
+   *  EXIT_REASON_CODE below) so it round-trips through the numeric
+   *  `script_prints` map; named constants `EXIT_TP`, `EXIT_SL`, etc.
+   *  let users compare without remembering the integers. */
+  tradeResult?: TradeResultBindings;
+}
+
+/** Numeric codes for ExitReason values — exposed as bare-name
+ *  constants in the entry evaluator (`EXIT_TP`, `EXIT_SL`, ...) and
+ *  used as the value of `exit_reason` when a trade's outcome is
+ *  bound. Codes are stable so users can persist comparisons in
+ *  scripts; new ExitReason values must extend this map without
+ *  renumbering the existing entries. */
+export const EXIT_REASON_CODE: Record<string, number> = {
+  tp: 1,
+  sl: 2,
+  trail: 3,
+  be: 4,
+  timer: 5,
+  end: 6,
+  next: 7,
+  daily: 8,
+  signal: 9,
+};
+
+/** Per-trade outcome bindings surfaced to `ontrade.print` expressions
+ *  via `EntryEvalCtx.tradeResult`. Every field is a finite number when
+ *  populated; absent fields (e.g. `eff_sl` on a legacy SimZoneResult)
+ *  resolve to NaN. */
+export interface TradeResultBindings {
+  exit_points: number;
+  scaled_points: number;
+  bars_held: number;
+  peak_mfe: number;
+  max_drawdown: number;
+  net_dollars: number;
+  position_size: number;
+  commission_dollars: number;
+  slippage_applied: number;
+  /** Numeric code from EXIT_REASON_CODE — 1=tp, 2=sl, 3=trail,
+   *  4=be, 5=timer, 6=end, 7=next, 8=daily, 9=signal. */
+  exit_reason: number;
+  /** 1 when exit_points > 0, else 0. Convenience for filter-style
+   *  prints (`ontrade.print = is_winner, "win"`). */
+  is_winner: number;
+  /** 1 when exit_points < 0, else 0. */
+  is_loser: number;
+  /** Effective SL/TP/Trail/BE thresholds the simulator actually used
+   *  for this trade — already resolved (base + atrAdjust × ATR) and
+   *  reflecting any per-trade rule overrides. NaN when undefined on
+   *  the source SimZoneResult. */
+  eff_sl: number;
+  eff_tp: number;
+  eff_trail: number;
+  eff_be: number;
+  /** Entry price the simulator used (zone.start_price or bar1.open
+   *  under fillMode="next_open"). */
+  entry_price: number;
 }
 
 /** Summary EvalCtx — the context for top-level `print = ...` expressions,
@@ -889,6 +955,72 @@ function resolveIdent(name: string, ctx: EvalCtx): number {
       return ctx.tickConfig?.pointValue ?? NaN;
     case "tickValue":
       return ctx.tickConfig?.tickValue ?? NaN;
+    // ── Per-trade outcome bindings ──────────────────────────────────
+    // Resolve to NaN when `tradeResult` is absent (entry-time path:
+    // filter.if conditions, numericOverrides resolution, optimizer
+    // bounds expressions). The simulator populates `tradeResult`
+    // ONLY for the post-exit re-evaluation pass that produces
+    // `script_prints`, so referencing these names in a filter.if
+    // condition fails-closed via standard NaN propagation.
+    case "exit_points":
+      return ctx.tradeResult?.exit_points ?? NaN;
+    case "scaled_points":
+      return ctx.tradeResult?.scaled_points ?? NaN;
+    case "bars_held":
+      return ctx.tradeResult?.bars_held ?? NaN;
+    case "peak_mfe":
+      return ctx.tradeResult?.peak_mfe ?? NaN;
+    case "max_drawdown":
+      return ctx.tradeResult?.max_drawdown ?? NaN;
+    case "net_dollars":
+      return ctx.tradeResult?.net_dollars ?? NaN;
+    case "position_size":
+      return ctx.tradeResult?.position_size ?? NaN;
+    case "commission_dollars":
+      return ctx.tradeResult?.commission_dollars ?? NaN;
+    case "slippage_applied":
+      return ctx.tradeResult?.slippage_applied ?? NaN;
+    case "exit_reason":
+      return ctx.tradeResult?.exit_reason ?? NaN;
+    case "is_winner":
+      return ctx.tradeResult?.is_winner ?? NaN;
+    case "is_loser":
+      return ctx.tradeResult?.is_loser ?? NaN;
+    case "eff_sl":
+      return ctx.tradeResult?.eff_sl ?? NaN;
+    case "eff_tp":
+      return ctx.tradeResult?.eff_tp ?? NaN;
+    case "eff_trail":
+      return ctx.tradeResult?.eff_trail ?? NaN;
+    case "eff_be":
+      return ctx.tradeResult?.eff_be ?? NaN;
+    case "entry_price":
+      return ctx.tradeResult?.entry_price ?? NaN;
+    // Exit-reason named constants — let users compare against
+    // `exit_reason` without remembering the numeric codes.
+    // `EXIT_TARGET` / `EXIT_STOP` are friendly aliases for the
+    // canonical `EXIT_TP` / `EXIT_SL`. Not gated on `tradeResult`
+    // because they're literal constants.
+    case "EXIT_TP":
+    case "EXIT_TARGET":
+      return EXIT_REASON_CODE.tp;
+    case "EXIT_SL":
+    case "EXIT_STOP":
+      return EXIT_REASON_CODE.sl;
+    case "EXIT_TRAIL":
+      return EXIT_REASON_CODE.trail;
+    case "EXIT_BE":
+      return EXIT_REASON_CODE.be;
+    case "EXIT_TIMER":
+      return EXIT_REASON_CODE.timer;
+    case "EXIT_END":
+      return EXIT_REASON_CODE.end;
+    case "EXIT_NEXT":
+      return EXIT_REASON_CODE.next;
+    case "EXIT_DAILY":
+      return EXIT_REASON_CODE.daily;
+    case "EXIT_SIGNAL":
+      return EXIT_REASON_CODE.signal;
   }
   // Optimize var lookup — `var <name> = Optimize.X.Y(...)` declarations
   // expose `<name>` as a bare identifier whose value is whatever the

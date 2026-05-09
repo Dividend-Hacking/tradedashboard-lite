@@ -1539,11 +1539,16 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     type: "directive",
     section: "Output — Per-trade prints",
     description:
-      'Add a column to the trade table showing a value calculated at each trade. Use indicators (ATR, RSI, EMA20, etc.) or bar fields (close, volume).',
+      'Add a column to the trade table showing a value calculated at each trade. Evaluated AFTER each trade exits, so expressions can use entry-side identifiers (close, ATR, RSI, EMA20, ...) AND exit-side bindings: exit_points, scaled_points, net_dollars, bars_held, peak_mfe, max_drawdown, position_size, commission_dollars, slippage_applied, is_winner, is_loser, exit_reason (compare against EXIT_TP/EXIT_SL/EXIT_TRAIL/EXIT_BE/EXIT_TIMER/EXIT_END/EXIT_NEXT/EXIT_DAILY/EXIT_SIGNAL), eff_sl/eff_tp/eff_trail/eff_be, entry_price.',
     default: "",
     examples: [
       { snippet: 'ontrade.print = ATR(14), "Entry ATR"', scenario: "Add a column showing the ATR at the moment each trade entered." },
       { snippet: 'ontrade.print = close - EMA50, "Dist from EMA50"', scenario: "Show how far each entry was from the 50-bar trend line." },
+      { snippet: 'ontrade.print = exit_points, "Trade R"', scenario: "Show each trade's realized P&L in points (negative for losers)." },
+      { snippet: 'ontrade.print = exit_reason, "Exit Code"', scenario: "Show the numeric exit-reason code (1=tp, 2=sl, 3=trail, 4=be, 5=timer, 6=end, 7=next, 8=daily, 9=signal)." },
+      { snippet: 'ontrade.print = (exit_reason == EXIT_STOP, 1, 0), "Was Stop"', scenario: "Add a 1/0 column flagging trades that exited via the stop-loss — comparable in CSV pivots." },
+      { snippet: 'ontrade.print = peak_mfe / max(1, -max_drawdown), "MFE / DD"', scenario: "Show the run-up vs run-down ratio per trade — higher = ran in your favor before resolving." },
+      { snippet: 'ontrade.print = net_dollars, "$ P/L"', scenario: "Show realized dollar P&L per trade — already net of commissions and reflects positionSize." },
     ],
   },
 
