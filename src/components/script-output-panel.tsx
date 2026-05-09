@@ -278,8 +278,20 @@ function ScriptOutputPanelImpl({
 
       {/* ── Per-trade section ──────────────────────────────────────── */}
       <div>
-        <div className="text-xs text-muted-foreground uppercase tracking-wide mb-2">
-          Per Trade {overflow && <span className="text-amber-400">(showing first {MAX_ROWS} of {trades.length})</span>}
+        <div className="flex items-baseline justify-between mb-2">
+          <div className="text-xs text-muted-foreground uppercase tracking-wide">
+            Per Trade {overflow && <span className="text-amber-400">(showing first {MAX_ROWS} of {trades.length})</span>}
+          </div>
+          {hasPerTrade && (
+            <button
+              type="button"
+              onClick={() => downloadTradePrintsCsv(trades, tradePrintLabels)}
+              className="text-[10px] font-mono uppercase tracking-wide px-2 py-0.5 rounded border border-card-border text-muted-foreground hover:text-foreground hover:border-foreground/50"
+              title={`Export all ${trades.length} trades' ontrade.print values as CSV`}
+            >
+              Export CSV
+            </button>
+          )}
         </div>
         {!hasPerTrade && (
           <div className="text-xs text-muted-foreground italic">
@@ -332,6 +344,62 @@ function shortTime(iso: string): string {
   // to the raw string if the format is unexpected.
   if (iso.length < 16) return iso;
   return `${iso.slice(5, 10)} ${iso.slice(11, 16)}`;
+}
+
+/** Escape a single CSV field per RFC 4180: quote any value containing
+ *  comma, double-quote, or newline; double up internal quotes. NaN and
+ *  non-finite numbers serialize as empty cells (so spreadsheets show a
+ *  blank, not "NaN", matching the table's "—" rendering). */
+function csvEscape(value: string | number | null | undefined): string {
+  if (value === null || value === undefined) return "";
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) return "";
+    return String(value);
+  }
+  const s = String(value);
+  if (/[",\n\r]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+  return s;
+}
+
+/** Build a CSV of every trade's `ontrade.print` outputs and trigger a
+ *  browser download. Columns mirror the on-screen table (`#`, `Entry`,
+ *  then one column per print label) so the spreadsheet view matches what
+ *  the user sees in the panel. Exports the FULL trade list — the panel's
+ *  500-row visual cap is purely for render perf and shouldn't limit the
+ *  exported analysis dataset. */
+function downloadTradePrintsCsv(
+  trades: SimZoneResult[],
+  labels: string[]
+): void {
+  const header = ["#", "Entry", ...labels].map(csvEscape).join(",");
+  const rows = trades.map((t, i) => {
+    const cells: (string | number)[] = [i + 1, t.startTime];
+    for (const l of labels) {
+      const v = t.script_prints?.[l];
+      cells.push(v === undefined ? "" : v);
+    }
+    return cells.map(csvEscape).join(",");
+  });
+  // Prefix with UTF-8 BOM so Excel auto-detects encoding when opening
+  // the file directly (otherwise non-ASCII labels can render garbled).
+  const csv = "﻿" + [header, ...rows].join("\r\n");
+  const blob = new Blob([csv], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  // Filename: ontrade-prints-YYYYMMDD-HHMMSS.csv (local time, no tz
+  // suffix — matches user's expectation of "now"). Stable across runs
+  // so two exports don't collide unless triggered in the same second.
+  const now = new Date();
+  const pad = (n: number) => String(n).padStart(2, "0");
+  const stamp =
+    `${now.getFullYear()}${pad(now.getMonth() + 1)}${pad(now.getDate())}` +
+    `-${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+  a.href = url;
+  a.download = `ontrade-prints-${stamp}.csv`;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
 }
 
 /** Inline sparkline rendered as an SVG polyline with optional
