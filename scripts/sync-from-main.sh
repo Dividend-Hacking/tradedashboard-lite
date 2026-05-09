@@ -130,6 +130,13 @@ git fetch --quiet main-repo
 
 # ─── Determine baseline ────────────────────────────────────────────
 # Priority: explicit --from > scripts/.sync-state > merge-base.
+#
+# Note: lite and main have INDEPENDENT commit histories — they share
+# files, not commits. So `git merge-base` will usually fail, and we
+# require .sync-state to be present (or --from to be passed) for the
+# script to know where to start. The only time merge-base helps is if
+# someone reorganizes the repos to share a parent, which we still
+# accept gracefully.
 STATE_FILE="$LITE_ROOT/scripts/.sync-state"
 BASELINE=""
 
@@ -141,17 +148,29 @@ elif [[ -f "$STATE_FILE" ]]; then
   echo "[baseline] from .sync-state: $BASELINE"
 fi
 
-# Validate that BASELINE actually exists as a commit in EITHER repo.
-# If not, fall back to merge-base. (Stale state file, force-pushed main,
-# etc.)
+# Validate that BASELINE actually exists as a commit (in either repo's
+# object database — fetch already pulled main-repo/main into ours).
 if [[ -n "$BASELINE" ]] && ! git cat-file -e "$BASELINE^{commit}" 2>/dev/null; then
-  echo "[baseline] $BASELINE is unknown — falling back to merge-base" >&2
-  BASELINE=""
+  echo "ERROR: baseline $BASELINE is not a known commit in this repo." >&2
+  echo "Stale .sync-state? Force-pushed main? Pass --from <sha> with a known good commit." >&2
+  exit 2
 fi
 
+# No explicit baseline — try merge-base as a last resort.
 if [[ -z "$BASELINE" ]]; then
-  BASELINE="$(git merge-base HEAD main-repo/main)"
-  echo "[baseline] merge-base HEAD..main-repo/main: $BASELINE"
+  if MB="$(git merge-base HEAD main-repo/main 2>/dev/null)" && [[ -n "$MB" ]]; then
+    BASELINE="$MB"
+    echo "[baseline] merge-base HEAD..main-repo/main: $BASELINE"
+  else
+    echo "ERROR: no baseline available." >&2
+    echo "  - scripts/.sync-state is missing, and" >&2
+    echo "  - this repo has no merge-base with main-repo/main (independent histories)." >&2
+    echo
+    echo "First-time setup: pick the upstream SHA you've already synced to and run:" >&2
+    echo "  echo <main-repo-sha> > scripts/.sync-state" >&2
+    echo "Then re-run this script. (Or pass --from <sha>.)" >&2
+    exit 2
+  fi
 fi
 
 # ─── List candidate commits ────────────────────────────────────────
