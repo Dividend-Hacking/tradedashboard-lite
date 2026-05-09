@@ -511,6 +511,9 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     min: -2,
     max: 2,
     step: 0.05,
+    examples: [
+      { snippet: "rules.trailAtrAdjust = 1", scenario: "Widen the trail by 1× ATR on volatile days so the stop doesn't get clipped." },
+    ],
   },
   {
     path: "rules.beAtrAdjust",
@@ -521,6 +524,9 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     min: -2,
     max: 2,
     step: 0.05,
+    examples: [
+      { snippet: "rules.beAtrAdjust = 0.5", scenario: "Push the break-even trigger out by half an ATR on busy days — wait for more confirmation before locking in." },
+    ],
   },
 
   // ── Risk rules: Position overlap ───────────────────────────────────────
@@ -599,6 +605,9 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     min: 1,
     max: 100,
     step: 1,
+    examples: [
+      { snippet: "rules.scalingMinSize = 1", scenario: "Never go below 1 contract — even after a string of losses, keep at least one in play." },
+    ],
   },
   {
     path: "rules.scalingMaxSize",
@@ -828,6 +837,9 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     min: 0,
     max: 100000,
     step: 0.01,
+    examples: [
+      { snippet: "rules.tickValue = 5", scenario: "Set 1 tick to $5 (NQ-style: $20 point ÷ 4 ticks)." },
+    ],
   },
   {
     path: "rules.slippagePoints",
@@ -941,6 +953,9 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     max: 100,
     step: 1,
     legacyHiddenWhenDefault: true,
+    examples: [
+      { snippet: "filters.adx.max = 50", scenario: "Skip already-overheated trends — block trades when ADX is above 50." },
+    ],
   },
   {
     path: "filters.adx.period",
@@ -952,6 +967,9 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     max: 200,
     step: 1,
     legacyHiddenWhenDefault: true,
+    examples: [
+      { snippet: "filters.adx.period = 14", scenario: "Use the standard 14-bar ADX. Bump higher (e.g. 28) for a slower, smoother trend reading." },
+    ],
   },
 
   // ── Filters: ATR ───────────────────────────────────────────────────────
@@ -995,6 +1013,9 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     max: 100,
     step: 0.25,
     legacyHiddenWhenDefault: true,
+    examples: [
+      { snippet: "filters.atr.max = 5", scenario: "Skip extra-volatile sessions where ATR is over 5 points — risk gets too unpredictable." },
+    ],
   },
   {
     path: "filters.atr.period",
@@ -1006,6 +1027,9 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     max: 200,
     step: 1,
     legacyHiddenWhenDefault: true,
+    examples: [
+      { snippet: "filters.atr.period = 14", scenario: "Use the standard 14-bar ATR for both gating and any ATR-adjust math on stops/targets." },
+    ],
   },
 
   // ── Filters: Trend (EMA20 / EMA200) ────────────────────────────────────
@@ -1065,6 +1089,9 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     max: 500,
     step: 1,
     legacyHiddenWhenDefault: true,
+    examples: [
+      { snippet: "filters.trend.fastPeriod = 20", scenario: "Use a 20-bar EMA as the fast trend line — the standard short-term reading." },
+    ],
   },
   {
     path: "filters.trend.fastType",
@@ -1075,6 +1102,9 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     options: MA_TYPES,
     enumerable: true,
     legacyHiddenWhenDefault: true,
+    examples: [
+      { snippet: 'filters.trend.fastType = "sma"', scenario: "Use a plain SMA instead of EMA for the fast line — smoother reading, slower to react." },
+    ],
   },
   {
     path: "filters.trend.slowPeriod",
@@ -1086,6 +1116,9 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     max: 1000,
     step: 1,
     legacyHiddenWhenDefault: true,
+    examples: [
+      { snippet: "filters.trend.slowPeriod = 50", scenario: "Use a 50-bar slow line for medium-term bias instead of the long 200-bar default." },
+    ],
   },
   {
     path: "filters.trend.slowType",
@@ -1096,6 +1129,9 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     options: MA_TYPES,
     enumerable: true,
     legacyHiddenWhenDefault: true,
+    examples: [
+      { snippet: 'filters.trend.slowType = "sma"', scenario: "Use the classic 200-bar SMA for long-term bias — closer to what most traders watch." },
+    ],
   },
 
   // ── Filters: Bollinger position ────────────────────────────────────────
@@ -1131,6 +1167,9 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     min: 2,
     max: 500,
     step: 1,
+    examples: [
+      { snippet: "filters.bollinger.period = 20", scenario: "Use the classic 20-bar Bollinger center line — the standard setting." },
+    ],
   },
   {
     path: "filters.bollinger.stdDev",
@@ -1141,6 +1180,9 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     min: 0.5,
     max: 5,
     step: 0.1,
+    examples: [
+      { snippet: "filters.bollinger.stdDev = 2.5", scenario: "Push the bands further out (2.5 stdev) so only more extreme excursions count as above/below." },
+    ],
   },
 
   // ── Filters: Bollinger band width ──────────────────────────────────────
@@ -1177,6 +1219,9 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     min: 0,
     max: 10000,
     step: 0.25,
+    examples: [
+      { snippet: "filters.bbWidth.max = 50", scenario: "Skip extra-wide volatility regimes — only trade when bands are 50 points or narrower." },
+    ],
   },
 
   // ── Filters: Distance from a configurable MA ───────────────────────────
@@ -1205,6 +1250,9 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     max: 1000,
     step: 1,
     legacyHiddenWhenDefault: true,
+    examples: [
+      { snippet: "filters.maDistance.period = 50", scenario: "Measure pullback distance from a 50-bar moving average — a balanced medium-term reference." },
+    ],
   },
   {
     path: "filters.maDistance.type",
@@ -1215,6 +1263,9 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     options: MA_TYPES,
     enumerable: true,
     legacyHiddenWhenDefault: true,
+    examples: [
+      { snippet: 'filters.maDistance.type = "sma"', scenario: "Use a plain SMA as the reference line for distance calculations — smoother, less twitchy." },
+    ],
   },
   {
     path: "filters.maDistance.mode",
@@ -1254,6 +1305,9 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     max: 50,
     step: 0.05,
     legacyHiddenWhenDefault: true,
+    examples: [
+      { snippet: "filters.maDistance.max = 2", scenario: "Skip overstretched moves — block trades when price is more than 2 ATRs away from the reference MA." },
+    ],
   },
 
   // ── Filters: Volume ────────────────────────────────────────────────────
@@ -1281,6 +1335,9 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     max: 500,
     step: 1,
     legacyHiddenWhenDefault: true,
+    examples: [
+      { snippet: "filters.volume.period = 20", scenario: "Compare current bar volume against the rolling 20-bar average — the standard reference window." },
+    ],
   },
   {
     path: "filters.volume.minRatio",
@@ -1306,6 +1363,9 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     max: 1000,
     step: 0.05,
     legacyHiddenWhenDefault: true,
+    examples: [
+      { snippet: "filters.volume.maxRatio = 5", scenario: "Skip news-driven volume blowouts — block bars where volume is more than 5× the average." },
+    ],
   },
 
   // ── Filters: RSI ───────────────────────────────────────────────────────
@@ -1329,6 +1389,9 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     min: 2,
     max: 200,
     step: 1,
+    examples: [
+      { snippet: "filters.rsi.period = 14", scenario: "Use the standard 14-bar RSI. Lower it (e.g. 7) for a faster, twitchier oscillator." },
+    ],
   },
   {
     path: "filters.rsi.min",
@@ -1390,6 +1453,9 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     min: 1,
     max: 100,
     step: 1,
+    examples: [
+      { snippet: "filters.adxTrend.lookback = 10", scenario: "Compare ADX against its value 10 bars ago — slower, less twitchy direction reading." },
+    ],
   },
   {
     path: "filters.adxTrend.flatThreshold",
@@ -1400,6 +1466,9 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     min: 0,
     max: 50,
     step: 0.1,
+    examples: [
+      { snippet: "filters.adxTrend.flatThreshold = 2", scenario: "Treat ADX changes of 2 or less as \"flat\" — a more forgiving definition of stable." },
+    ],
   },
 
   // ── Filters: Bid/ask delta imbalance ──────────────────────────────────
@@ -1442,6 +1511,9 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     min: -1,
     max: 1,
     step: 0.05,
+    examples: [
+      { snippet: "filters.delta.max = -0.2", scenario: "Only take shorts when sellers are clearly winning — block when buyers dominate." },
+    ],
   },
 
   // ── Print directives (Script v2) ──────────────────────────────────────

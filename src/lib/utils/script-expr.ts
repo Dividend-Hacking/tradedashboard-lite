@@ -1706,6 +1706,9 @@ export const EXPR_SYMBOLS: ExprSymbol[] = [
     signature: "ceil(x)",
     description: "Rounds up to a whole number (e.g. 2.1 → 3).",
     context: "both",
+    examples: [
+      { snippet: "rules.timedExitBars = ceil(ATR / 2)", scenario: "Convert a volatility-scaled bar count to a whole number, rounding UP so the exit always covers at least the calculated time." },
+    ],
   },
   {
     name: "round",
@@ -1713,6 +1716,9 @@ export const EXPR_SYMBOLS: ExprSymbol[] = [
     signature: "round(x)",
     description: "Rounds to the nearest whole number.",
     context: "both",
+    examples: [
+      { snippet: "rules.stopLossPoints = round(ATR * 1.5)", scenario: "Use 1.5× ATR for the stop, rounded to a whole number of points for cleaner display." },
+    ],
   },
   {
     name: "sqrt",
@@ -1730,6 +1736,9 @@ export const EXPR_SYMBOLS: ExprSymbol[] = [
     signature: "log(x)",
     description: "Natural logarithm. Useful for log-scaling values.",
     context: "both",
+    examples: [
+      { snippet: 'print = log(totalPoints + 1), "log points"', scenario: "Compress a wide-ranging stat into a log scale for easier reading in the output panel." },
+    ],
   },
   {
     name: "exp",
@@ -1737,6 +1746,9 @@ export const EXPR_SYMBOLS: ExprSymbol[] = [
     signature: "exp(x)",
     description: "Exponential — e raised to the power x. The inverse of `log`.",
     context: "both",
+    examples: [
+      { snippet: "rules.takeProfitPoints = exp(ATR * 0.5)", scenario: "Make the target grow exponentially with volatility — small bumps when ATR rises." },
+    ],
   },
 
   // ─── Tick / point helpers — backed by rules.ticksPerPoint, etc. ─────
@@ -2245,24 +2257,36 @@ export const EXPR_SYMBOLS: ExprSymbol[] = [
     kind: "ident",
     description: "Sell-aggressor volume — how much of this bar's volume came from traders selling at the bid (hitting bids). Needs bid/ask data; blank without it.",
     context: "entry",
+    examples: [
+      { snippet: "filter.if = bar_volume_ask > bar_volume_bid", scenario: "Only take longs when buyers (lifting offers) outpaced sellers (hitting bids) on this bar." },
+    ],
   },
   {
     name: "bar_volume_ask",
     kind: "ident",
     description: "Buy-aggressor volume — how much of this bar's volume came from traders buying at the ask (lifting offers). Needs bid/ask data; blank without it.",
     context: "entry",
+    examples: [
+      { snippet: "filter.if = bar_volume_ask > volume * 0.6", scenario: "Trade longs only when at least 60% of this bar's volume hit the ask — clear buy pressure." },
+    ],
   },
   {
     name: "buy_volume",
     kind: "ident",
     description: "Same as bar_volume_ask — the friendlier name for buy-aggressor volume on this bar.",
     context: "entry",
+    examples: [
+      { snippet: "filter.if = buy_volume > sell_volume * 1.5", scenario: "Take longs when buy-aggressor volume is at least 50% larger than sell-aggressor volume." },
+    ],
   },
   {
     name: "sell_volume",
     kind: "ident",
     description: "Same as bar_volume_bid — the friendlier name for sell-aggressor volume on this bar.",
     context: "entry",
+    examples: [
+      { snippet: "filter.if = sell_volume < buy_volume", scenario: "Only trade longs when sellers were the smaller side on the entry bar." },
+    ],
   },
   {
     name: "delta",
@@ -2784,6 +2808,12 @@ export const SUMMARY_SYMBOLS: ExprSymbol[] = [
     description:
       "Total points captured across every trade. Alias for `totalPnl`.",
     context: "summary",
+    examples: [
+      {
+        snippet: 'print = totalPoints, "Total points"',
+        scenario: 'Show the total points captured by the strategy across the whole run.',
+      },
+    ],
   },
   {
     name: "expectancy",
@@ -2804,6 +2834,12 @@ export const SUMMARY_SYMBOLS: ExprSymbol[] = [
     description:
       "Same as expectancy but per single contract (ignores any position sizing). Useful for comparing strategies that trade different sizes.",
     context: "summary",
+    examples: [
+      {
+        snippet: 'print = expectancyPerSize, "Pts/trade (1 contract)"',
+        scenario: "Show expected points per trade as if every trade were a single contract — the apples-to-apples comparison number.",
+      },
+    ],
   },
   {
     name: "avgPoints",
@@ -2903,6 +2939,12 @@ export const SUMMARY_SYMBOLS: ExprSymbol[] = [
     description:
       "Sharpe ratio (a smoothness score) on the original zone results, BEFORE any rules-based adjustments. Higher = steadier results.",
     context: "summary",
+    examples: [
+      {
+        snippet: 'print = sharpeSimulated - sharpeOriginal, "Sharpe lift"',
+        scenario: 'Show how much your rules.* (stops, targets, etc.) improved or hurt the smoothness compared to the raw zone signal.',
+      },
+    ],
   },
   {
     name: "sharpeSimulated",
