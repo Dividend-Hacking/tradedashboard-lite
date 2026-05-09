@@ -910,9 +910,13 @@ function result(
     commissionDollars: Math.max(0, rules.commissionPerRoundTrip || 0),
     // Filled in by applyScalingModifier once positionSize is known.
     // Provisional value here uses size=1 so a result that bypasses
-    // scaling still has a sensible $ figure.
+    // scaling still has a sensible $ figure. Resolve pointValue
+    // through resolveTickConfig so auto mode pulls the per-instrument
+    // value (e.g. GC=$100) instead of the stale rules.pointValue
+    // default (NQ=$20) — see comment on tickConfigMode.
     netDollars: Math.round(
-      (netPoints * (rules.pointValue || 0) - Math.max(0, rules.commissionPerRoundTrip || 0)) * 100
+      (netPoints * (resolveTickConfig(zone.instrument, rules).pointValue || 0)
+        - Math.max(0, rules.commissionPerRoundTrip || 0)) * 100
     ) / 100,
     effSlPoints: effSl,
     effTpPoints: effTp,
@@ -1568,8 +1572,11 @@ export function applyScalingModifier(
   // here keeps the contract "netDollars is always size-correct" without
   // forcing every caller to re-derive it.
   if (!rules.scalingEnabled) {
-    const pv = rules.pointValue || 0;
+    // Resolve pointValue per-result so multi-instrument sessions and
+    // auto-mode lookups stay correct (rules.pointValue is just the
+    // manual-mode fallback; see resolveTickConfig).
     for (const r of results) {
+      const pv = resolveTickConfig(r.instrument, rules).pointValue || 0;
       r.netDollars =
         Math.round(
           (r.scaledPoints * pv - r.commissionDollars * r.positionSize) * 100
@@ -1628,7 +1635,8 @@ export function applyScalingModifier(
   let size = startSize;
   let prevDay: string | null = null;
   let exitCursor = 0;
-  const pv = rules.pointValue || 0;
+  // pointValue is resolved per-result inside the loop below — see comment
+  // at the netDollars assignment for why hoisting it would be wrong.
 
   for (const r of sortedByStart) {
     // Daily reset: when scalingResetDaily is on and we've crossed into a
@@ -1677,6 +1685,9 @@ export function applyScalingModifier(
     // netDollars reflects the size-scaled P&L net of commissions for
     // this trade's full bracket: every contract pays the round-trip
     // commission, so we multiply commissionDollars by size.
+    // Resolve pointValue per-result so multi-instrument sessions and
+    // auto-mode lookups stay correct.
+    const pv = resolveTickConfig(r.instrument, rules).pointValue || 0;
     r.netDollars =
       Math.round(
         (r.scaledPoints * pv - r.commissionDollars * size) * 100
@@ -1882,9 +1893,9 @@ export function applyDailyLimits(
   const tpThresh = rules.dailyTakeProfitPoints;
   const slThresh = -Math.abs(rules.dailyStopLossPoints);
 
-  // pointValue used by the in-flight force-close path to recompute
-  // netDollars after rewriting scaledPoints (matches applyScalingModifier).
-  const pvForDailyClip = rules.pointValue || 0;
+  // pointValue is resolved per-result at the force-close site below —
+  // hoisting it would break multi-instrument sessions and bypass auto
+  // mode's per-symbol resolution. Matches applyScalingModifier.
 
   const finalKept: SimZoneResult[] = [];
 
@@ -2021,6 +2032,8 @@ export function applyDailyLimits(
       forceClosed.positionSize = t.positionSize;
       forceClosed.scaledPoints =
         Math.round(forceClosed.exitPoints * t.positionSize * 100) / 100;
+      const pvForDailyClip =
+        resolveTickConfig(forceClosed.instrument, rules).pointValue || 0;
       forceClosed.netDollars =
         Math.round(
           (forceClosed.scaledPoints * pvForDailyClip -
@@ -2240,7 +2253,11 @@ function earlyCloseAtTime(
   const netPnl = closePnl - slipRoundTrip;
   const rounded = Math.round(netPnl * 100) / 100;
   const commission = Math.max(0, rules?.commissionPerRoundTrip || 0);
-  const pv = rules?.pointValue || 0;
+  // Resolve pointValue through resolveTickConfig so auto mode pulls the
+  // per-instrument value (e.g. GC=$100) instead of the stale rules.pointValue
+  // default (NQ=$20). When rules is omitted, fall back to 0 like before so
+  // callers without a SimRules don't get a misleading $ figure.
+  const pv = rules ? (resolveTickConfig(zone.instrument, rules).pointValue || 0) : 0;
   return {
     zoneId: zone.id,
     direction: zone.direction,
