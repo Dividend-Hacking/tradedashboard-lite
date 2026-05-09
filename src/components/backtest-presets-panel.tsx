@@ -2,24 +2,35 @@
  * BacktestPresetsPanel
  *
  * UI affordance for the Backtesting tab's preset feature. Renders a single
- * row of controls:
- *   1. A dropdown of saved presets (alphabetical by name).
- *   2. LOAD — applies the selected preset to the dashboard.
- *   3. SAVE AS — prompts for a name, captures the current dashboard state.
- *   4. UPDATE — overwrites the selected preset with current state.
- *   5. DELETE — removes the selected preset (with a confirm).
+ * row of controls plus a search/filter bar:
+ *   1. A bucket-filter dropdown + a free-text search input.
+ *   2. A dropdown of presets matching the active filter+search, alphabetical.
+ *   3. LOAD — applies the selected preset to the dashboard.
+ *   4. SAVE AS — prompts for a name, captures the current dashboard state.
+ *   5. UPDATE — overwrites the selected preset with current state.
+ *   6. EXPORT — copies the preset JSON to the clipboard.
+ *   7. TO NT8 — convert + deploy the preset to NinjaTrader 8.
+ *   8. ADVANCE — moves the preset one stage forward in the pipeline.
+ *   9. FAIL — moves the preset to the Failed bucket.
+ *   10. DELETE — removes the selected preset (with a confirm).
  *
  * The panel is intentionally state-light: it owns the selected dropdown
- * value and the save-name input, but every persistence call goes back to
- * the dashboard via callbacks so the parent stays the source of truth for
- * what's "active right now". The panel re-reads from localStorage after
- * each mutation via the parent's onPresetsChange — a one-way refresh that
- * guarantees the visible list matches what's saved.
+ * value, the save-name input, and the local search/filter strings, but
+ * every persistence call goes back to the dashboard via callbacks so the
+ * parent stays the source of truth for what's "active right now". The
+ * panel re-reads from localStorage after each mutation via the parent's
+ * onPresetsChange — a one-way refresh that guarantees the visible list
+ * matches what's saved.
  */
 "use client";
 
 import { memo, useState, useMemo } from "react";
-import { BacktestPreset } from "@/lib/utils/backtest-presets";
+import {
+  BacktestPreset,
+  PIPELINE_BUCKETS,
+  PIPELINE_BUCKET_LABELS,
+  type PipelineBucket,
+} from "@/lib/utils/backtest-presets";
 
 interface BacktestPresetsPanelProps {
   /** Current saved presets, fed in by the parent so all callers see the
@@ -38,6 +49,10 @@ interface BacktestPresetsPanelProps {
   onUpdate: (preset: BacktestPreset) => void;
   /** Called when the user confirms DELETE on a selected preset. */
   onDelete: (preset: BacktestPreset) => void;
+  /** Called when the user clicks ADVANCE (move forward one pipeline stage)
+   *  or FAIL (jump to the Failed bucket). The parent persists via
+   *  setPresetBucket and refreshes the list. */
+  onMoveBucket: (preset: BacktestPreset, bucket: PipelineBucket) => void;
   /** Live DSL script text from the editor — overrides `selected.script`
    *  when the user clicks TO NT8. Without this, the API receives only
    *  what was last saved (or nothing for older presets) and silently
@@ -49,12 +64,27 @@ interface BacktestPresetsPanelProps {
   liveParamMeta?: BacktestPreset["paramMeta"];
 }
 
+/** Tailwind classes for the small bucket badge, keyed by bucket. Each
+ *  bucket has its own subtle hue so the user can scan the dropdown and
+ *  see at a glance which stage a preset is in. The colors track the
+ *  existing palette: muted for early stages, green for Sim/Live, amber
+ *  for Out of Sample (a "yellow flag" stage), red for Failed. */
+const BUCKET_BADGE_CLASS: Record<PipelineBucket, string> = {
+  new: "bg-white/5 text-muted-foreground",
+  in_sample: "bg-blue-500/15 text-blue-300",
+  out_of_sample: "bg-amber-500/15 text-amber-300",
+  sim: "bg-accent-green/15 text-accent-green",
+  live: "bg-accent-green/25 text-accent-green",
+  failed: "bg-accent-red/15 text-accent-red",
+};
+
 function BacktestPresetsPanelImpl({
   presets,
   onLoad,
   onSaveAs,
   onUpdate,
   onDelete,
+  onMoveBucket,
   liveScript,
   liveParamMeta,
 }: BacktestPresetsPanelProps) {
@@ -69,6 +99,14 @@ function BacktestPresetsPanelImpl({
   // so the user doesn't lose visual context of what they're saving.
   const [savingName, setSavingName] = useState<string>("");
   const [showNameInput, setShowNameInput] = useState<boolean>(false);
+
+  // Bucket filter ("all" = no filter). Lives here, not the parent — it's
+  // pure UI state and doesn't affect anything outside this dropdown.
+  const [bucketFilter, setBucketFilter] = useState<"all" | PipelineBucket>(
+    "all"
+  );
+  // Free-text search across preset name. Substring, case-insensitive.
+  const [search, setSearch] = useState<string>("");
 
   // Transient confirmation flash for the EXPORT button. After a successful
   // clipboard copy we set this to the preset id and clear it after ~1.5s,
@@ -85,15 +123,39 @@ function BacktestPresetsPanelImpl({
     null | "running" | { id: string; ok: boolean; message: string }
   >(null);
 
-  // Sort by name for predictable dropdown order. Memoized so the sort
-  // doesn't run on every keystroke in the name input.
-  const sortedPresets = useMemo(
-    () => [...presets].sort((a, b) => a.name.localeCompare(b.name)),
-    [presets]
-  );
+  // Apply bucket filter + name search, then sort alphabetically.
+  // Memoized so the work doesn't repeat on unrelated re-renders (the
+  // parent passes a new presets array reference every time something on
+  // the dashboard changes, but the contents are usually stable).
+  const filteredSorted = useMemo(() => {
+    const q = search.trim().toLowerCase();
+    return [...presets]
+      .filter((p) => {
+        const b = (p.bucket ?? "new") as PipelineBucket;
+        if (bucketFilter !== "all" && b !== bucketFilter) return false;
+        if (q.length > 0 && !p.name.toLowerCase().includes(q)) return false;
+        return true;
+      })
+      .sort((a, b) => a.name.localeCompare(b.name));
+  }, [presets, bucketFilter, search]);
 
-  const selected = sortedPresets.find((p) => p.id === selectedId) ?? null;
+  const selected = filteredSorted.find((p) => p.id === selectedId) ?? null;
   const hasSelection = selected !== null;
+  const selectedBucket = (selected?.bucket ?? "new") as PipelineBucket;
+  // ADVANCE is allowed for everything except the last forward stage and
+  // the Failed dead-end. Computed once so the disabled-state and tooltip
+  // stay consistent. Cast to PipelineBucket[] so TS doesn't try to narrow
+  // the array element type from `b !== "failed"` and reject calls like
+  // indexOf(selectedBucket) when selectedBucket happens to be "failed".
+  const forwardChain: PipelineBucket[] = PIPELINE_BUCKETS.filter(
+    (b) => b !== "failed"
+  ) as PipelineBucket[];
+  const advanceIdx = forwardChain.indexOf(selectedBucket);
+  const canAdvance =
+    hasSelection && advanceIdx >= 0 && advanceIdx < forwardChain.length - 1;
+  const advanceTarget: PipelineBucket | null = canAdvance
+    ? forwardChain[advanceIdx + 1]
+    : null;
 
   const handleSaveSubmit = () => {
     const trimmed = savingName.trim();
@@ -116,6 +178,17 @@ function BacktestPresetsPanelImpl({
     setSelectedId("");
   };
 
+  const handleAdvance = () => {
+    if (!selected || !advanceTarget) return;
+    onMoveBucket(selected, advanceTarget);
+  };
+
+  const handleFail = () => {
+    if (!selected) return;
+    if (selectedBucket === "failed") return;
+    onMoveBucket(selected, "failed");
+  };
+
   // Export the selected preset to the clipboard as pretty-printed JSON.
   // Used to hand a preset to NinjaScript ports, share it across machines,
   // or paste it into a backup. We copy the full preset object verbatim
@@ -131,22 +204,10 @@ function BacktestPresetsPanelImpl({
   // shared folder NT8 reads. After this lands, the user only needs to F5
   // in NT8's NinjaScript Editor to compile — same workflow that running
   // ninjatrader/new-strategy.sh + deploy-nt8.sh manually would produce.
-  //
-  // Three-stage UI feedback via convertState:
-  //   - "running"  → button disabled, label "CONVERTING…"
-  //   - success    → flash "DEPLOYED ✓" for 3s, log nextSteps to console
-  //   - failure    → flash "FAILED" for 3s, log full response to console
-  // We don't surface a modal because the panel is meant to stay compact;
-  // the next-step instructions go to the console where they're easy to
-  // copy and where any deploy-nt8.sh stderr can be inspected.
   const handleConvertToNt8 = async () => {
     if (!selected) return;
     setConvertState("running");
     try {
-      // Always overlay the live editor script + paramMeta. Without this
-      // the API receives stale (or empty) `preset.script` and silently
-      // falls back to the legacy strategyId template, which drops every
-      // `filters.X = Y` directive — see plan round 4.
       const presetForExport: BacktestPreset = {
         ...selected,
         script: liveScript && liveScript.length > 0 ? liveScript : selected.script,
@@ -159,7 +220,6 @@ function BacktestPresetsPanelImpl({
       });
       const json = await resp.json();
       if (!resp.ok || !json.success) {
-        // eslint-disable-next-line no-console
         console.error("[TO NT8] conversion failed", json);
         setConvertState({
           id: selected.id,
@@ -167,7 +227,6 @@ function BacktestPresetsPanelImpl({
           message: json.error ?? "Failed",
         });
       } else {
-        // eslint-disable-next-line no-console
         console.log(
           `[TO NT8] ${selected.name} → ${json.className}.cs\n` +
             `Next steps:\n  ${(json.nextSteps as string[]).join("\n  ")}` +
@@ -180,7 +239,6 @@ function BacktestPresetsPanelImpl({
         });
       }
     } catch (e) {
-      // eslint-disable-next-line no-console
       console.error("[TO NT8] request error", e);
       setConvertState({
         id: selected.id,
@@ -188,7 +246,6 @@ function BacktestPresetsPanelImpl({
         message: "REQUEST ERROR",
       });
     }
-    // Clear the flash after 3s so subsequent clicks feel responsive.
     window.setTimeout(() => setConvertState(null), 3000);
   };
 
@@ -211,9 +268,6 @@ function BacktestPresetsPanelImpl({
       setCopiedId(selected.id);
       window.setTimeout(() => setCopiedId(null), 1500);
     } catch {
-      // Last-resort fallback: dump it to a prompt so the user can copy
-      // manually. Better than silently failing on a feature whose whole
-      // job is to put text on the clipboard.
       window.prompt("Copy preset JSON:", json);
     }
   };
@@ -227,16 +281,54 @@ function BacktestPresetsPanelImpl({
         <span className="text-xs text-muted-foreground">
           {presets.length === 0
             ? "No saved presets"
-            : `${presets.length} saved`}
+            : filteredSorted.length === presets.length
+              ? `${presets.length} saved`
+              : `${filteredSorted.length} of ${presets.length}`}
         </span>
       </div>
 
+      {/* ── Bucket filter + search row ────────────────────────────────
+          Always visible (even when SAVE AS is open) so the user can see
+          which slice of the catalog they're working with. The filter
+          state is purely local — nothing about it persists. */}
+      <div className="flex items-center gap-2 mb-2 flex-wrap">
+        <select
+          value={bucketFilter}
+          onChange={(e) =>
+            setBucketFilter(e.target.value as "all" | PipelineBucket)
+          }
+          title="Filter presets by pipeline bucket"
+          className="bg-card border border-card-border rounded-md px-2 py-1 text-xs text-foreground focus:outline-none focus:ring-1 focus:ring-accent-green"
+        >
+          <option value="all">All buckets</option>
+          {PIPELINE_BUCKETS.map((b) => (
+            <option key={b} value={b}>
+              {PIPELINE_BUCKET_LABELS[b]}
+            </option>
+          ))}
+        </select>
+        <input
+          type="text"
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          placeholder="Search presets…"
+          className="flex-1 min-w-0 bg-card border border-card-border rounded-md px-2 py-1 text-xs text-foreground focus:outline-none focus:ring-1 focus:ring-accent-green"
+        />
+        {(bucketFilter !== "all" || search.trim().length > 0) && (
+          <button
+            onClick={() => {
+              setBucketFilter("all");
+              setSearch("");
+            }}
+            className="px-2 py-1 rounded text-[10px] uppercase tracking-wider font-medium bg-white/5 text-muted-foreground hover:text-foreground hover:bg-white/10 transition-colors"
+            title="Clear filter and search"
+          >
+            Clear
+          </button>
+        )}
+      </div>
+
       {showNameInput ? (
-        // ── SAVE AS inline form ─────────────────────────────────────
-        // Replaces the controls row while the user names a new preset.
-        // Enter submits; Escape cancels. Auto-focuses on mount via the
-        // input element's autoFocus attribute so the user can start
-        // typing immediately.
         <div className="flex items-center gap-2 flex-wrap">
           <input
             type="text"
@@ -275,10 +367,6 @@ function BacktestPresetsPanelImpl({
           </button>
         </div>
       ) : (
-        // ── Dropdown + action buttons ───────────────────────────────
-        // Standard row layout: pick from the list, then act on it. SAVE AS
-        // lives here too even though it doesn't need a selection — keeping
-        // all preset ops in one row keeps the UI compact.
         <div className="flex items-center gap-2 flex-wrap">
           <select
             value={selectedId}
@@ -286,19 +374,23 @@ function BacktestPresetsPanelImpl({
             className="flex-1 min-w-0 bg-card border border-card-border rounded-md px-3 py-1.5 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-accent-green"
           >
             <option value="">
-              {sortedPresets.length === 0
+              {presets.length === 0
                 ? "— No presets yet, click SAVE AS to create one —"
-                : "— Select a preset —"}
+                : filteredSorted.length === 0
+                  ? "— No presets match the current filter —"
+                  : "— Select a preset —"}
             </option>
-            {sortedPresets.map((p) => (
-              <option key={p.id} value={p.id}>
-                {p.name}
-              </option>
-            ))}
+            {filteredSorted.map((p) => {
+              const b = (p.bucket ?? "new") as PipelineBucket;
+              return (
+                <option key={p.id} value={p.id}>
+                  {`[${PIPELINE_BUCKET_LABELS[b]}] ${p.name}`}
+                </option>
+              );
+            })}
           </select>
 
-          {/* LOAD — applies the selected preset to the dashboard. Only
-              enabled with a selection. */}
+          {/* LOAD — applies the selected preset to the dashboard. */}
           <button
             onClick={() => selected && onLoad(selected)}
             disabled={!hasSelection}
@@ -316,15 +408,9 @@ function BacktestPresetsPanelImpl({
             LOAD
           </button>
 
-          {/* SAVE AS — opens the inline name input. Always enabled; if the
-              user is mid-config and clicks this, they get to bookmark
-              wherever they are right now. */}
           <button
             onClick={() => {
               setShowNameInput(true);
-              // Pre-fill with selected name + " (copy)" if a preset is
-              // active so the user has a sensible starting point for
-              // forking an existing config.
               setSavingName(selected ? `${selected.name} (copy)` : "");
             }}
             title="Save the current strategy, rules, and filters as a new preset"
@@ -333,9 +419,6 @@ function BacktestPresetsPanelImpl({
             SAVE AS
           </button>
 
-          {/* UPDATE — overwrites the selected preset with current state.
-              Disabled without a selection so it can't accidentally fire on
-              a fresh dashboard. */}
           <button
             onClick={() => selected && onUpdate(selected)}
             disabled={!hasSelection}
@@ -353,11 +436,6 @@ function BacktestPresetsPanelImpl({
             UPDATE
           </button>
 
-          {/* EXPORT — copies the selected preset's full JSON to the
-              clipboard. Used for sharing across devices, archiving, or
-              feeding the NinjaScript port pipeline. Label flashes to
-              "COPIED ✓" for 1.5s on success so the user has visual
-              feedback without a toast. */}
           <button
             onClick={handleExport}
             disabled={!hasSelection}
@@ -377,11 +455,6 @@ function BacktestPresetsPanelImpl({
               : "EXPORT"}
           </button>
 
-          {/* TO NT8 — convert the selected preset into a deployable NT8
-              strategy and rsync the files to the VM in one shot. After the
-              button finishes, the user only needs to F5 in NT8 NinjaScript
-              Editor to compile. Disabled without a selection or while a
-              convert is in flight. */}
           <button
             onClick={handleConvertToNt8}
             disabled={!hasSelection || convertState === "running"}
@@ -413,6 +486,52 @@ function BacktestPresetsPanelImpl({
                 : "TO NT8"}
           </button>
 
+          {/* ── Pipeline action buttons ───────────────────────────────
+              ADVANCE walks the preset one step right along the forward
+              chain (New → In Sample → Out of Sample → Sim → Live).
+              FAIL drops it into the Failed bucket regardless of where
+              it currently lives. Both no-op via disabled state when
+              there's no selection or the move is impossible. */}
+          <button
+            onClick={handleAdvance}
+            disabled={!canAdvance}
+            title={
+              canAdvance && advanceTarget
+                ? `Move "${selected!.name}" forward → ${PIPELINE_BUCKET_LABELS[advanceTarget]}`
+                : hasSelection
+                  ? selectedBucket === "failed"
+                    ? "Failed presets can't be advanced — drag them on the pipeline page to revive."
+                    : "Already at the last pipeline stage."
+                  : "Select a preset to advance"
+            }
+            className={`px-3 py-1.5 rounded text-xs font-medium transition-colors ${
+              canAdvance
+                ? "bg-blue-500/15 text-blue-300 hover:bg-blue-500/25"
+                : "bg-white/5 text-muted-foreground/40 cursor-not-allowed"
+            }`}
+          >
+            ADVANCE →
+          </button>
+
+          <button
+            onClick={handleFail}
+            disabled={!hasSelection || selectedBucket === "failed"}
+            title={
+              hasSelection
+                ? selectedBucket === "failed"
+                  ? `"${selected!.name}" is already in the Failed bucket.`
+                  : `Move "${selected!.name}" → Failed bucket`
+                : "Select a preset to fail"
+            }
+            className={`px-3 py-1.5 rounded text-xs font-medium transition-colors ${
+              hasSelection && selectedBucket !== "failed"
+                ? "bg-accent-red/10 text-accent-red hover:bg-accent-red/20"
+                : "bg-white/5 text-muted-foreground/40 cursor-not-allowed"
+            }`}
+          >
+            FAIL
+          </button>
+
           {/* DELETE — confirm-gated. */}
           <button
             onClick={handleDelete}
@@ -435,28 +554,40 @@ function BacktestPresetsPanelImpl({
 
       {/* Selected preset summary — shows what'll happen when the user
           hits LOAD. Helps when several presets share a strategy and the
-          name alone isn't enough to disambiguate. Only renders when a
-          preset is selected. */}
+          name alone isn't enough to disambiguate. The bucket badge is
+          rendered inline so it's the first thing the user sees. */}
       {selected && !showNameInput && (
-        <div className="mt-2 text-xs text-muted-foreground">
-          Strategy: <span className="text-foreground">{selected.strategyId}</span>
-          {" · "}
-          Filters:{" "}
-          <span className="text-foreground">
-            {[
-              selected.filters.time.enabled && "Time",
-              selected.filters.adx.enabled && "ADX",
-              selected.filters.atr.enabled && "ATR",
-              selected.filters.trend.enabled && "Trend",
-              selected.filters.bollinger.enabled && "Bollinger",
-            ]
-              .filter(Boolean)
-              .join(", ") || "none"}
+        <div className="mt-2 text-xs text-muted-foreground flex items-center gap-2 flex-wrap">
+          <span
+            className={`px-2 py-0.5 rounded text-[10px] uppercase tracking-wider font-semibold ${BUCKET_BADGE_CLASS[selectedBucket]}`}
+          >
+            {PIPELINE_BUCKET_LABELS[selectedBucket]}
           </span>
-          {" · "}
-          Updated:{" "}
-          <span className="text-foreground">
-            {new Date(selected.updatedAt).toLocaleString()}
+          <span>
+            Strategy:{" "}
+            <span className="text-foreground">{selected.strategyId}</span>
+          </span>
+          <span>·</span>
+          <span>
+            Filters:{" "}
+            <span className="text-foreground">
+              {[
+                selected.filters.time.enabled && "Time",
+                selected.filters.adx.enabled && "ADX",
+                selected.filters.atr.enabled && "ATR",
+                selected.filters.trend.enabled && "Trend",
+                selected.filters.bollinger.enabled && "Bollinger",
+              ]
+                .filter(Boolean)
+                .join(", ") || "none"}
+            </span>
+          </span>
+          <span>·</span>
+          <span>
+            Updated:{" "}
+            <span className="text-foreground">
+              {new Date(selected.updatedAt).toLocaleString()}
+            </span>
           </span>
         </div>
       )}

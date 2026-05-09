@@ -77,6 +77,12 @@ export default async function RootLayout({
                 >
                   Auto
                 </Link>
+                <Link
+                  href="/pipeline"
+                  className="px-3 py-1.5 rounded text-sm text-[#a1a1aa] hover:text-[#e4e4e7] transition-colors"
+                >
+                  Pipeline
+                </Link>
               </div>
               {/* Mode badge + Settings link, pushed to the right. The badge is
                   purely informational: in local mode it's tinted so the user

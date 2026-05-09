@@ -774,6 +774,14 @@ interface PresetRow {
   filters: BacktestPreset["filters"];
   created_at: string;
   updated_at: string;
+  // Added in the pipeline-bucket migration. Defaults to 'new' on the DB side
+  // so any pre-existing rows show up at the leftmost stage on first load.
+  bucket?: BacktestPreset["bucket"];
+  // Added in the same migration so the v2 DSL fields actually round-trip
+  // through Supabase (previously they only lived in localStorage and were
+  // dropped on every cross-device sync).
+  script?: string | null;
+  param_meta?: BacktestPreset["paramMeta"] | null;
 }
 
 function rowToPreset(row: PresetRow): BacktestPreset {
@@ -787,6 +795,9 @@ function rowToPreset(row: PresetRow): BacktestPreset {
     params: row.params,
     rules: row.rules,
     filters: row.filters,
+    bucket: row.bucket ?? "new",
+    script: row.script ?? undefined,
+    paramMeta: row.param_meta ?? undefined,
   };
 }
 
@@ -801,6 +812,9 @@ function presetToRow(p: BacktestPreset): PresetRow {
     filters: p.filters,
     created_at: p.createdAt,
     updated_at: p.updatedAt,
+    bucket: p.bucket ?? "new",
+    script: p.script ?? null,
+    param_meta: p.paramMeta ?? null,
   };
 }
 

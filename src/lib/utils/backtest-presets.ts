@@ -62,6 +62,51 @@ function activeMode(): Mode {
 /** Schema version. Bump when the preset shape adds/removes/renames fields. */
 export const PRESET_SCHEMA_VERSION = 2;
 
+/**
+ * Pipeline bucket the preset currently lives in.
+ *
+ * Drives the /pipeline page kanban board and the bucket badge inside the
+ * backtest dashboard's preset selector. The order of this list IS the
+ * canonical pipeline order — `nextBucketInPipeline()` advances by one
+ * step through it (skipping `failed`, which is the dead-end terminal).
+ *
+ * Persisted as a plain TEXT column so adding a new stage is a one-side
+ * code change (plus a CHECK relax in the DB if we want strict enforcement).
+ */
+export const PIPELINE_BUCKETS = [
+  "new",
+  "in_sample",
+  "out_of_sample",
+  "sim",
+  "live",
+  "failed",
+] as const;
+export type PipelineBucket = (typeof PIPELINE_BUCKETS)[number];
+
+/** Human-readable label for each bucket (used by the kanban headers and
+ *  the badge in the preset dropdown). Kept here so the labels never
+ *  drift out of sync with the canonical id list. */
+export const PIPELINE_BUCKET_LABELS: Record<PipelineBucket, string> = {
+  new: "New",
+  in_sample: "In Sample",
+  out_of_sample: "Out of Sample",
+  sim: "Sim",
+  live: "Live",
+  failed: "Failed",
+};
+
+/** Returns the bucket one step forward along the forward pipeline (i.e.
+ *  excluding `failed`). Returns the same bucket if we're already at the
+ *  last forward stage so callers can no-op safely without a guard. */
+export function nextBucketInPipeline(b: PipelineBucket): PipelineBucket {
+  if (b === "failed") return "failed";
+  // Forward chain stops one before "failed" (which is a side-bucket).
+  const forward = PIPELINE_BUCKETS.filter((x) => x !== "failed");
+  const idx = forward.indexOf(b);
+  if (idx < 0 || idx >= forward.length - 1) return b;
+  return forward[idx + 1];
+}
+
 /** Bollinger position keys — must stay in sync with backtest-dashboard.tsx. */
 export type BollingerPos = "above_upper" | "inside" | "below_lower";
 
@@ -302,6 +347,16 @@ export interface BacktestPreset {
     label?: string;
     description?: string;
   }>;
+  /** Pipeline stage. Drives the /pipeline kanban board and the bucket badge
+   *  in the backtest dashboard's preset selector. New presets always start
+   *  in `"new"` (defaulted in normalizePresetForLoad and createPreset for
+   *  forward-compat with older saves). */
+  bucket?: PipelineBucket;
+}
+
+/** Patch shape accepted by setPresetBucket — just the destination stage. */
+export interface PresetBucketPatch {
+  bucket: PipelineBucket;
 }
 
 /** Default filter state — matches the initial useState defaults in
@@ -394,6 +449,11 @@ export interface NewPresetInput {
   params: Record<string, number>;
   rules: SimRules;
   filters: PresetFilters;
+  /** Optional starting bucket. Defaults to "new" — every preset enters the
+   *  pipeline at the leftmost stage. Callers don't normally pass this; it
+   *  exists mainly so an importer or duplicator can re-create a preset at
+   *  the same pipeline position as the original. */
+  bucket?: PipelineBucket;
   /** Verbatim DSL script text. The dashboard previously didn't capture
    *  this when saving presets, so /api/convert-to-nt8 received an empty
    *  `preset.script` and silently fell back to the legacy strategyId
@@ -426,6 +486,7 @@ export function createPreset(input: NewPresetInput): BacktestPreset {
     // directive — see plan round 4.
     script: input.script,
     paramMeta: input.paramMeta,
+    bucket: input.bucket ?? "new",
     // Defensive shallow copies — caller may keep mutating its state.
     params: { ...input.params },
     rules: { ...input.rules },
@@ -479,6 +540,7 @@ export function updatePreset(
     // pick up changes the user made in the script editor.
     script: patch.script !== undefined ? patch.script : prev.script,
     paramMeta: patch.paramMeta !== undefined ? patch.paramMeta : prev.paramMeta,
+    bucket: patch.bucket !== undefined ? patch.bucket : (prev.bucket ?? "new"),
     params: patch.params ? { ...patch.params } : prev.params,
     rules: patch.rules ? { ...patch.rules } : prev.rules,
     filters: patch.filters
@@ -505,6 +567,57 @@ export function updatePreset(
           delta: { ...patch.filters.delta },
         }
       : prev.filters,
+    updatedAt: new Date().toISOString(),
+  };
+  list[idx] = next;
+  writePresets(list);
+  pushPresetToBackend(next).catch(() => {});
+  emitPresetsChanged();
+  return next;
+}
+
+/** Move a preset to a new pipeline bucket WITHOUT touching its
+ *  configuration. Bumps `updatedAt` so the kanban "last updated" sort
+ *  reflects the move. Returns the updated preset, or null if id is unknown.
+ *
+ *  Kept separate from `updatePreset` because most bucket changes happen
+ *  from the /pipeline page (drag-drop) and the dashboard's pipeline
+ *  buttons (MOVE FORWARD / FAIL), where there is no live filter / param
+ *  state to fold in — calling `updatePreset` from those code paths would
+ *  require synthesizing a full payload patch which we don't have. */
+export function setPresetBucket(
+  id: string,
+  bucket: PipelineBucket
+): BacktestPreset | null {
+  const list = loadPresets();
+  const idx = list.findIndex((p) => p.id === id);
+  if (idx < 0) return null;
+  const prev = list[idx];
+  if ((prev.bucket ?? "new") === bucket) return prev;
+  const next: BacktestPreset = {
+    ...prev,
+    bucket,
+    updatedAt: new Date().toISOString(),
+  };
+  list[idx] = next;
+  writePresets(list);
+  pushPresetToBackend(next).catch(() => {});
+  emitPresetsChanged();
+  return next;
+}
+
+/** Rename a preset without touching strategy/params/rules/filters. Used by
+ *  the /pipeline page edit modal where the user is curating the catalog,
+ *  not editing strategy state. */
+export function renamePreset(id: string, name: string): BacktestPreset | null {
+  const list = loadPresets();
+  const idx = list.findIndex((p) => p.id === id);
+  if (idx < 0) return null;
+  const trimmed = name.trim();
+  if (trimmed.length === 0) return list[idx];
+  const next: BacktestPreset = {
+    ...list[idx],
+    name: trimmed,
     updatedAt: new Date().toISOString(),
   };
   list[idx] = next;
@@ -549,6 +662,7 @@ export function normalizePresetForLoad(preset: BacktestPreset): BacktestPreset {
     ...preset,
     script: preset.script,
     paramMeta: preset.paramMeta,
+    bucket: preset.bucket ?? "new",
     rules: { ...DEFAULT_SIM_RULES, ...preset.rules },
     filters: {
       time: (() => {

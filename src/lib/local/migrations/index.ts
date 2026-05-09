@@ -14,13 +14,18 @@
 import type { Database } from "better-sqlite3";
 import { migration0001 } from "./0001_init";
 import { migration0002 } from "./0002_data_request_recovery";
+import { migration0003 } from "./0003_preset_pipeline_bucket";
 
 interface Migration {
   version: number;
   sql: string;
 }
 
-const MIGRATIONS: readonly Migration[] = [migration0001, migration0002];
+const MIGRATIONS: readonly Migration[] = [
+  migration0001,
+  migration0002,
+  migration0003,
+];
 
 export function runMigrations(db: Database): void {
   // Bootstrap the migrations registry table itself.

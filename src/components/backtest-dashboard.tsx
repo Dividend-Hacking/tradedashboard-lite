@@ -176,9 +176,12 @@ import {
   createPreset,
   updatePreset as updatePresetInStorage,
   deletePreset as deletePresetInStorage,
+  setPresetBucket,
   normalizePresetForLoad,
   syncPresetsFromSupabase,
+  PIPELINE_BUCKET_LABELS,
   PRESETS_CHANGED_EVENT,
+  type PipelineBucket,
 } from "@/lib/utils/backtest-presets";
 import {
   DashboardSyncState,
@@ -815,6 +818,21 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
       deletePresetInStorage(preset.id);
       setPresets(loadPresets());
       showToast(`Deleted preset "${preset.name}"`);
+    },
+    [showToast]
+  );
+
+  /** Move a preset to another pipeline bucket. Used by both the ADVANCE
+   *  and FAIL buttons in the preset panel — the panel decides the target
+   *  bucket; we just persist and notify. */
+  const handleMoveBucketPreset = useCallback(
+    (preset: BacktestPreset, bucket: PipelineBucket) => {
+      const updated = setPresetBucket(preset.id, bucket);
+      if (!updated) return;
+      setPresets(loadPresets());
+      showToast(
+        `Moved "${preset.name}" → ${PIPELINE_BUCKET_LABELS[bucket]}`
+      );
     },
     [showToast]
   );
@@ -4563,6 +4581,7 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
         onSaveAs={handleSavePreset}
         onUpdate={handleUpdatePreset}
         onDelete={handleDeletePreset}
+        onMoveBucket={handleMoveBucketPreset}
         liveScript={scriptText}
         liveParamMeta={scriptParamMeta}
       />
