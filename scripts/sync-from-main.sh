@@ -179,21 +179,28 @@ fi
 # out anything already in HEAD via `git cherry` — which is necessary
 # because BASELINE may be behind HEAD if the user manually cherry-picked
 # something already.
-mapfile -t CANDIDATES < <(git log --reverse --format='%H' "$BASELINE..main-repo/main")
+# macOS still ships bash 3.2, so we avoid `mapfile` and associative
+# arrays — both bash 4+ features. `read` loops + space-delimited string
+# membership tests work everywhere.
+CANDIDATES=()
+while IFS= read -r line; do
+  [[ -z "$line" ]] && continue
+  CANDIDATES+=("$line")
+done < <(git log --reverse --format='%H' "$BASELINE..main-repo/main")
 
 if [[ ${#CANDIDATES[@]} -eq 0 ]]; then
   echo "[sync] 0 new commits to sync — already up to date."
   exit 0
 fi
 
-# Build a lookup of patch-ids already in HEAD's history so we can detect
-# commits the user already cherry-picked manually. `git cherry` is the
-# canonical tool here: lines starting with '+' are commits in upstream
-# but not in HEAD; '-' are already present.
-declare -A IN_HEAD_PATCH=()
+# Build a space-delimited list of upstream commit SHAs that `git cherry`
+# says are already represented in HEAD's history (matched by patch-id —
+# i.e. the user manually cherry-picked them). Membership test below uses
+# substring match against this string.
+IN_HEAD_PATCHES=" "
 while read -r mark sha; do
   if [[ "$mark" == "-" ]]; then
-    IN_HEAD_PATCH["$sha"]=1
+    IN_HEAD_PATCHES+="$sha "
   fi
 done < <(git cherry HEAD main-repo/main "$BASELINE" 2>/dev/null || true)
 
@@ -246,7 +253,7 @@ PLAN_SKIP_PRESENT=()
 for sha in "${CANDIDATES[@]}"; do
   short="$(git rev-parse --short "$sha")"
   subject="$(git log -1 --format='%s' "$sha")"
-  if [[ "${IN_HEAD_PATCH[$sha]:-0}" == "1" ]]; then
+  if [[ "$IN_HEAD_PATCHES" == *" $sha "* ]]; then
     PLAN_SKIP_PRESENT+=("$sha")
     echo "  [skip:already-in-HEAD]  $short  $subject"
   elif [[ ${#EXCLUDES[@]} -gt 0 ]] && all_files_excluded "$sha"; then
@@ -269,8 +276,8 @@ if [[ ${#PLAN_APPLY[@]} -eq 0 ]]; then
   echo "[sync] nothing to apply (all commits already present or excluded)."
   # Even when nothing is applied, advance the cursor so future runs
   # don't re-enumerate the same commits.
-  echo "${CANDIDATES[-1]}" > "$STATE_FILE"
-  echo "[state] cursor advanced to ${CANDIDATES[-1]}"
+  echo "${CANDIDATES[$((${#CANDIDATES[@]}-1))]}" > "$STATE_FILE"
+  echo "[state] cursor advanced to ${CANDIDATES[$((${#CANDIDATES[@]}-1))]}"
   exit 0
 fi
 
@@ -294,7 +301,7 @@ done
 
 # Cursor advances to the LATEST candidate (not just last applied) so
 # excluded commits don't get re-enumerated forever.
-echo "${CANDIDATES[-1]}" > "$STATE_FILE"
+echo "${CANDIDATES[$((${#CANDIDATES[@]}-1))]}" > "$STATE_FILE"
 echo
 echo "[done] applied ${#PLAN_APPLY[@]} commit(s); cursor at ${CANDIDATES[-1]:0:7}"
 echo "[reminder] review with 'git log --oneline' and push when ready."
