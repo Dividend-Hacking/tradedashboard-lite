@@ -135,7 +135,7 @@ import {
   buildLetBindings,
   type Stmt as StrategyStmt,
 } from "@/lib/utils/strategy-evaluator";
-import { BUILTIN_STRATEGY_TEMPLATES } from "@/lib/utils/built-in-strategies";
+import { BUILTIN_STRATEGY_TEMPLATES, findTemplateByLegacyId } from "@/lib/utils/built-in-strategies";
 import { ScriptOutputPanel } from "./script-output-panel";
 import { TerminalDrawer } from "./terminal-drawer";
 import {
@@ -738,24 +738,36 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
     if (typeof safe.script === "string" && safe.script.length > 0) {
       setScriptTextRef.current?.(safe.script);
     } else if (safe.strategyId) {
-      // Old presets (pre-8e393b6) have no embedded `script`. Fall back to
-      // reading the matching disk file under backtests/scripts/, so e.g.
-      // strategyId "range_break_v4" loads `range_break_v4.dsl`. Fire-and-
-      // forget — toast fires synchronously and the editor catches up when
-      // the fetch resolves. Editor stays unbound (no setActiveScriptName)
-      // to match the v2-preset behaviour where loaded scripts are
-      // in-memory until the user explicitly saves them to disk.
+      // Old presets (pre-8e393b6) have no embedded `script`. Two
+      // fallbacks, in order:
+      //   1. Disk file at backtests/scripts/<strategyId>.dsl — covers
+      //      strategies that were moved to disk (e.g. range_break_v4).
+      //   2. Built-in template registry by legacyStrategyId — covers
+      //      the original signal_v1 / signal_v2 / signal_v3 /
+      //      signal_v2_failed / failed_break_v1 presets that predate
+      //      the disk-file refactor.
+      // Editor stays unbound (no setActiveScriptName) to match the
+      // v2-preset behaviour. If both fail, silently no-op.
       const fileName = `${safe.strategyId}.dsl`;
+      const legacyId = safe.strategyId;
       void (async () => {
         try {
           const r = await fetch(`/api/scripts/${encodeURIComponent(fileName)}`);
-          if (!r.ok) return;
-          const data = await r.json();
-          if (typeof data?.content !== "string") return;
-          setScriptTextRef.current?.(data.content);
-          saveScriptDraft(data.content);
+          if (r.ok) {
+            const data = await r.json();
+            if (typeof data?.content === "string") {
+              setScriptTextRef.current?.(data.content);
+              saveScriptDraft(data.content);
+              return;
+            }
+          }
         } catch {
-          // Server unreachable / 404 — leave editor untouched.
+          // Network failure — fall through to template registry.
+        }
+        const tpl = findTemplateByLegacyId(legacyId);
+        if (tpl?.script) {
+          setScriptTextRef.current?.(tpl.script);
+          saveScriptDraft(tpl.script);
         }
       })();
     }
