@@ -2663,8 +2663,19 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
       kalmanArgsByLet?: Map<string, ScriptExpr[]>;
     } | null = null;
     let strategyOverrideKey: string | null = null;
+    // `Optimize.X.Y(...)` directives lifted from the strategy DSL — these
+    // need to merge into the overlay's `optimizeOverrides` alongside any
+    // line-based DSL specs so the engine's signal-time `varValues` map
+    // (built in runBacktestForSession from staticDefaults) and the
+    // per-trade online optimizer both see them. Empty when the strategy
+    // DSL has no Optimize directives or no script is applied.
+    let stratOptimizeSpecs: Record<
+      string,
+      import("@/lib/utils/script-expr").OptimizeSpec
+    > = {};
     if (appliedScriptText) {
       const parsedStrategy = parseStrategyScript(appliedScriptText);
+      stratOptimizeSpecs = parsedStrategy.optimizeSpecs;
       const hasSignals = parsedStrategy.stmts.some((s) => s.kind === "signal");
       if (hasSignals && parsedStrategy.errors.every((e) => e.severity !== "error")) {
         // Keep `let` bindings (referenced by signal expressions) and
@@ -2745,8 +2756,26 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
     // stays null and the engine falls into its byte-identical legacy
     // path. Seed is derived from script text + selected sessions so
     // re-runs on the same data produce identical optimization traces.
-    const hasOptimize =
-      scriptOptimizeOverrides && Object.keys(scriptOptimizeOverrides).length > 0;
+    // Merge line-based DSL Optimize specs (already in scriptOptimizeOverrides
+    // via parseBacktestScript) with strategy-DSL Optimize specs lifted
+    // above. Strategy DSL specs use the `__sopt_` and `__r` synthName
+    // prefixes; line-based DSL uses `__opt_` and `__r`. The two share the
+    // `__r` rev counter prefix space but for distinct ident names — the
+    // user's `var X` and `let X` would each generate `X__r0`, but we don't
+    // expect both to appear in the same script (the line-based parser
+    // skips strategy-DSL `let` lines and vice versa). On collision the
+    // line-based spec wins via spread order — explicit declaration beats
+    // inferred lift.
+    const mergedOptimizeOverrides:
+      | Record<string, import("@/lib/utils/script-expr").OptimizeSpec>
+      | undefined = (() => {
+      const out: Record<string, import("@/lib/utils/script-expr").OptimizeSpec> = {
+        ...stratOptimizeSpecs,
+        ...(scriptOptimizeOverrides ?? {}),
+      };
+      return Object.keys(out).length > 0 ? out : undefined;
+    })();
+    const hasOptimize = mergedOptimizeOverrides !== undefined;
     const hasFilterIfs = scriptFilterIfs.length > 0;
     const hasExitIfs = scriptExitIfs.length > 0;
     const overlayForRun: import("@/lib/utils/zone-simulator").ScriptOverlay | null =
@@ -2761,7 +2790,7 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
               label: p.label,
               expr: p.expr,
             })),
-            optimizeOverrides: scriptOptimizeOverrides ?? undefined,
+            optimizeOverrides: mergedOptimizeOverrides,
             optimizeAll: scriptOptimizeAll,
             warmup: scriptWarmup,
             filterIfs: hasFilterIfs ? scriptFilterIfs : undefined,
@@ -2815,10 +2844,12 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
             })),
             // Optimize overrides — keyed by path + source string. The
             // seed is also part of the key so changing the script text
-            // (which affects the seed) invalidates the cache too.
-            optimize: scriptOptimizeOverrides
+            // (which affects the seed) invalidates the cache too. We
+            // serialize the MERGED set (line-based + strategy DSL) so a
+            // change to either pipeline's specs invalidates the cache.
+            optimize: mergedOptimizeOverrides
               ? Object.fromEntries(
-                  Object.entries(scriptOptimizeOverrides).map(([k, spec]) => [
+                  Object.entries(mergedOptimizeOverrides).map(([k, spec]) => [
                     k,
                     `${spec.objective}|${spec.lookbackUnit}|${spec.lookback}`,
                   ])
@@ -3327,6 +3358,20 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
           parsedForBindings.kalmanArgsByLet,
         );
       }
+      // Strategy-DSL-lifted Optimize specs need to land in the same
+      // overlay the filter-sim path consumes; otherwise the per-trade
+      // online optimizer never sees them and any var (sidebar var or
+      // strategy-DSL `let X = Optimize.…`) referenced by filter.if/
+      // exit.if/rules.X reads as NaN.
+      if (Object.keys(parsedForBindings.optimizeSpecs).length > 0) {
+        overlayForFilterSim = {
+          ...overlayForFilterSim,
+          optimizeOverrides: {
+            ...parsedForBindings.optimizeSpecs,
+            ...(overlayForFilterSim.optimizeOverrides ?? {}),
+          },
+        };
+      }
     }
 
     // Precompute indicator series for the filtered zones whenever the
@@ -3568,6 +3613,18 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
           letBindings,
           parsedForBindings.kalmanArgsByLet,
         );
+      }
+      // Merge strategy-DSL Optimize specs into the filter-sim overlay so
+      // the online optimizer registers them. Same logic as the
+      // tradesAndOptimization memo above.
+      if (Object.keys(parsedForBindings.optimizeSpecs).length > 0) {
+        overlayForFilterSim = {
+          ...overlayForFilterSim,
+          optimizeOverrides: {
+            ...parsedForBindings.optimizeSpecs,
+            ...(overlayForFilterSim.optimizeOverrides ?? {}),
+          },
+        };
       }
     }
     if (

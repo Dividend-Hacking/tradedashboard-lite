@@ -1907,6 +1907,31 @@ export function runBacktestForSession(args: {
       : { ticks: sessionTicks!, barTickRanges: sessionTickRanges! }
     : undefined;
 
+  // Collect the static-default values from any `Optimize.X.Y(...) default
+  // <num>` directives the strategy DSL declared (lifted into
+  // `effectiveOverlay.optimizeOverrides` by the dashboard's run memo).
+  // This is the SAME `staticDefaults` map the per-trade online optimizer
+  // builds in script-online-optimizer.ts:242-249; we mirror it here so
+  // signal-generation-time references to those synthName idents resolve to
+  // a finite number instead of NaN. Today this is the ONLY value plumbed
+  // through to signal generation — per-signal TPE feedback is per-trade
+  // only — so a script's `Optimize…` threshold inside a signal expression
+  // effectively behaves like a constant equal to its `default` literal.
+  // Tracking-issue note: full per-signal online optimization would require
+  // generating signals one at a time with TPE between each, a substantial
+  // refactor of this function; out of scope for the current change.
+  let signalVarValues: Map<string, number> | undefined;
+  if (effectiveOverlay?.optimizeOverrides) {
+    for (const path of Object.keys(effectiveOverlay.optimizeOverrides)) {
+      if (!path.startsWith("var.")) continue;
+      const spec = effectiveOverlay.optimizeOverrides[path];
+      if (spec.kind !== "optimize-numeric") continue;
+      if (spec.defaultValue === undefined) continue;
+      signalVarValues ??= new Map();
+      signalVarValues.set(path.slice("var.".length), spec.defaultValue);
+    }
+  }
+
   const rawSignals = evaluateStrategyScript({
     stmts: strategyOverride.stmts,
     paramOverrides: strategyOverride.paramOverrides,
@@ -1915,6 +1940,7 @@ export function runBacktestForSession(args: {
     // across the prior history so ATR/ADX are warm by index `warmupCount`.
     minBarIndex: warmupCount,
     tickCtx: evalTickCtx,
+    varValues: signalVarValues,
   }).signals;
 
   // Rebase signal indices back to session-local space so downstream zone

@@ -47,7 +47,7 @@ import {
   compile as compileExpr,
   parseNumericValue,
   parseEnumValue,
-  parseOptimizeSpec,
+  scanInlineOptimize,
   evaluate as evaluateExpr,
   applyBindings,
   referencedSymbols,
@@ -2402,148 +2402,26 @@ function parensWrapEntireString(text: string): boolean {
   return depth === 0;
 }
 
-/** Find the closing `"` of a double-quoted string starting at index
- *  `start`. Honors `\"` and `\\` escape sequences (the only ones the
- *  rest of the parser handles). Returns -1 if no terminator. */
-function findStringEnd(text: string, start: number): number {
-  for (let i = start + 1; i < text.length; i++) {
-    if (text[i] === '"' && text[i - 1] !== "\\") return i;
-  }
-  return -1;
-}
-
-/** Scan `text` for inline `Optimize.<Obj>.<Unit>(...)` calls and rewrite
- *  each into a synthetic var ident (`__opt_<n>__`). Each lifted spec
- *  lands in `config.optimizeOverrides["var.<name>"]` so the online
- *  optimizer drives it like any explicit `var <name> = ...` declaration.
+/** Lift inline `Optimize.<Obj>.<Unit>(...)` calls in expression text into
+ *  synthetic `__opt_<n>__` var idents. Each lifted spec lands in
+ *  `config.optimizeOverrides["var.<name>"]` so the online optimizer drives
+ *  it like any explicit `var <name> = ...` declaration.
  *
- *  Why lift at parse time: the expression tokenizer's identifier regex
- *  doesn't allow `.`, so `Optimize.DailyEV.trades(...)` is a tokenization
- *  error inside any expression. By rewriting it to a clean ident BEFORE
- *  reaching compileExpr, the user gets to write inline Optimize in
- *  filter.if conditions without first declaring a var on its own line.
- *
- *  Lifting is paren-aware (commas inside Optimize args don't terminate
- *  the call) and string-aware (an `Optimize.` substring inside a quoted
- *  print label is left alone). Only fires on `Optimize.` preceded by a
- *  non-identifier char so `MyOptimize.X` won't false-match. */
+ *  Thin wrapper around `scanInlineOptimize` — the shared scanner does the
+ *  paren/string walking and trailing-clause consumption, this caller owns
+ *  the naming scheme and config registration so the strategy-evaluator can
+ *  reuse the scanner with a different prefix (`__sopt_<n>__`) and storage. */
 function liftInlineOptimize(
   text: string,
   config: PartialBacktestConfig,
   counter: { n: number }
 ): { ok: true; text: string } | { ok: false; error: string } {
-  let out = "";
-  let i = 0;
-  while (i < text.length) {
-    // Skip over string literals so quoted text doesn't get scanned.
-    if (text[i] === '"') {
-      const end = findStringEnd(text, i);
-      if (end < 0) {
-        // Unterminated string — let the downstream parser flag it. Pass
-        // through verbatim.
-        out += text.slice(i);
-        break;
-      }
-      out += text.slice(i, end + 1);
-      i = end + 1;
-      continue;
-    }
-    // Match `Optimize.` only at an identifier boundary (preceding char
-    // is NOT an ident char). Case-insensitive — the user might type
-    // `optimize.dailyev.trades` and parseOptimizeSpec already tolerates
-    // lowercase.
-    const atIdentStart = i === 0 || !/[A-Za-z0-9_]/.test(text[i - 1]);
-    if (
-      atIdentStart &&
-      i + 9 <= text.length &&
-      text.slice(i, i + 9).toLowerCase() === "optimize."
-    ) {
-      // Walk to the opening paren.
-      let j = i;
-      while (j < text.length && text[j] !== "(") j++;
-      if (j === text.length) {
-        return {
-          ok: false,
-          error: `inline Optimize at position ${i}: expected "(" after "Optimize.<Obj>.<Unit>"`,
-        };
-      }
-      // Balance parens (ignoring `(` `)` inside string literals).
-      let depth = 1;
-      let inStr = false;
-      let k = j + 1;
-      while (k < text.length && depth > 0) {
-        const c = text[k];
-        if (c === '"' && text[k - 1] !== "\\") inStr = !inStr;
-        if (!inStr) {
-          if (c === "(") depth++;
-          else if (c === ")") depth--;
-        }
-        k++;
-      }
-      if (depth !== 0) {
-        return {
-          ok: false,
-          error: `inline Optimize at position ${i}: unbalanced parens`,
-        };
-      }
-      // Extend the captured slice over any trailing `smooth <N>` /
-      // `smooth(<N>)` / `default <num>` / `default(<num>)` clauses so the
-      // whole Optimize directive — including its modifiers — is replaced
-      // by the synthetic ident. Otherwise modifiers are left dangling in
-      // the expression text and the downstream tokenizer chokes on them
-      // ("unexpected trailing tokens after expression"). Either order is
-      // accepted, up to two passes — matches parseOptimizeSpec's own
-      // trailing-clause handling. The numeric-literal patterns mirror
-      // parseOptimizeSpec exactly so anything that parser would accept
-      // here gets swallowed up cleanly.
-      const SMOOTH_PAREN = /^\s*smooth\s*\(\s*\d+\s*\)/i;
-      const SMOOTH_BARE = /^\s*smooth\s+\d+/i;
-      const DEFAULT_PAREN = /^\s*default\s*\(\s*-?\d+\.?\d*(?:[eE][+-]?\d+)?\s*\)/i;
-      const DEFAULT_BARE = /^\s*default\s+-?\d+\.?\d*(?:[eE][+-]?\d+)?/i;
-      let sawSmooth = false;
-      let sawDefault = false;
-      for (let pass = 0; pass < 2; pass++) {
-        const tail = text.slice(k);
-        if (!sawSmooth) {
-          const m = tail.match(SMOOTH_PAREN) || tail.match(SMOOTH_BARE);
-          if (m) {
-            k += m[0].length;
-            sawSmooth = true;
-            continue;
-          }
-        }
-        if (!sawDefault) {
-          const m = tail.match(DEFAULT_PAREN) || tail.match(DEFAULT_BARE);
-          if (m) {
-            k += m[0].length;
-            sawDefault = true;
-            continue;
-          }
-        }
-        break;
-      }
-      const slice = text.slice(i, k);
-      const r = parseOptimizeSpec(slice);
-      if (!r.ok) {
-        return { ok: false, error: `inline Optimize: ${r.error}` };
-      }
-      if (r.spec.kind === "optimize-categorical") {
-        return {
-          ok: false,
-          error: `inline Optimize: categorical form (option list) isn't supported inside expressions — only numeric Optimize.X.Y(lookback, min, max[, step])`,
-        };
-      }
-      const name = `__opt_${counter.n++}__`;
-      config.optimizeOverrides ??= {};
-      config.optimizeOverrides[`var.${name}`] = r.spec;
-      out += name;
-      i = k;
-    } else {
-      out += text[i];
-      i++;
-    }
-  }
-  return { ok: true, text: out };
+  return scanInlineOptimize(text, (spec) => {
+    const name = `__opt_${counter.n++}__`;
+    config.optimizeOverrides ??= {};
+    config.optimizeOverrides[`var.${name}`] = spec;
+    return name;
+  });
 }
 
 /** Parse the RHS of a `filter.if = ...` line. Two shapes:

@@ -66,6 +66,9 @@ import {
   ZERO_ARG_INDICATORS,
   FRACTIONAL_ARG_INDICATORS,
   type TickContext,
+  parseOptimizeSpec,
+  scanInlineOptimize,
+  type OptimizeSpec,
 } from "./script-expr";
 import { ProfileCache } from "@/lib/indicators/tick-indicators";
 import type { IndicatorBar } from "@/lib/indicators/calculations";
@@ -109,6 +112,20 @@ export interface ParsedStrategyScript {
    *  dotted ident `"kf.x"` that resolves to NaN at runtime and silently
    *  kills every exit/filter/print that depends on it. */
   kalmanArgsByLet: Map<string, Expr[]>;
+  /** `Optimize.X.Y(...)` directives lifted from the strategy DSL.
+   *  Two flavors:
+   *    - Bare RHS (`let X = Optimize.…`): synthetic name `<X>__r<rev>`,
+   *      bindings.set(X, ident(synthName)) so later references rewrite
+   *      cleanly. Mirrors `var X = Optimize.…` in the line-based DSL.
+   *    - Inline (anywhere else inside a `let`/`signal.*.if`/`path = expr`
+   *      RHS): synthetic name `__sopt_<n>__`, splice-replaces the call.
+   *  Keys are full overlay paths (`var.<synthName>`) so the engine can
+   *  merge this map directly into `overlay.optimizeOverrides` — the
+   *  online optimizer then drives each spec like any line-based
+   *  `var <name> = Optimize.…` declaration. The runtime ident resolver
+   *  in `evaluateStrategyScript` (`ctx.varValues`) translates the synthName
+   *  back into the optimizer's per-signal numeric pick. */
+  optimizeSpecs: Record<string, OptimizeSpec>;
 }
 
 // Reserved binding names that conflict with built-in idents — refuse `let`
@@ -136,6 +153,41 @@ export function parseStrategyScript(text: string): ParsedStrategyScript {
   const errors: ParseError[] = [];
   const stmts: Stmt[] = [];
 
+  // Optimize directive accumulator. Two synthName flavors share this map:
+  //   - `<name>__r<rev>` for bare `let <name> = Optimize.…` (so two
+  //     redeclarations of the same name become independent optimizer
+  //     params, matching `var X = Optimize.…` in the line-based DSL).
+  //   - `__sopt_<n>__` for inline `Optimize.…` calls anywhere in an
+  //     expression RHS. The `__sopt_` prefix is distinct from the
+  //     line-based parser's `__opt_` prefix so the two pipelines never
+  //     clash on a script that uses both DSLs.
+  // The full overlay path (`var.<synthName>`) is the map key so the
+  // engine can merge directly into `overlay.optimizeOverrides`.
+  const optimizeSpecs: Record<string, OptimizeSpec> = {};
+  const inlineOptCounter = { n: 0 };
+  let optVarRev = 0;
+
+  // Shared lift helper — runs the inline `Optimize.X.Y(…)` scanner over an
+  // RHS string and registers each lifted numeric spec under a fresh
+  // `__sopt_<n>__` synth name. Returns the rewritten text or a parse
+  // error message tied to the line. Used by every line type below.
+  function liftRhs(
+    rhs: string,
+    line: number,
+    label: string
+  ): { ok: true; text: string } | { ok: false } {
+    const r = scanInlineOptimize(rhs, (spec) => {
+      const synth = `__sopt_${inlineOptCounter.n++}__`;
+      optimizeSpecs[`var.${synth}`] = spec;
+      return synth;
+    });
+    if (!r.ok) {
+      errors.push({ line, message: `${label}: ${r.error}`, severity: "error" });
+      return { ok: false };
+    }
+    return { ok: true, text: r.text };
+  }
+
   // 1. Pre-pass: combine continuation lines into logical statements.
   const logicalLines = combineContinuationLines(text);
 
@@ -156,7 +208,46 @@ export function parseStrategyScript(text: string): ParsedStrategyScript {
         });
         continue;
       }
-      const c = compile(rhs);
+      // Bare `let X = Optimize.…` — register the spec as an optimizer-
+      // driven var and bind the let to the synthName. Mirrors the
+      // `var X = Optimize.…` path in backtest-script.ts. Detected by an
+      // exact `Optimize.` prefix on the trimmed RHS so `let X = ATR(…) +
+      // Optimize.…` falls through to the inline-lift branch instead.
+      const trimmedRhs = rhs.trim();
+      if (/^Optimize\./i.test(trimmedRhs)) {
+        const r = parseOptimizeSpec(trimmedRhs);
+        if (!r.ok) {
+          errors.push({ line: ll.line, message: `let ${name}: ${r.error}`, severity: "error" });
+          continue;
+        }
+        if (r.spec.kind === "optimize-categorical") {
+          errors.push({
+            line: ll.line,
+            message: `let ${name}: categorical Optimize on a let RHS isn't supported. Use Optimize.X.Y(lookback, min, max[, step]).`,
+            severity: "error",
+          });
+          continue;
+        }
+        const synthName = `${name}__r${optVarRev++}`;
+        optimizeSpecs[`var.${synthName}`] = r.spec;
+        // Push a plain `let` stmt whose body is just the synthName ident.
+        // The downstream let-inline pass at step 3 then propagates the
+        // substitution into every subsequent reference, exactly the way
+        // a literal-bound let works.
+        stmts.push({
+          kind: "let",
+          name,
+          expr: { kind: "ident", name: synthName },
+          line: ll.line,
+          source: trimmedRhs,
+        });
+        continue;
+      }
+      // Otherwise: lift any inline Optimize calls in the RHS first, then
+      // compile the rewritten text.
+      const lifted = liftRhs(rhs, ll.line, `let ${name}`);
+      if (!lifted.ok) continue;
+      const c = compile(lifted.text);
       if (!c.ok) {
         errors.push({ line: ll.line, message: `let ${name}: ${c.error}`, severity: "error" });
         continue;
@@ -170,7 +261,9 @@ export function parseStrategyScript(text: string): ParsedStrategyScript {
     if (sigMatch) {
       const [, sideRaw, rhs] = sigMatch;
       const side = sideRaw as "long" | "short";
-      const c = compile(rhs);
+      const lifted = liftRhs(rhs, ll.line, `signal.${side}.if`);
+      if (!lifted.ok) continue;
+      const c = compile(lifted.text);
       if (!c.ok) {
         errors.push({
           line: ll.line,
@@ -211,7 +304,23 @@ export function parseStrategyScript(text: string): ParsedStrategyScript {
       });
       continue;
     }
-    const c = compile(rhs);
+    // Lift inline Optimize before compiling. If the lift fails we still
+    // skip silently below (the line-based DSL parser may handle a
+    // 3-arg `filter.if = (cond, , )` shape that isn't a single Expr),
+    // BUT we surface the lift error because it's a real Optimize syntax
+    // problem the user needs to see.
+    const lifted = scanInlineOptimize(rhs, (spec) => {
+      const synth = `__sopt_${inlineOptCounter.n++}__`;
+      optimizeSpecs[`var.${synth}`] = spec;
+      return synth;
+    });
+    if (!lifted.ok) {
+      // Optimize syntax error — surface as a real error rather than
+      // silently dropping the line.
+      errors.push({ line: ll.line, message: `${path}: ${lifted.error}`, severity: "error" });
+      continue;
+    }
+    const c = compile(lifted.text);
     if (!c.ok) {
       // Generic `path = expr` lines that don't compile as strategy
       // expressions — e.g. `filter.if = (cond, , )` whose 3-arg form is
@@ -295,7 +404,7 @@ export function parseStrategyScript(text: string): ParsedStrategyScript {
     });
   }
 
-  return { stmts: rewritten, errors, paramRefs, kalmanArgsByLet };
+  return { stmts: rewritten, errors, paramRefs, kalmanArgsByLet, optimizeSpecs };
 }
 
 /** Encode KALMAN_OU's argument list — `(source, calib, trust)` — into the
@@ -557,6 +666,13 @@ function walkParamsRefs(expr: Expr, visit: (name: string) => void): void {
 
 const SERIES_SENTINEL = Symbol("strategy-evaluator-series");
 
+/** Module-level empty `varValues` map for ctx construction when the caller
+ *  doesn't supply one. Sharing one frozen instance avoids allocating a
+ *  fresh `new Map()` per evaluateStrategyScript call (the engine spins
+ *  this up once per backtest, so the saving is negligible — but the type
+ *  signature stays uniform: `ctx.varValues` is always `ReadonlyMap`). */
+const EMPTY_VAR_VALUES: ReadonlyMap<string, number> = new Map();
+
 interface SeriesHandle {
   __series: typeof SERIES_SENTINEL;
   /** Value at (current bar - k). For k=0 returns the series at the
@@ -583,6 +699,15 @@ interface BarEvalCtx {
   bars: ReplayBar[];
   barIndex: number;
   params: Record<string, number>;
+  /** Optimizer-driven synthetic vars (`__sopt_<n>__`, `<name>__r<rev>`).
+   *  Populated by the engine via `varValuesFrom()` from the online
+   *  optimizer's chosen point; pre-warmup it falls back to each spec's
+   *  `default <num>` literal (also via the same machinery). Empty Map
+   *  when the script declares no `Optimize.X.Y(...)` directives. The
+   *  resolver looks here BEFORE bar fields / params / let bindings so a
+   *  synthName never collides with a real ident — synthNames have a
+   *  `__r` or `__sopt_` infix that no real script identifier uses. */
+  varValues: ReadonlyMap<string, number>;
   firingsLong: number[];
   firingsShort: number[];
   /** Lazy-evaluated `let` bindings — keyed by name. Cleared at the start
@@ -630,6 +755,17 @@ export interface EvaluateOptions {
    *  `(sessionTicks, sessionTickRanges)` from `runBacktestForSession`
    *  satisfies this directly when `sessionTickRanges.length === bars.length * 2`. */
   tickCtx?: TickContext;
+  /** Optimizer-driven synthetic vars (`__sopt_<n>__`, `<name>__r<rev>`)
+   *  resolved to numeric values per signal. Empty/omitted when the
+   *  script has no `Optimize.X.Y(...)` directives, when the optimizer
+   *  is disabled, or when this evaluator is being used outside the
+   *  online-optimizer loop (e.g. built-in strategy templates). The
+   *  online optimizer in `script-online-optimizer.ts` produces this map
+   *  via `varValuesFrom(result.params)` (post-warmup) or
+   *  `preWarmupVarValues()` (pre-warmup, returns each spec's
+   *  `defaultValue` so signals can still fire before the optimizer's
+   *  lookback window has filled). */
+  varValues?: ReadonlyMap<string, number>;
 }
 
 export interface AssignOverlay {
@@ -732,6 +868,7 @@ export function evaluateStrategyScript(opts: EvaluateOptions): EvaluateResult {
     bars,
     barIndex: 0,
     params: paramOverrides,
+    varValues: opts.varValues ?? EMPTY_VAR_VALUES,
     firingsLong: [],
     firingsShort: [],
     letCache: new Map(),
@@ -969,6 +1106,19 @@ function evalValue(expr: Expr, ctx: BarEvalCtx): number | SeriesHandle {
 }
 
 function resolveIdent(name: string, ctx: BarEvalCtx): number | SeriesHandle {
+  // 0. Optimizer-driven synthetic vars (`__sopt_<n>__`, `<name>__r<rev>`).
+  //    These are minted by `parseStrategyScript` whenever a script uses
+  //    `Optimize.X.Y(...)` and resolved per-signal by the online optimizer
+  //    via `varValuesFrom()` (post-warmup) or `preWarmupVarValues()`
+  //    (pre-warmup → each spec's `default <num>` literal). Missing → NaN
+  //    propagates through `cross_up`/`cross_down` and the signal silently
+  //    fails to fire — same fail-closed discipline the entry-context
+  //    evaluator uses for the same kinds of synthName.
+  //    Checked FIRST so the cheap Map lookup short-circuits before more
+  //    expensive branches; safe because synthName infixes (`__r`,
+  //    `__sopt_`) don't collide with any legal user identifier.
+  const synthV = ctx.varValues.get(name);
+  if (synthV !== undefined) return synthV;
   // 1. params.X
   if (name.startsWith("params.")) {
     const key = name.slice("params.".length);

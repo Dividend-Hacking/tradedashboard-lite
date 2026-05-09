@@ -3656,6 +3656,112 @@ function splitArgs(text: string): string[] {
   return out;
 }
 
+/** Scan `text` for inline `Optimize.<Obj>.<Unit>(...)` directives and
+ *  rewrite each into a synthetic ident chosen by the caller. The caller's
+ *  `registerSpec` callback receives the parsed numeric OptimizeSpec and
+ *  returns the synthetic ident string to splice in — so the caller owns
+ *  naming and storage (line-based DSL uses `__opt_<n>__` + the partial
+ *  config; strategy DSL uses `__sopt_<n>__` + a parser-local map). The
+ *  two prefixes never collide because each scan uses an independent
+ *  counter.
+ *
+ *  Lifting is paren-aware (commas inside Optimize args don't terminate
+ *  the call) and string-aware (an `Optimize.` substring inside a quoted
+ *  print label is left alone). Only fires on `Optimize.` preceded by a
+ *  non-identifier char so `MyOptimize.X` won't false-match. Trailing
+ *  `default <num>` and `smooth <N>` clauses are consumed as part of the
+ *  lifted slice — anything `parseOptimizeSpec` would accept is captured. */
+export function scanInlineOptimize(
+  text: string,
+  registerSpec: (spec: OptimizeSpec) => string
+): { ok: true; text: string } | { ok: false; error: string } {
+  let out = "";
+  let i = 0;
+  while (i < text.length) {
+    if (text[i] === '"') {
+      // Skip over string literals so quoted text doesn't get scanned.
+      // Honors `\"` escapes (the only ones the rest of the parser handles).
+      let end = -1;
+      for (let j = i + 1; j < text.length; j++) {
+        if (text[j] === '"' && text[j - 1] !== "\\") { end = j; break; }
+      }
+      if (end < 0) {
+        // Unterminated — let the downstream parser flag it. Pass through.
+        out += text.slice(i);
+        break;
+      }
+      out += text.slice(i, end + 1);
+      i = end + 1;
+      continue;
+    }
+    const atIdentStart = i === 0 || !/[A-Za-z0-9_]/.test(text[i - 1]);
+    if (
+      atIdentStart &&
+      i + 9 <= text.length &&
+      text.slice(i, i + 9).toLowerCase() === "optimize."
+    ) {
+      let j = i;
+      while (j < text.length && text[j] !== "(") j++;
+      if (j === text.length) {
+        return {
+          ok: false,
+          error: `inline Optimize at position ${i}: expected "(" after "Optimize.<Obj>.<Unit>"`,
+        };
+      }
+      let depth = 1;
+      let inStr = false;
+      let k = j + 1;
+      while (k < text.length && depth > 0) {
+        const c = text[k];
+        if (c === '"' && text[k - 1] !== "\\") inStr = !inStr;
+        if (!inStr) {
+          if (c === "(") depth++;
+          else if (c === ")") depth--;
+        }
+        k++;
+      }
+      if (depth !== 0) {
+        return { ok: false, error: `inline Optimize at position ${i}: unbalanced parens` };
+      }
+      const SMOOTH_PAREN = /^\s*smooth\s*\(\s*\d+\s*\)/i;
+      const SMOOTH_BARE = /^\s*smooth\s+\d+/i;
+      const DEFAULT_PAREN = /^\s*default\s*\(\s*-?\d+\.?\d*(?:[eE][+-]?\d+)?\s*\)/i;
+      const DEFAULT_BARE = /^\s*default\s+-?\d+\.?\d*(?:[eE][+-]?\d+)?/i;
+      let sawSmooth = false;
+      let sawDefault = false;
+      for (let pass = 0; pass < 2; pass++) {
+        const tail = text.slice(k);
+        if (!sawSmooth) {
+          const m = tail.match(SMOOTH_PAREN) || tail.match(SMOOTH_BARE);
+          if (m) { k += m[0].length; sawSmooth = true; continue; }
+        }
+        if (!sawDefault) {
+          const m = tail.match(DEFAULT_PAREN) || tail.match(DEFAULT_BARE);
+          if (m) { k += m[0].length; sawDefault = true; continue; }
+        }
+        break;
+      }
+      const slice = text.slice(i, k);
+      const r = parseOptimizeSpec(slice);
+      if (!r.ok) {
+        return { ok: false, error: `inline Optimize: ${r.error}` };
+      }
+      if (r.spec.kind === "optimize-categorical") {
+        return {
+          ok: false,
+          error: `inline Optimize: categorical form (option list) isn't supported inside expressions — only numeric Optimize.X.Y(lookback, min, max[, step])`,
+        };
+      }
+      out += registerSpec(r.spec);
+      i = k;
+    } else {
+      out += text[i];
+      i++;
+    }
+  }
+  return { ok: true, text: out };
+}
+
 /** Parse a NumericValue from RHS text — literal-first, then Optimize,
  *  then expression. Public so the script parser can call it. */
 export function parseNumericValue(text: string): { ok: true; value: NumericValue } | { ok: false; error: string } {
