@@ -139,6 +139,12 @@ import {
   vwapTickSeries,
   type TickContext,
 } from "@/lib/indicators/tick-indicators";
+import {
+  KalmanOuCache,
+  KALMAN_SOURCE_CODES,
+} from "@/lib/indicators/kalman-ou";
+
+export { KALMAN_SOURCE_CODES } from "@/lib/indicators/kalman-ou";
 
 export type { TickContext } from "@/lib/indicators/tick-indicators";
 
@@ -938,6 +944,12 @@ export const FRACTIONAL_ARG_INDICATORS = new Set<string>([
   "PSAR",
   // Volume-profile area defaults to 0.7 (70% of total volume).
   "POC", "VAH", "VAL", "VA_width", "dist_to_POC",
+  // KALMAN_OU's `trust` arg is a fraction in (0,1); rounding would
+  // collapse it to 0 or 1 and break the filter. The integer-rounding
+  // bypass keeps source / calib / trust all unmodified — source codes
+  // are tiny ints that survive verbatim, calib is rounded inside
+  // `kalmanOuBundle` itself (defense-in-depth).
+  "KALMAN_OU_x", "KALMAN_OU_mu", "KALMAN_OU_sigma", "KALMAN_OU_phi", "KALMAN_OU_P",
 ]);
 
 /** Indicators that require the per-zone TickContext to compute. When
@@ -1057,6 +1069,22 @@ export function applyArgDefaults(name: string, args: number[]): number[] {
       return args;
     case "large_trade_count":
       return args;
+    // KALMAN_OU sub-indicators — args are [source, calib, trust] with
+    // sensible defaults. `source` defaults to 1 (close); `calib` defaults
+    // to 60 bars; `trust` defaults to 0.5. The strategy parser usually
+    // fills the source slot before this gets called (so users typically
+    // see all three present), but the defaults make the bare-call form
+    // `KALMAN_OU_x()` a meaningful sanity check.
+    case "KALMAN_OU_x":
+    case "KALMAN_OU_mu":
+    case "KALMAN_OU_sigma":
+    case "KALMAN_OU_phi":
+    case "KALMAN_OU_P": {
+      const source = args.length >= 1 ? args[0] : 1;
+      const calib = args.length >= 2 ? args[1] : 60;
+      const trust = args.length >= 3 ? args[2] : 0.5;
+      return [source, calib, trust];
+    }
     default:
       return args;
   }
@@ -1305,6 +1333,20 @@ export function indicatorKeyForCall(name: string, args: number[]): string | null
       return `LARGECNT:${args[0]}:${args[1]}`;
     case "vwap_tick":
       return `VWAPTICK:${p}`;
+    // Kalman-OU sub-indicators — keyed by (field, source, calib, trust)
+    // so all five fields against the same parameter tuple stay distinct
+    // in the per-zone series cache, while sharing the underlying bundle
+    // build via `KalmanOuCache`.
+    case "KALMAN_OU_x":
+      return `KOU_X:${args[0]}:${args[1]}:${args[2]}`;
+    case "KALMAN_OU_mu":
+      return `KOU_MU:${args[0]}:${args[1]}:${args[2]}`;
+    case "KALMAN_OU_sigma":
+      return `KOU_SIG:${args[0]}:${args[1]}:${args[2]}`;
+    case "KALMAN_OU_phi":
+      return `KOU_PHI:${args[0]}:${args[1]}:${args[2]}`;
+    case "KALMAN_OU_P":
+      return `KOU_P:${args[0]}:${args[1]}:${args[2]}`;
     default:
       return null;
   }
@@ -1342,6 +1384,12 @@ const KNOWN_INDICATOR_NAMES = new Set<string>([
   // Tick microstructure.
   "trades_at_bid", "trades_at_ask", "tick_imbalance", "tick_count",
   "mean_trade_size", "large_trade_count", "vwap_tick",
+  // Kalman-filtered Ornstein-Uhlenbeck — exposed as five sibling names,
+  // one per output field. The strategy parser rewrites `let kf =
+  // KALMAN_OU(close, calib, trust)` + `kf.x` references into direct
+  // calls to these names so member-access syntax just works without
+  // the AST learning a new node kind. See kalman-ou.ts for the model.
+  "KALMAN_OU_x", "KALMAN_OU_mu", "KALMAN_OU_sigma", "KALMAN_OU_phi", "KALMAN_OU_P",
 ]);
 
 /** True when `name` is a recognized indicator that `computeIndicatorSeries`
@@ -3636,6 +3684,17 @@ export function maxIndicatorPeriod(exprs: Iterable<Expr>): number {
     if (r.name === "UO" && Number.isFinite(r.args[2])) {
       effPeriod = r.args[2];
     }
+    // KALMAN_OU's args are [source, calib, trust] — args[0] is the
+    // source code (1..7), not a period. The calibration window
+    // (args[1]) is the warmup driver: the filter emits NaN until bar
+    // `calib - 1`, so we need at least that many pre-entry bars.
+    if (
+      r.name === "KALMAN_OU_x" || r.name === "KALMAN_OU_mu" ||
+      r.name === "KALMAN_OU_sigma" || r.name === "KALMAN_OU_phi" ||
+      r.name === "KALMAN_OU_P"
+    ) {
+      effPeriod = Number.isFinite(r.args[1]) ? r.args[1] : 60;
+    }
     const needed = WILDER_FAMILY.has(r.name) ? effPeriod * 2 : effPeriod;
     if (needed > max) max = needed;
   }
@@ -3663,7 +3722,8 @@ export function computeIndicatorSeries(
   args: number[],
   bars: IndicatorBar[],
   tickCtx?: TickContext,
-  profileCache?: ProfileCache | null
+  profileCache?: ProfileCache | null,
+  kalmanCache?: KalmanOuCache | null,
 ): number[] | null {
   switch (name) {
     // Existing (single-period).
@@ -3912,6 +3972,29 @@ export function computeIndicatorSeries(
         ? vwapTickSeries(bars.length, tickCtx, args[0])
         : new Array(bars.length).fill(NaN);
 
+    // ─── Kalman-filtered Ornstein-Uhlenbeck (5 sibling fields) ──────
+    // The cache is shared per-zone so all 5 field accesses on the same
+    // (source, calib, trust) tuple run the filter exactly once. Falls
+    // back to a one-off cache when called outside a precompute (e.g.
+    // strategy-evaluator's lazy per-bar dispatch) so single-field
+    // strategies still work.
+    case "KALMAN_OU_x":
+    case "KALMAN_OU_mu":
+    case "KALMAN_OU_sigma":
+    case "KALMAN_OU_phi":
+    case "KALMAN_OU_P": {
+      const cache = kalmanCache ?? new KalmanOuCache(bars);
+      const bundle = cache.get(args[0], args[1], args[2]);
+      switch (name) {
+        case "KALMAN_OU_x":     return bundle.x;
+        case "KALMAN_OU_mu":    return bundle.mu;
+        case "KALMAN_OU_sigma": return bundle.sigma;
+        case "KALMAN_OU_phi":   return bundle.phi;
+        case "KALMAN_OU_P":     return bundle.P;
+      }
+      return null;
+    }
+
     default:
       return null;
   }
@@ -3960,6 +4043,11 @@ export function precomputeIndicators(
     const profileCache = tickCtx
       ? new ProfileCache(combined.length, tickCtx)
       : null;
+    // Per-zone Kalman bundle cache — KALMAN_OU_x/mu/sigma/phi/P over the
+    // same (source, calib, trust) reuse one filter pass via this cache.
+    // Always created (no tick dependency); the bundle math runs on plain
+    // OHLCV bars.
+    const kalmanCache = new KalmanOuCache(combined);
     for (const r of required) {
       const series = computeIndicatorSeries(
         r.name,
@@ -3967,6 +4055,7 @@ export function precomputeIndicators(
         combined,
         tickCtx,
         profileCache,
+        kalmanCache,
       );
       if (series) perZone.set(r.key, offset > 0 ? series.slice(offset) : series);
     }

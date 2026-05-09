@@ -69,6 +69,7 @@ import {
 } from "./script-expr";
 import { ProfileCache } from "@/lib/indicators/tick-indicators";
 import type { IndicatorBar } from "@/lib/indicators/calculations";
+import { KalmanOuCache, KALMAN_SOURCE_CODES } from "@/lib/indicators/kalman-ou";
 
 // ─── BacktestSignal — output shape preserved from the legacy engine ────────
 
@@ -227,11 +228,54 @@ export function parseStrategyScript(text: string): ParsedStrategyScript {
     }
   }
 
+  // 3b. Kalman-OU member-access rewrite. The DSL has no native `obj.field`
+  //     access, but the tokenizer captures `kf.x` as a single dotted
+  //     ident. We exploit that: when `let kf = KALMAN_OU(source, calib,
+  //     trust)` is bound, walk every subsequent expression and replace
+  //     ident `kf.<field>` with a direct call to `KALMAN_OU_<field>`
+  //     against the encoded args. The five sibling indicators share a
+  //     per-zone `KalmanOuCache` so this stays a single Kalman pass per
+  //     parameter tuple even when the strategy reads several fields.
+  //
+  //     The substitution runs AFTER the let-inline loop so any args that
+  //     reference earlier lets (e.g. `KALMAN_OU(close, calib_param, ...)`)
+  //     have already been resolved to literals; that means the source
+  //     ident and numeric args we encode here are stable.
+  const kalmanArgsByLet = new Map<string, Expr[]>();
+  for (const s of flat) {
+    if (
+      s.kind === "let" &&
+      s.expr.kind === "call" &&
+      s.expr.name === "KALMAN_OU"
+    ) {
+      const encoded = encodeKalmanArgs(s.expr.args);
+      if (!encoded) {
+        errors.push({
+          line: s.line,
+          message: `let ${s.name}: KALMAN_OU expects (source, calib?, trust?) — source must be one of close/open/high/low/typical/median_price/weighted_close, calib > 0, trust in (0,1)`,
+          severity: "error",
+        });
+        continue;
+      }
+      kalmanArgsByLet.set(s.name, encoded);
+    }
+  }
+  const rewritten: Stmt[] = [];
+  for (const s of flat) {
+    // Strip the `let kf = KALMAN_OU(…)` stmts themselves — `kf` only ever
+    // appears in field-access form (`kf.x`), and the rewrite below
+    // synthesizes calls directly. Leaving the original would make `kf`
+    // resolve to a bare `KALMAN_OU(…)` call which has no series and just
+    // returns NaN; cleaner to drop it.
+    if (s.kind === "let" && kalmanArgsByLet.has(s.name)) continue;
+    rewritten.push({ ...s, expr: rewriteKalmanRefs(s.expr, kalmanArgsByLet) });
+  }
+
   // 4. Walk every stmt's AST collecting params.X references (deduped,
   //    ordered by first appearance).
   const paramRefs: string[] = [];
   const seen = new Set<string>();
-  for (const s of flat) {
+  for (const s of rewritten) {
     walkParamsRefs(s.expr, (name) => {
       if (!seen.has(name)) {
         seen.add(name);
@@ -240,7 +284,114 @@ export function parseStrategyScript(text: string): ParsedStrategyScript {
     });
   }
 
-  return { stmts: flat, errors, paramRefs };
+  return { stmts: rewritten, errors, paramRefs };
+}
+
+/** Encode KALMAN_OU's argument list — `(source, calib, trust)` — into the
+ *  numeric tuple the indicator dispatch expects. The first arg is a bare
+ *  ident naming a price source; we map it to the small int defined in
+ *  `KALMAN_SOURCE_CODES`. The calibration window and trust factor are
+ *  ordinary numeric expressions, but at this point in parsing they're
+ *  always already-substituted literal `num` nodes (see step 3 above) so
+ *  we just unwrap the value. Returns null on any malformed input — the
+ *  caller surfaces a parse error in that case so the user sees a clear
+ *  message instead of NaN at run time. Defaults: source=close, calib=60,
+ *  trust=0.5 (matches the indicator's `applyArgDefaults`). */
+function encodeKalmanArgs(args: Expr[]): Expr[] | null {
+  // Source — defaults to `close` if omitted.
+  let sourceCode = KALMAN_SOURCE_CODES.close;
+  if (args.length >= 1) {
+    const a0 = args[0];
+    if (a0.kind === "ident" && KALMAN_SOURCE_CODES[a0.name] != null) {
+      sourceCode = KALMAN_SOURCE_CODES[a0.name];
+    } else if (a0.kind === "num" && KALMAN_SOURCE_CODES_REVERSE[Math.round(a0.value)]) {
+      // Already-encoded numeric source code — pass through verbatim. Lets
+      // a power user write `KALMAN_OU(1, 60, 0.5)` directly if they want.
+      sourceCode = Math.round(a0.value);
+    } else {
+      return null;
+    }
+  }
+  // Calib — must be a positive integer literal.
+  let calib = 60;
+  if (args.length >= 2) {
+    const a1 = args[1];
+    if (a1.kind !== "num" || !(a1.value > 0)) return null;
+    calib = Math.round(a1.value);
+  }
+  // Trust — must be a literal in (0, 1).
+  let trust = 0.5;
+  if (args.length >= 3) {
+    const a2 = args[2];
+    if (a2.kind !== "num" || !(a2.value > 0) || !(a2.value < 1)) return null;
+    trust = a2.value;
+  }
+  if (args.length > 3) return null;
+  return [
+    { kind: "num", value: sourceCode },
+    { kind: "num", value: calib },
+    { kind: "num", value: trust },
+  ];
+}
+
+/** Reverse map for `encodeKalmanArgs`'s "already a numeric source code"
+ *  pass-through path. Built once at module load. */
+const KALMAN_SOURCE_CODES_REVERSE: Record<number, string> = (() => {
+  const out: Record<number, string> = {};
+  for (const [k, v] of Object.entries(KALMAN_SOURCE_CODES)) out[v] = k;
+  return out;
+})();
+
+/** Recognized member-access fields on a Kalman binding. The five fields
+ *  one-to-one match the `KalmanOuBundle` shape. */
+const KALMAN_FIELDS = new Set(["x", "mu", "sigma", "phi", "P"]);
+
+/** Walk an Expr AST and replace every dotted ident matching
+ *  `<kalmanLet>.<field>` with a synthetic `call("KALMAN_OU_<field>",
+ *  encodedArgs)`. Idents that don't match a known Kalman binding are
+ *  left alone (they may be `params.X`, `signal.long`, or just unrelated
+ *  dotted names). Pure: returns a new tree, never mutates input. */
+function rewriteKalmanRefs(expr: Expr, kalmanArgsByLet: Map<string, Expr[]>): Expr {
+  if (kalmanArgsByLet.size === 0) return expr;
+  switch (expr.kind) {
+    case "num":
+      return expr;
+    case "ident": {
+      const dot = expr.name.indexOf(".");
+      if (dot < 0) return expr;
+      const root = expr.name.slice(0, dot);
+      const field = expr.name.slice(dot + 1);
+      const args = kalmanArgsByLet.get(root);
+      if (!args || !KALMAN_FIELDS.has(field)) return expr;
+      return { kind: "call", name: `KALMAN_OU_${field}`, args };
+    }
+    case "call":
+      return {
+        ...expr,
+        args: expr.args.map((a) => rewriteKalmanRefs(a, kalmanArgsByLet)),
+      };
+    case "unary":
+      return { ...expr, arg: rewriteKalmanRefs(expr.arg, kalmanArgsByLet) };
+    case "binop":
+      return {
+        ...expr,
+        lhs: rewriteKalmanRefs(expr.lhs, kalmanArgsByLet),
+        rhs: rewriteKalmanRefs(expr.rhs, kalmanArgsByLet),
+      };
+    case "if":
+      return {
+        ...expr,
+        cond: rewriteKalmanRefs(expr.cond, kalmanArgsByLet),
+        then: rewriteKalmanRefs(expr.then, kalmanArgsByLet),
+        else: rewriteKalmanRefs(expr.else, kalmanArgsByLet),
+      };
+    case "index":
+      return {
+        ...expr,
+        base: rewriteKalmanRefs(expr.base, kalmanArgsByLet),
+        offset: rewriteKalmanRefs(expr.offset, kalmanArgsByLet),
+      };
+  }
 }
 
 /** Combine continuation lines into single logical statements. Returns
@@ -430,6 +581,10 @@ interface BarEvalCtx {
    *  dist_to_POC calls on the same window. Built once per run when
    *  `tickCtx` is present; null otherwise. */
   profileCache?: ProfileCache | null;
+  /** Per-run Kalman bundle cache so KALMAN_OU_x/mu/sigma/phi/P at the
+   *  same (source, calib, trust) share one Kalman pass. Always present;
+   *  the underlying math has no tick dependency. */
+  kalmanCache: KalmanOuCache;
 }
 
 // ─── Public API ────────────────────────────────────────────────────────────
@@ -546,6 +701,7 @@ export function evaluateStrategyScript(opts: EvaluateOptions): EvaluateResult {
   // indicators then degrade to all-NaN inside `computeIndicatorSeries`.
   const tickCtx = opts.tickCtx;
   const profileCache = tickCtx ? new ProfileCache(bars.length, tickCtx) : null;
+  const kalmanCache = new KalmanOuCache(indicatorBars);
 
   const ctx: BarEvalCtx = {
     bars,
@@ -560,6 +716,7 @@ export function evaluateStrategyScript(opts: EvaluateOptions): EvaluateResult {
     rollingCache: new Map(),
     tickCtx,
     profileCache,
+    kalmanCache,
   };
 
   const signals: BacktestSignal[] = [];
@@ -1181,6 +1338,7 @@ function getIndicatorAt(
       ctx.indicatorBars,
       ctx.tickCtx,
       ctx.profileCache,
+      ctx.kalmanCache,
     );
     if (!computed) return NaN;
     series = computed;
@@ -1239,6 +1397,19 @@ export const STRATEGY_SYMBOLS = [
     signature: "cross_down(a, b)",
     description: "True (1) if `a` crossed down through `b` on the current bar.",
     context: "entry" as const,
+  },
+  {
+    name: "KALMAN_OU",
+    kind: "call" as const,
+    signature: "KALMAN_OU(source, calib=60, trust=0.5)",
+    description: "Kalman-filtered Ornstein-Uhlenbeck mean-reversion estimator. ONLY usable as a let-binding; the binding exposes five fields via member access — `kf.x` (filtered state estimate), `kf.mu` (long-run mean from calibration), `kf.sigma` (long-run unconditional std, the natural z-score divisor), `kf.phi` (AR(1) persistence), `kf.P` (current posterior state variance). `source` must be one of close/open/high/low/typical/median_price/weighted_close. `calib` is the calibration window in bars. `trust` ∈ (0,1) controls the steady-state Kalman gain (small = heavy smoothing, large = closer to raw price). Recalibration is currently 'once' (frozen after the calib window).",
+    context: "entry" as const,
+    examples: [
+      {
+        snippet: "let kf = KALMAN_OU(close, 60, 0.5)\nlet z = (close - kf.x) / kf.sigma\nsignal.long.if = cross_down(z, -params.entryZ)",
+        scenario: "Mean-reversion long when price dives more than entryZ standard deviations below the Kalman estimate.",
+      },
+    ],
   },
   {
     name: "signal.long",
