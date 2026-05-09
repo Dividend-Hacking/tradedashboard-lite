@@ -130,16 +130,12 @@ import {
 } from "@/lib/utils/composite-trade";
 import { BacktestPresetsPanel } from "./backtest-presets-panel";
 import { BacktestScriptEditor } from "./backtest-script-editor";
-import { BacktestScriptStrategyPanel } from "./backtest-script-strategy-panel";
 import {
   parseStrategyScript,
   buildLetBindings,
   type Stmt as StrategyStmt,
 } from "@/lib/utils/strategy-evaluator";
-import {
-  BUILTIN_STRATEGY_TEMPLATES,
-  type StrategyTemplate,
-} from "@/lib/utils/built-in-strategies";
+import { BUILTIN_STRATEGY_TEMPLATES } from "@/lib/utils/built-in-strategies";
 import { ScriptOutputPanel } from "./script-output-panel";
 import { TerminalDrawer } from "./terminal-drawer";
 import {
@@ -1442,40 +1438,6 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
     },
     [scriptApplied]
   );
-
-  /** Stable handlers for the BacktestScriptStrategyPanel call site below.
-   *  Hoisted out of inline-arrow form so the memoized panel can shallow-
-   *  compare its callback props and skip re-renders during fast typing.
-   *
-   *  `handleScriptParamChange` uses only the setter, so deps = [].
-   *  `handleLoadStrategyTemplate` reads the prior `scriptText` through the
-   *  functional setter form (`setScriptText(prev => …)`) instead of
-   *  closing over `scriptText` directly — keeping its identity stable
-   *  across keystrokes (the previous inline arrow closed over `scriptText`
-   *  and got a fresh identity every render, defeating the memo). */
-  const handleScriptParamChange = useCallback((key: string, value: number) => {
-    setScriptParams((prev) => ({ ...prev, [key]: value }));
-  }, []);
-  const handleLoadStrategyTemplate = useCallback((tpl: StrategyTemplate) => {
-    setScriptText((prev) => {
-      const sep =
-        prev.trim() === ""
-          ? ""
-          : `\n\n// ── existing script preserved below ──\n`;
-      return tpl.script + sep + prev;
-    });
-    // Seed paramMeta + scriptParams with the template's defaults. The
-    // user's previously-tuned scriptParams for matching keys are
-    // preserved (preference > template default).
-    setScriptParamMeta((prev) => ({ ...tpl.paramMeta, ...prev }));
-    setScriptParams((prev) => {
-      const next = { ...prev };
-      for (const [k, m] of Object.entries(tpl.paramMeta)) {
-        if (next[k] === undefined) next[k] = m.default;
-      }
-      return next;
-    });
-  }, []);
 
   // ─── Script ↔ dashboard-state bridge ──────────────────────────────
   // Snapshot every script-controllable piece of state into a single
@@ -5034,21 +4996,6 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
           </p>
         </div>
       )}
-
-      {/* Script-strategy panel — only renders when the script contains
-          `signal.long.if = …` / `signal.short.if = …` statements OR
-          `params.X` references. Lets users author from scratch without
-          using the dropdown, and load any builtin template as a starting
-          point. Sits ABOVE the legacy panel so when active it's the
-          first thing the user sees. */}
-      <BacktestScriptStrategyPanel
-        scriptText={scriptText}
-        scriptParams={scriptParams}
-        paramMeta={scriptParamMeta}
-        onParamChange={handleScriptParamChange}
-        onLoadTemplate={handleLoadStrategyTemplate}
-      />
-
 
       {/* ── Exports row — visible in BOTH modes ─────────────────────
           The export buttons used to live inside the time filter row, but
