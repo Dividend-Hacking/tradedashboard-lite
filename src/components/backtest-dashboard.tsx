@@ -737,6 +737,27 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
     // are populated by useEffects further down.
     if (typeof safe.script === "string" && safe.script.length > 0) {
       setScriptTextRef.current?.(safe.script);
+    } else if (safe.strategyId) {
+      // Old presets (pre-8e393b6) have no embedded `script`. Fall back to
+      // reading the matching disk file under backtests/scripts/, so e.g.
+      // strategyId "range_break_v4" loads `range_break_v4.dsl`. Fire-and-
+      // forget — toast fires synchronously and the editor catches up when
+      // the fetch resolves. Editor stays unbound (no setActiveScriptName)
+      // to match the v2-preset behaviour where loaded scripts are
+      // in-memory until the user explicitly saves them to disk.
+      const fileName = `${safe.strategyId}.dsl`;
+      void (async () => {
+        try {
+          const r = await fetch(`/api/scripts/${encodeURIComponent(fileName)}`);
+          if (!r.ok) return;
+          const data = await r.json();
+          if (typeof data?.content !== "string") return;
+          setScriptTextRef.current?.(data.content);
+          saveScriptDraft(data.content);
+        } catch {
+          // Server unreachable / 404 — leave editor untouched.
+        }
+      })();
     }
     if (safe.paramMeta && setScriptParamMetaRef.current) {
       setScriptParamMetaRef.current(safe.paramMeta);
