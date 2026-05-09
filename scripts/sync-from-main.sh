@@ -303,5 +303,6 @@ done
 # excluded commits don't get re-enumerated forever.
 echo "${CANDIDATES[$((${#CANDIDATES[@]}-1))]}" > "$STATE_FILE"
 echo
-echo "[done] applied ${#PLAN_APPLY[@]} commit(s); cursor at ${CANDIDATES[-1]:0:7}"
+_last_idx=$((${#CANDIDATES[@]}-1))
+echo "[done] applied ${#PLAN_APPLY[@]} commit(s); cursor at ${CANDIDATES[$_last_idx]:0:7}"
 echo "[reminder] review with 'git log --oneline' and push when ready."
