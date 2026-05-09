@@ -342,9 +342,13 @@ const KALMAN_SOURCE_CODES_REVERSE: Record<number, string> = (() => {
   return out;
 })();
 
-/** Recognized member-access fields on a Kalman binding. The five fields
- *  one-to-one match the `KalmanOuBundle` shape. */
-const KALMAN_FIELDS = new Set(["x", "mu", "sigma", "phi", "P"]);
+/** Recognized member-access fields on a Kalman binding. Six fields
+ *  one-to-one match the `KalmanOuBundle` shape. `x_pred` is the
+ *  pre-fit OU prediction at each bar (forecast given everything known
+ *  BEFORE the bar opens) — the right divisor baseline for unbiased
+ *  innovation z-scores; `x` is the post-fit posterior (already
+ *  absorbed the bar). See kalman-ou.ts for the full distinction. */
+const KALMAN_FIELDS = new Set(["x", "mu", "sigma", "phi", "P", "x_pred"]);
 
 /** Walk an Expr AST and replace every dotted ident matching
  *  `<kalmanLet>.<field>` with a synthetic `call("KALMAN_OU_<field>",

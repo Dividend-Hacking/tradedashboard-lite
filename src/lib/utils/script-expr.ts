@@ -950,6 +950,7 @@ export const FRACTIONAL_ARG_INDICATORS = new Set<string>([
   // are tiny ints that survive verbatim, calib is rounded inside
   // `kalmanOuBundle` itself (defense-in-depth).
   "KALMAN_OU_x", "KALMAN_OU_mu", "KALMAN_OU_sigma", "KALMAN_OU_phi", "KALMAN_OU_P",
+  "KALMAN_OU_x_pred",
 ]);
 
 /** Indicators that require the per-zone TickContext to compute. When
@@ -1079,7 +1080,8 @@ export function applyArgDefaults(name: string, args: number[]): number[] {
     case "KALMAN_OU_mu":
     case "KALMAN_OU_sigma":
     case "KALMAN_OU_phi":
-    case "KALMAN_OU_P": {
+    case "KALMAN_OU_P":
+    case "KALMAN_OU_x_pred": {
       const source = args.length >= 1 ? args[0] : 1;
       const calib = args.length >= 2 ? args[1] : 60;
       const trust = args.length >= 3 ? args[2] : 0.5;
@@ -1347,6 +1349,8 @@ export function indicatorKeyForCall(name: string, args: number[]): string | null
       return `KOU_PHI:${args[0]}:${args[1]}:${args[2]}`;
     case "KALMAN_OU_P":
       return `KOU_P:${args[0]}:${args[1]}:${args[2]}`;
+    case "KALMAN_OU_x_pred":
+      return `KOU_XPRED:${args[0]}:${args[1]}:${args[2]}`;
     default:
       return null;
   }
@@ -1384,12 +1388,18 @@ const KNOWN_INDICATOR_NAMES = new Set<string>([
   // Tick microstructure.
   "trades_at_bid", "trades_at_ask", "tick_imbalance", "tick_count",
   "mean_trade_size", "large_trade_count", "vwap_tick",
-  // Kalman-filtered Ornstein-Uhlenbeck — exposed as five sibling names,
+  // Kalman-filtered Ornstein-Uhlenbeck — exposed as six sibling names,
   // one per output field. The strategy parser rewrites `let kf =
-  // KALMAN_OU(close, calib, trust)` + `kf.x` references into direct
-  // calls to these names so member-access syntax just works without
-  // the AST learning a new node kind. See kalman-ou.ts for the model.
+  // KALMAN_OU(close, calib, trust)` + `kf.<field>` references into
+  // direct calls to these names so member-access syntax just works
+  // without the AST learning a new node kind. `KALMAN_OU_x_pred` is
+  // the pre-fit OU prediction (forecast for bar i given everything
+  // known BEFORE bar i opens) — use it as the divisor baseline for
+  // unbiased innovation z-scores. The post-fit `KALMAN_OU_x` already
+  // incorporates the bar-i observation; great for "fair value right
+  // now," misleading as a divisor. See kalman-ou.ts for details.
   "KALMAN_OU_x", "KALMAN_OU_mu", "KALMAN_OU_sigma", "KALMAN_OU_phi", "KALMAN_OU_P",
+  "KALMAN_OU_x_pred",
 ]);
 
 /** True when `name` is a recognized indicator that `computeIndicatorSeries`
@@ -2805,16 +2815,16 @@ export const EXPR_SYMBOLS: ExprSymbol[] = [
     name: "KALMAN_OU",
     kind: "call",
     signature: "KALMAN_OU(source, calib=60, trust=0.5)",
-    description: "Kalman-filtered Ornstein-Uhlenbeck mean-reversion estimator. STRATEGY DSL ONLY — must be assigned to a `let` and accessed via member syntax. Five fields: `kf.x` (filtered fair-value estimate), `kf.mu` (long-run mean from calibration), `kf.sigma` (long-run unconditional std — natural z-score divisor), `kf.phi` (AR(1) persistence), `kf.P` (current posterior variance). `source` is one of close/open/high/low/typical/median_price/weighted_close. `calib` is the calibration window in bars (must be a literal). `trust` ∈ (0,1) sets the steady-state Kalman gain — small = heavy smoothing toward the OU prediction, large = closer to raw price. All five fields share one filter pass per (source, calib, trust) tuple via a shared bundle cache. Recalibration is currently 'once' — parameters are frozen after the calib window.",
+    description: "Kalman-filtered Ornstein-Uhlenbeck mean-reversion estimator. STRATEGY DSL ONLY — must be assigned to a `let` and accessed via member syntax. SIX fields: `kf.x_pred` (PRE-fit OU prediction — the model's forecast for THIS bar given everything known before it opens; use this as the divisor baseline for honest innovation z-scores), `kf.x` (POST-fit posterior — already absorbed THIS bar's close into its smoothing; great for `where is fair value RIGHT NOW`, biased as a divisor because `(close - kf.x)` has the bar baked into both terms), `kf.mu` (rolling long-run mean), `kf.sigma` (rolling long-run unconditional std), `kf.phi` (rolling AR(1) persistence), `kf.P` (current posterior variance). `source` is one of close/open/high/low/typical/median_price/weighted_close. `calib` is the rolling calibration window in bars (must be a literal). `trust` ∈ (0,1) sets the steady-state Kalman gain — small = heavy smoothing toward the OU prediction, large = closer to raw price. Calibration is ROLLING — every bar refits (mu, phi, sigma) from the immediately preceding `calib` bars, so the filter is fully out-of-sample and adapts to regime shifts. All six fields share one filter pass per (source, calib, trust) tuple via a shared bundle cache.",
     context: "entry",
     examples: [
       {
-        snippet: "let kf = KALMAN_OU(close, 60, 0.5)\nlet z = (close - kf.x) / kf.sigma\nsignal.long.if = cross_down(z, -params.entryZ)\nsignal.short.if = cross_up(z, params.entryZ)",
-        scenario: "Mean-reversion: go long when price drops more than entryZ standard deviations below the Kalman fair-value estimate; short on the symmetric overshoot.",
+        snippet: "let kf = KALMAN_OU(close, 60, 0.5)\nlet z = (close - kf.x_pred) / kf.sigma\nsignal.long.if = cross_down(z, -params.entryZ)\nexit.long.if = cross_up(close, kf.x_pred)",
+        scenario: "Honest mean-reversion: enter when price is more than entryZ stds below the OU PREDICTION (using x_pred makes the z-score the real innovation, not a half-bar-baked-in residual). Exit when price reclaims the prediction.",
       },
       {
-        snippet: "let kf = KALMAN_OU(typical, 90, 0.3)\nrules.takeProfitPoints = abs(close - kf.x)",
-        scenario: "Use the Kalman estimate as a mean-reversion target — TP equals the distance from price back to the filter's fair value.",
+        snippet: "let kf = KALMAN_OU(typical, 90, 0.3)\nontrade.print = kf.x, \"x_post\"\nontrade.print = kf.x_pred, \"x_pre\"",
+        scenario: "Side-by-side check: x_post tracks the bar's close more closely (it absorbed it); x_pred is what the OU model predicted before seeing the bar. The gap (close - x_pred) is the real innovation.",
       },
     ],
   },
@@ -3715,7 +3725,7 @@ export function maxIndicatorPeriod(exprs: Iterable<Expr>): number {
     if (
       r.name === "KALMAN_OU_x" || r.name === "KALMAN_OU_mu" ||
       r.name === "KALMAN_OU_sigma" || r.name === "KALMAN_OU_phi" ||
-      r.name === "KALMAN_OU_P"
+      r.name === "KALMAN_OU_P" || r.name === "KALMAN_OU_x_pred"
     ) {
       effPeriod = Number.isFinite(r.args[1]) ? r.args[1] : 60;
     }
@@ -4006,15 +4016,17 @@ export function computeIndicatorSeries(
     case "KALMAN_OU_mu":
     case "KALMAN_OU_sigma":
     case "KALMAN_OU_phi":
-    case "KALMAN_OU_P": {
+    case "KALMAN_OU_P":
+    case "KALMAN_OU_x_pred": {
       const cache = kalmanCache ?? new KalmanOuCache(bars);
       const bundle = cache.get(args[0], args[1], args[2]);
       switch (name) {
-        case "KALMAN_OU_x":     return bundle.x;
-        case "KALMAN_OU_mu":    return bundle.mu;
-        case "KALMAN_OU_sigma": return bundle.sigma;
-        case "KALMAN_OU_phi":   return bundle.phi;
-        case "KALMAN_OU_P":     return bundle.P;
+        case "KALMAN_OU_x":      return bundle.x;
+        case "KALMAN_OU_mu":     return bundle.mu;
+        case "KALMAN_OU_sigma":  return bundle.sigma;
+        case "KALMAN_OU_phi":    return bundle.phi;
+        case "KALMAN_OU_P":      return bundle.P;
+        case "KALMAN_OU_x_pred": return bundle.x_pred;
       }
       return null;
     }

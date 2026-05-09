@@ -743,31 +743,40 @@ const INDICATOR_FAMILIES: IndicatorFamily[] = [
   },
 
   // ─── Kalman-filtered Ornstein-Uhlenbeck (strategy DSL only) ─────────
-  // Member access (`kf.x`, `kf.sigma`, …) only works inside a strategy
-  // script via a `let X = KALMAN_OU(...)` binding — the parser rewrites
-  // dotted ident references into direct calls against five hidden
-  // sibling indicators. Five fields share one filter pass per parameter
-  // tuple via a per-zone bundle cache.
+  // Member access (`kf.x_pred`, `kf.x`, `kf.sigma`, …) only works
+  // inside a strategy script via a `let X = KALMAN_OU(...)` binding —
+  // the parser rewrites dotted ident references into direct calls
+  // against six hidden sibling indicators. All six share one filter
+  // pass per parameter tuple via a per-zone bundle cache. Calibration
+  // is rolling (refits every bar from the previous `calib` bars) so
+  // it's fully out-of-sample and adapts to regime shifts.
   {
     headline: "KALMAN_OU (mean-reversion estimator)",
     forms: [
       "let kf = KALMAN_OU(source, calib, trust)",
-      "kf.x       (filtered fair-value estimate)",
-      "kf.mu      (long-run mean)",
-      "kf.sigma   (long-run unconditional std — z-score divisor)",
-      "kf.phi     (AR(1) persistence)",
+      "kf.x_pred  (PRE-fit OU prediction — honest z-score divisor)",
+      "kf.x       (POST-fit posterior — has THIS bar baked in)",
+      "kf.mu      (rolling long-run mean)",
+      "kf.sigma   (rolling long-run unconditional std)",
+      "kf.phi     (rolling AR(1) persistence)",
       "kf.P       (current posterior variance)",
     ],
     description:
-      "Kalman-filtered Ornstein-Uhlenbeck mean-reversion estimator — gives you a smoothed \"fair value\" line that price reverts toward, plus the natural standard-deviation scale to size mean-reversion entries. STRATEGY DSL ONLY: must be assigned to a `let` and then accessed via `kf.x`-style member syntax (the parser rewrites those into direct sub-indicator calls). `source` is one of close/open/high/low/typical/median_price/weighted_close. `calib` is the calibration window in bars and must be a literal number (60 is a sensible default). `trust` ∈ (0,1) controls how much weight the filter puts on each new bar's price vs its own prediction — small (0.1–0.3) = very smooth slow line, large (0.7–0.9) = follows price closely. Recalibration is currently 'once' — the (mu, phi, sigma) parameters are estimated from the first `calib` bars and frozen.",
+      "Kalman-filtered Ornstein-Uhlenbeck mean-reversion estimator — gives you a smoothed \"fair value\" line that price reverts toward, plus the standard-deviation scale to size mean-reversion entries. STRATEGY DSL ONLY: must be assigned to a `let` and then accessed via `kf.x_pred`-style member syntax. `source` is one of close/open/high/low/typical/median_price/weighted_close. `calib` is the rolling calibration window in bars (60 is a sensible default). `trust` ∈ (0,1) controls how much weight the filter puts on each new bar's price vs its own prediction — small (0.1–0.3) = very smooth slow line, large (0.7–0.9) = follows price closely. " +
+      "**`kf.x_pred` vs `kf.x` matters for honest backtests.** `kf.x_pred` is the OU model's prediction for THIS bar given everything known BEFORE it opens — comparing `close` to `x_pred` measures the true OU innovation. `kf.x` is the post-fit posterior (it absorbed THIS bar's close into the smoothing) — comparing `close` to `kf.x` measures the post-fit residual, which is mathematically smaller than the innovation and biases entry/exit thresholds toward easier triggers. Use `kf.x_pred` as your z-score divisor baseline; reach for `kf.x` only when you genuinely want \"fair value RIGHT NOW given everything I know.\" " +
+      "Calibration is fully ROLLING: every bar refits (mu, phi, sigma) from the immediately preceding `calib` bars, so the filter is always out-of-sample and adapts to regime shifts as the session progresses.",
     examples: [
       {
-        snippet: "let kf = KALMAN_OU(close, 60, 0.5)\nlet z = (close - kf.x) / kf.sigma\nsignal.long.if = cross_down(z, -params.entryZ)\nsignal.short.if = cross_up(z, params.entryZ)",
-        scenario: "Mean-reversion: go long when price drops more than entryZ standard deviations below the Kalman fair-value estimate; symmetric short on the overshoot.",
+        snippet: "let kf = KALMAN_OU(close, 60, 0.5)\nlet z = (close - kf.x_pred) / kf.sigma\nsignal.long.if = cross_down(z, -params.entryZ)\nexit.long.if = cross_up(close, kf.x_pred)",
+        scenario: "Honest mean-reversion: enter long when price is more than entryZ stds below the OU PREDICTION (using x_pred makes the z-score the real innovation, not a half-bar-baked-in residual). Exit when price reclaims the prediction.",
       },
       {
-        snippet: "let kf = KALMAN_OU(typical, 90, 0.3)\nrules.takeProfitPoints = abs(close - kf.x)",
-        scenario: "Use the Kalman estimate as a mean-reversion target — TP equals the distance from price back to the filter's fair value.",
+        snippet: "let kf = KALMAN_OU(typical, 90, 0.3)\nontrade.print = kf.x, \"x_post\"\nontrade.print = kf.x_pred, \"x_pre\"",
+        scenario: "Side-by-side check: x_post tracks the bar's close more closely (it absorbed it); x_pred is what the OU model predicted before seeing the bar. The gap (close - x_pred) is the real innovation.",
+      },
+      {
+        snippet: "let kf = KALMAN_OU(close, 60, 0.5)\nrules.takeProfitPoints = abs(close - kf.x_pred)",
+        scenario: "Use the Kalman PREDICTION as the mean-reversion target — TP is the distance from current price back to the OU model's forecast.",
       },
     ],
   },
