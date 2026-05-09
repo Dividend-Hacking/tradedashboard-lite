@@ -35,7 +35,7 @@ const TABS = [
 type TabId = (typeof TABS)[number]["id"];
 
 export function TabSwitcher({ trades, zones, sections, replaySessions }: TabSwitcherProps) {
-  const [activeTab, setActiveTab] = useState<TabId>("zones");
+  const [activeTab, setActiveTab] = useState<TabId>("backtest");
 
   return (
     <div className="min-h-screen p-4 md:p-8">
