@@ -2024,11 +2024,15 @@ export function applyDailyLimits(
         finalKept.push(t);
         continue;
       }
-      const forceClosed = earlyCloseAtTime(z, bars, T, rules);
-      if (!forceClosed) {
+      const closed = earlyCloseAtTime(z, bars, T, rules);
+      if (!closed) {
         finalKept.push(t);
         continue;
       }
+      // Spread `t` first so per-trade entry-time metadata
+      // (script_prints, effSlPoints/effTpPoints/effTrailPoints/effBePoints,
+      // isWarmup, isReverseEntry) survives the daily-limit force-close.
+      const forceClosed = { ...t, ...closed };
       forceClosed.positionSize = t.positionSize;
       forceClosed.scaledPoints =
         Math.round(forceClosed.exitPoints * t.positionSize * 100) / 100;
@@ -2118,7 +2122,13 @@ export function applyPositionMode(
           const bars = barsByZoneId.get(r.zoneId);
           if (!z || !bars) continue;
           const closed = earlyCloseAtTime(z, bars, candStart, rules);
-          if (closed) finalResults[i] = closed;
+          // Spread `r` first so per-trade entry-time metadata
+          // (script_prints, effSlPoints/effTpPoints/effTrailPoints/effBePoints,
+          // isWarmup) survives the early-close. earlyCloseAtTime returns a
+          // bare result with only exit-related fields recomputed, so without
+          // this merge the per-trade DSL print table loses every value
+          // except for the last trade of each chain.
+          if (closed) finalResults[i] = { ...r, ...closed };
         }
         finalResults.push(candidate);
         break;
@@ -2132,7 +2142,7 @@ export function applyPositionMode(
           const bars = barsByZoneId.get(r.zoneId);
           if (!z || !bars) continue;
           const closed = earlyCloseAtTime(z, bars, candStart, rules);
-          if (closed) finalResults[i] = closed;
+          if (closed) finalResults[i] = { ...r, ...closed };
         }
         finalResults.push(candidate);
         break;
@@ -2159,7 +2169,7 @@ export function applyPositionMode(
           const bars = barsByZoneId.get(r.zoneId);
           if (!z || !bars) continue;
           const closed = earlyCloseAtTime(z, bars, candStart, rules);
-          if (closed) finalResults[i] = closed;
+          if (closed) finalResults[i] = { ...r, ...closed };
         }
         finalResults.push({ ...candidate, isReverseEntry: true });
         break;
@@ -2175,7 +2185,7 @@ export function applyPositionMode(
             const bars = barsByZoneId.get(r.zoneId);
             if (!z || !bars) continue;
             const closed = earlyCloseAtTime(z, bars, candStart, rules);
-            if (closed) finalResults[i] = closed;
+            if (closed) finalResults[i] = { ...r, ...closed };
           }
           finalResults.push({ ...candidate, isReverseEntry: true });
         } else {
