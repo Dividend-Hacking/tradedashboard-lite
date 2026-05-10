@@ -2033,19 +2033,26 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
     });
   }, [handleApplyScript, selectedSessionIds]);
 
-  /** Abort an in-flight script run. Flips the optimizer's cancel flag
-   *  so its main loop breaks at the next signal boundary (worst case
-   *  one yield interval — ~50ms — before it actually stops). The
-   *  effect's post-await guard then sees the cancel and skips the
-   *  setAsyncOptResult write, so the LAST GOOD result keeps showing
-   *  in the chart instead of being clobbered by a partial trade list.
-   *  Progress + spinner clear synchronously so the UI snaps back even
-   *  if the optimizer hasn't reached its next yield point yet. */
+  /** Abort an in-flight script run. Flips both cancel flags — the
+   *  optimizer's (so its TPE loop breaks at the next signal boundary)
+   *  AND the per-session simulator's (so the multi-session walk bails
+   *  at the next session boundary). Worst case is one yield interval
+   *  before either actually stops. The effects' post-await guards then
+   *  see the cancel and skip their state-commit writes, so the LAST
+   *  GOOD result keeps showing in the chart instead of being
+   *  clobbered by a partial trade list. Progress + spinner + simulator
+   *  status clear synchronously so the UI snaps back to "idle" even
+   *  if the loops haven't reached their next yield point yet. */
   const handleCancelRun = useCallback(() => {
     if (asyncOptCancelRef.current) {
       asyncOptCancelRef.current.current = true;
     }
+    if (simCancelRef.current) {
+      simCancelRef.current.current = true;
+    }
     setScriptRunProgress(null);
+    setSimRunStartedAt(null);
+    setSimCurrentSessionLabel(null);
     setIsRunning(false);
   }, []);
 
@@ -2624,7 +2631,68 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
     >()
   );
 
-  const runResult = useMemo(() => {
+  // Defensive cap on the per-session result cache. Previously the cache
+  // was unbounded — every session ever clicked stayed resident in memory
+  // alongside its full synthetic-bar payload (zone bars + pre-entry bars
+  // + tick context maps). On long-running sessions where the user picks
+  // many distinct day ranges across a workday, that growth was a
+  // primary contributor to the tab going OOM ("Aw Snap"). When the cache
+  // exceeds this size we evict the oldest entries (insertion-order map)
+  // until we're back under the cap. The cap is intentionally generous
+  // because the typical multi-session run is well under it; the bound
+  // exists to defang pathological session-churn cases.
+  const BACKTEST_CACHE_MAX_ENTRIES = 60;
+
+  // ── Async per-session run state ──────────────────────────────────────
+  // The backtest used to be a synchronous useMemo — for a 30-day run
+  // (10s+ of sessions × thousands of bars × indicator/optimizer cost)
+  // that blocked the main thread for many seconds. Chrome would either
+  // pop the "Page Unresponsive" prompt or the user would see a frozen
+  // UI with no feedback. Now the per-session walk lives in a useEffect
+  // that yields control back to the browser between sessions, so the
+  // page stays interactive and the progress banner updates as each
+  // session lands. `runResultState` is the live result the rest of the
+  // component reads via `runResult`. While a new run is in flight the
+  // PRIOR result stays in place so the chart/table don't flicker to
+  // empty — only swapped atomically when the new run finishes.
+  const emptyBacktestRunResult = useMemo<BacktestRunResult>(
+    () => ({
+      trades: [],
+      syntheticZones: [],
+      syntheticBarsByZoneId: new Map(),
+      syntheticPreEntryBarsByZoneId: new Map(),
+      syntheticIndicatorPreEntryBarsByZoneId: new Map(),
+      syntheticAtrByZoneId: new Map(),
+      syntheticTickCtxByZoneId: new Map(),
+      totalSignals: 0,
+    }),
+    [],
+  );
+  const [runResultState, setRunResultState] = useState<BacktestRunResult>(
+    emptyBacktestRunResult,
+  );
+  // Cancel token for the in-flight per-session walk. The Cancel button
+  // (and dep changes) flip the inner `current` flag; the async loop
+  // checks it between sessions and bails before starting the next one.
+  const simCancelRef = useRef<{ current: boolean } | null>(null);
+  // Wall-clock start of the current sim run, used by the progress banner
+  // to display elapsed seconds. Reset to null when no run is active.
+  const [simRunStartedAt, setSimRunStartedAt] = useState<number | null>(null);
+  // Human-readable label of the session currently being walked
+  // ("2026-04-08 NQ"). Surfaced in the progress banner so the user can
+  // see real movement during a long run instead of just a percent bar.
+  const [simCurrentSessionLabel, setSimCurrentSessionLabel] = useState<
+    string | null
+  >(null);
+  // Elapsed-seconds counter for the progress banner. Updated by a 1Hz
+  // interval whenever a run is active so the displayed elapsed time
+  // visibly ticks even during a single long session (where the
+  // per-session progress callback wouldn't fire mid-walk). When no run
+  // is active, the interval is torn down and this stays at 0 — the
+  // banner reads `null` for elapsed and renders a placeholder.
+  const [runElapsedSec, setRunElapsedSec] = useState<number>(0);
+
+  useEffect(() => {
     // Read from the COMMITTED set, not `selectedSessionIds`. Toggling
     // chips in the day picker should not auto-run — the user has to
     // click Run to commit their selection (see `handleRun`).
@@ -2647,16 +2715,26 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
       (a.bars[0]?.bar_time ?? "").localeCompare(b.bars[0]?.bar_time ?? "")
     );
 
+    // Cancel any in-flight per-session walk before spinning up a new
+    // one. The previous run's async loop checks `myCancel.current`
+    // between sessions and bails — without this guard, two overlapping
+    // runs would race to setRunResultState and the user could see the
+    // OLDER config's result clobber the newer one's commit.
+    if (simCancelRef.current) simCancelRef.current.current = true;
+    const myCancel = { current: false };
+    simCancelRef.current = myCancel;
+
     if (ready.length === 0) {
-      return {
-        trades: [],
-        syntheticZones: [],
-        syntheticBarsByZoneId: new Map<number, TradeZoneBar[]>(),
-        syntheticPreEntryBarsByZoneId: new Map<number, TradeZoneBar[]>(),
-        syntheticAtrByZoneId: new Map<number, number>(),
-        syntheticTickCtxByZoneId: new Map<number, TickContext>(),
-        totalSignals: 0,
-      };
+      // Nothing selected — clear any stale running state and reset the
+      // result to empty so downstream consumers (charts, stat cards)
+      // collapse to the no-data view. This is the only branch where we
+      // proactively wipe the prior result; mid-run dep changes keep the
+      // prior result visible until the new run lands.
+      setRunResultState(emptyBacktestRunResult);
+      setScriptRunProgress(null);
+      setSimRunStartedAt(null);
+      setSimCurrentSessionLabel(null);
+      return;
     }
 
     // ── Strategy DSL override ───────────────────────────────────────
@@ -2918,7 +2996,64 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
     // 0 trades instead of throwing. The next valid Apply will rebuild
     // the override and the memo will re-run.
     const ranSessions = strategyOverrideForRun ? ready : [];
+
+    // Yield helper — same MessageChannel-postMessage trick the optimizer
+    // effect below uses. Avoids the setTimeout-4ms clamp so a yield
+    // between sessions costs effectively nothing while still letting
+    // the browser paint the progress banner and process input events.
+    const yieldToMain = (): Promise<void> => {
+      if (typeof MessageChannel === "undefined") {
+        return new Promise<void>((resolve) => setTimeout(resolve, 0));
+      }
+      return new Promise<void>((resolve) => {
+        const ch = new MessageChannel();
+        ch.port1.onmessage = () => {
+          ch.port1.close();
+          resolve();
+        };
+        ch.port2.postMessage(null);
+      });
+    };
+
+    // Initial progress paint — the banner shows "Simulating · 0 / N"
+    // immediately on Run click so the user sees feedback even before
+    // the first session has been walked. Skip when nothing to do
+    // (engine was hand-fed an empty ranSessions because strategyOverride
+    // was null — typical when the editor is empty/erroring).
+    if (ranSessions.length > 0) {
+      setSimRunStartedAt(performance.now());
+      setSimCurrentSessionLabel(null);
+      setScriptRunProgress({
+        stage: "simulating",
+        current: 0,
+        total: ranSessions.length,
+      });
+    } else {
+      // Empty ranSessions still needs a clean state commit so any prior
+      // stale "Simulating…" banner clears. We fall through to the IIFE
+      // which immediately commits an empty (but valid) result via the
+      // accumulators initialized above.
+      setScriptRunProgress(null);
+      setSimRunStartedAt(null);
+      setSimCurrentSessionLabel(null);
+    }
+
+    // ── Per-session walk (async) ─────────────────────────────────────
+    // The actual run body lives inside an async IIFE so we can await a
+    // yield between sessions. Crucially, the cleanup function attached
+    // to the useEffect (`return () => { myCancel.current = true; }`)
+    // gets registered SYNCHRONOUSLY right after this IIFE starts — so
+    // any dep change (or unmount) flips the flag, the loop bails on
+    // its next iteration, and the in-flight result is dropped instead
+    // of clobbering a newer run's commit.
+    void (async () => {
     for (let sIdx = 0; sIdx < ranSessions.length; sIdx++) {
+      // Cancel check at the TOP of each iteration. If the user changed
+      // a dep (or hit Cancel) since we started, exit before doing the
+      // expensive runBacktestForSession call. The current iteration's
+      // partial work is discarded — runResultState stays at whatever
+      // the prior run produced, so the chart doesn't flash to empty.
+      if (myCancel.current) return;
       const s = ranSessions[sIdx];
       // Pull the prior chronological session's bar tail as warmup for the
       // signal evaluator, so ATR(14)/ADX(14)/rolling-* are valid at bar 0
@@ -2995,6 +3130,34 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
       if (result.optimizationWarnings) {
         allOptimizationWarnings.push(...result.optimizationWarnings);
       }
+
+      // Per-session progress update — the banner shows
+      //   "Simulating · 2026-04-08 · NQ · 7 / 22"
+      // so the user can verify forward progress on a long run instead
+      // of being stuck on a single percent that never moves.
+      const sess = sessions.find((x) => x.id === s.id);
+      const dateLabel = sess
+        ? (formatDate(sess.session_date) ?? sess.session_date)
+        : null;
+      setSimCurrentSessionLabel(
+        dateLabel ? `${dateLabel} · ${s.instrument}` : `Session ${sIdx + 1}`,
+      );
+      setScriptRunProgress({
+        stage: "simulating",
+        current: sIdx + 1,
+        total: ranSessions.length,
+      });
+
+      // Yield between sessions to keep the main thread responsive. No
+      // need to yield after the last one — we're about to commit and
+      // the React render itself releases the thread. Yielding only
+      // between (not within) sessions gives the browser ~1 paint per
+      // session, which is plenty for "I'm alive" feedback while
+      // keeping the per-yield cost bounded (one MessageChannel hop).
+      if (sIdx < ranSessions.length - 1) {
+        await yieldToMain();
+        if (myCancel.current) return;
+      }
     }
 
     // Same chronological sort runBacktestAcrossSessions used to apply
@@ -3070,7 +3233,29 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
     //    which is what produced the "424 updates / 79 trades"
     //    discrepancy. We pass the per-session aggregated history along
     //    only as a fallback for the no-Optimize case (legacy path).
-    return {
+    // Cancel re-check before committing — a dep change between the
+    // last yield and now would have flipped the flag. Without this
+    // guard the older run's setRunResultState would clobber the newer
+    // run's already-committed result.
+    if (myCancel.current) return;
+
+    // Cache eviction (insertion-order LRU). The `Map` preserves insertion
+    // order, so iterating keys gives us oldest-first. We delete enough
+    // to bring size back under the cap. Keeps peak memory bounded
+    // across long dashboard sessions where the user explores many
+    // distinct date ranges — without this, every session ever clicked
+    // stays resident with its full synthetic-bar payload.
+    if (cache.size > BACKTEST_CACHE_MAX_ENTRIES) {
+      const overflow = cache.size - BACKTEST_CACHE_MAX_ENTRIES;
+      const it = cache.keys();
+      for (let i = 0; i < overflow; i++) {
+        const next = it.next();
+        if (next.done) break;
+        cache.delete(next.value);
+      }
+    }
+
+    setRunResultState({
       trades: dedupedTrades,
       syntheticZones: dedupedZones,
       syntheticBarsByZoneId: allBars,
@@ -3085,8 +3270,75 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
           : undefined,
       optimizationWarnings:
         allOptimizationWarnings.length > 0 ? allOptimizationWarnings : undefined,
+    });
+    setScriptRunProgress(null);
+    setSimRunStartedAt(null);
+    setSimCurrentSessionLabel(null);
+    })();
+
+    // Cleanup: register the cancel-flag flip so dep-changes / unmount
+    // tell the in-flight async loop to bail at its next iteration.
+    return () => {
+      myCancel.current = true;
     };
-  }, [committedSessionIds, sessions, barsBySessionId, currentStrategy, params, rules, indicatorConfig, scriptNumericOverrides, scriptTradePrints, scriptOptimizeOverrides, scriptOptimizeAll, scriptWarmup, scriptFilterIfs, scriptExitIfs, appliedScriptText, scriptParams, scriptParamMeta]);
+  }, [committedSessionIds, sessions, barsBySessionId, currentStrategy, params, rules, indicatorConfig, scriptNumericOverrides, scriptTradePrints, scriptOptimizeOverrides, scriptOptimizeAll, scriptWarmup, scriptFilterIfs, scriptExitIfs, appliedScriptText, scriptParams, scriptParamMeta, emptyBacktestRunResult]);
+
+  // The rest of the component reads `runResult` as a plain value — same
+  // shape as the old useMemo returned. Indirection through state lets
+  // the per-session walk above run async without changing any
+  // downstream consumer. While a new run is in flight, `runResult`
+  // points at the PRIOR committed result so the chart/table don't
+  // flicker to empty between Run click and run completion.
+  const runResult = runResultState;
+
+  // ── Elapsed-time ticker for the progress banner ──────────────────
+  // Runs a 1Hz interval whenever a run is active (either the per-
+  // session walk OR the optimizer effect — whichever set
+  // simRunStartedAt). Updates `runElapsedSec` every second so the
+  // banner's "Elapsed: 12s" counter keeps moving even when no progress
+  // event has fired (e.g. the middle of a single long session walk
+  // where the per-session callback only updates between sessions).
+  // Tears the interval down on cancel / completion so we don't leave
+  // a stray timer running when the dashboard goes idle.
+  useEffect(() => {
+    if (simRunStartedAt === null) {
+      // Idle — make sure the displayed counter resets so the next run
+      // doesn't start from a stale value before the first tick fires.
+      setRunElapsedSec(0);
+      return;
+    }
+    // Fire once immediately so the banner shows "0s" right away
+    // instead of waiting a full second for the first interval tick.
+    setRunElapsedSec(Math.floor((performance.now() - simRunStartedAt) / 1000));
+    const id = setInterval(() => {
+      setRunElapsedSec(
+        Math.floor((performance.now() - simRunStartedAt) / 1000),
+      );
+    }, 1000);
+    return () => clearInterval(id);
+  }, [simRunStartedAt]);
+
+  // ── Optimizer-effect: keep simRunStartedAt aligned for elapsed time
+  // The optimizer effect below sets `scriptRunProgress` directly. The
+  // elapsed-time ticker keys off `simRunStartedAt`, so whenever the
+  // optimizer flips progress on (and we don't already have a sim
+  // start time, e.g. because the per-session walk skipped to the
+  // optimizer phase via its cache), we record `now()` as the
+  // optimizer's start. Cleared symmetrically when progress goes back
+  // to null. This makes the elapsed counter cover the entire run —
+  // simulator phase + optimizer phase — without each effect having
+  // to coordinate state.
+  useEffect(() => {
+    if (scriptRunProgress && simRunStartedAt === null) {
+      setSimRunStartedAt(performance.now());
+    } else if (!scriptRunProgress && simRunStartedAt !== null) {
+      setSimRunStartedAt(null);
+    }
+    // simRunStartedAt is intentionally read-only here — including it
+    // in deps would re-fire on its own setter, looping. The effect
+    // only needs to react to scriptRunProgress transitions.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [scriptRunProgress]);
 
   // ─── Apply context filters (ADX / ATR / Trend / Bollinger) ────────
   // Runs BEFORE the time filter so the chain is:
@@ -4599,6 +4851,129 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
   }, [trades, timeFilteredZones, runResult.syntheticBarsByZoneId, rules]);
 
   return (
+    <>
+      {/* ── Global run-progress banner ─────────────────────────────────
+          Fixed-position at the top of the viewport whenever a run is in
+          flight (sim walk OR optimizer). This is the user's primary
+          "is anything happening?" feedback channel during big multi-
+          session runs — without it, the previous UI's only progress
+          indicator was a thin bar buried in the script editor's
+          sticky nav, which the user often couldn't see at all when
+          the editor was scrolled away or off-screen.
+
+          Banner contents:
+            • Stage icon + label ("Simulating" / "Optimizing")
+            • Current session label when known (date · instrument)
+            • Count "X / Y"
+            • Elapsed seconds — updated every 1s by the ticker effect
+              above, so it visibly moves even during a single long
+              session walk where no per-session callback fires
+            • Progress bar (matches the in-editor one's calculation)
+            • Cancel button — same handler as the editor's; flips both
+              the optimizer and simulator cancel flags
+
+          When no run is active the banner unmounts entirely so it
+          doesn't take vertical space in the idle state. */}
+      {scriptRunProgress && (
+        <div
+          className="fixed top-0 left-0 right-0 z-50 px-4 py-2 bg-card/95 backdrop-blur border-b border-card-border shadow-lg"
+          role="status"
+          aria-live="polite"
+        >
+          <div className="max-w-screen-2xl mx-auto flex items-center gap-3">
+            {/* Spinner + stage label */}
+            <div className="flex items-center gap-2 shrink-0">
+              <svg
+                className="animate-spin h-4 w-4 text-accent-green"
+                viewBox="0 0 24 24"
+                fill="none"
+                aria-hidden
+              >
+                <circle
+                  cx="12"
+                  cy="12"
+                  r="10"
+                  stroke="currentColor"
+                  strokeWidth="4"
+                  opacity="0.25"
+                />
+                <path
+                  d="M4 12a8 8 0 018-8"
+                  stroke="currentColor"
+                  strokeWidth="4"
+                  strokeLinecap="round"
+                />
+              </svg>
+              <span className="text-sm font-medium text-foreground">
+                {scriptRunProgress.stage === "optimizing"
+                  ? "Optimizing"
+                  : "Simulating"}
+                …
+              </span>
+            </div>
+
+            {/* Current session label — only meaningful during the sim
+                phase. The optimizer phase doesn't surface a per-trial
+                label here (would require deep changes to the worker
+                protocol); the count + elapsed are enough signal. */}
+            {simCurrentSessionLabel &&
+              scriptRunProgress.stage === "simulating" && (
+                <span className="text-xs text-muted-foreground truncate">
+                  {simCurrentSessionLabel}
+                </span>
+              )}
+
+            {/* Count + elapsed — tabular-nums so the digits don't jitter */}
+            <span className="text-xs text-muted-foreground tabular-nums shrink-0 ml-auto">
+              {scriptRunProgress.total > 0
+                ? `${scriptRunProgress.current} / ${scriptRunProgress.total}`
+                : ""}
+            </span>
+            <span
+              className="text-xs text-muted-foreground tabular-nums shrink-0"
+              title="Elapsed time since the run started"
+            >
+              {runElapsedSec >= 60
+                ? `${Math.floor(runElapsedSec / 60)}m ${runElapsedSec % 60}s`
+                : `${runElapsedSec}s`}
+            </span>
+
+            {/* Cancel — bound to the same handler the in-editor button
+                uses. Flips both the optimizer's and the simulator's
+                cancel flags so a long multi-session run can actually
+                be aborted, not just the optimizer phase. */}
+            <button
+              onClick={handleCancelRun}
+              className="px-2.5 py-1 rounded text-xs font-medium bg-accent-red/20 text-accent-red hover:bg-accent-red/30 transition-colors shrink-0"
+              title="Stop the in-flight run. Loops bail at the next yield boundary; the chart keeps showing the previously-committed result."
+            >
+              Cancel
+            </button>
+          </div>
+
+          {/* Progress bar — same calculation as the in-editor one but
+              full-viewport-width so the user always has a visible
+              "I'm alive" pulse anchor regardless of scroll position. */}
+          <div className="mt-1.5 h-1 w-full bg-white/10 rounded-full overflow-hidden">
+            <div
+              className="h-full bg-accent-green transition-[width] duration-150 ease-out"
+              style={{
+                width: `${
+                  scriptRunProgress.total > 0
+                    ? Math.min(
+                        100,
+                        (scriptRunProgress.current /
+                          scriptRunProgress.total) *
+                          100,
+                      )
+                    : 0
+                }%`,
+              }}
+            />
+          </div>
+        </div>
+      )}
+
     <div
       ref={splitContainerRef}
       // The dashboard renders as a 2-column flex layout: left = the
@@ -5791,5 +6166,6 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
           `scripts/term-server.mjs` over a localhost-only WebSocket. */}
       <TerminalDrawer />
     </div>
+    </>
   );
 }
