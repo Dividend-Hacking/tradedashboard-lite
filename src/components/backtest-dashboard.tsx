@@ -347,6 +347,18 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
     () => new Set()
   );
 
+  // ─── Committed session selection (run-pipeline input) ─────────────
+  // The run pipeline (runResult / tradesAndOptimization / async optimizer
+  // effect) reads from THIS set instead of `selectedSessionIds`. We only
+  // update it inside `handleRun`, so toggling chips in the day picker no
+  // longer auto-fires a backtest — the user has to click Run to commit
+  // their selection into the compute pipeline. UI surfaces (chip grid,
+  // chart preview, status banner, bar fetching) keep reading
+  // `selectedSessionIds` so they stay responsive to clicks.
+  const [committedSessionIds, setCommittedSessionIds] = useState<Set<number>>(
+    () => new Set()
+  );
+
   // ─── Day picker filters ───────────────────────────────────────────
   // Narrow the day picker by instrument (e.g. "ES", "NQ") and timeframe
   // (e.g. "1 Minute", "5 Minute") so users with a large session library
@@ -2001,6 +2013,13 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
    *  commits. */
   const handleRun = useCallback(() => {
     setIsRunning(true);
+    // Commit the current day-picker selection into the run pipeline.
+    // The run-side memos (runResult, tradesAndOptimization, async
+    // optimizer effect) all key off `committedSessionIds`, so this is
+    // the moment a freshly-toggled session actually enters the compute.
+    // We snapshot into a new Set so subsequent UI toggles don't mutate
+    // the committed reference and accidentally re-trigger the memos.
+    setCommittedSessionIds(new Set(selectedSessionIds));
     // Arm the disk-results export so the post-run effect knows this
     // upcoming `trades` recompute was triggered by an explicit Run click,
     // not by a filter-toggle / param-tweak that also invalidates the same
@@ -2012,7 +2031,7 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
         handleApplyScript();
       });
     });
-  }, [handleApplyScript]);
+  }, [handleApplyScript, selectedSessionIds]);
 
   /** Abort an in-flight script run. Flips the optimizer's cancel flag
    *  so its main loop breaks at the next signal boundary (worst case
@@ -2606,7 +2625,10 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
   );
 
   const runResult = useMemo(() => {
-    const ready = Array.from(selectedSessionIds)
+    // Read from the COMMITTED set, not `selectedSessionIds`. Toggling
+    // chips in the day picker should not auto-run — the user has to
+    // click Run to commit their selection (see `handleRun`).
+    const ready = Array.from(committedSessionIds)
       .map((id) => {
         const sess = sessions.find((s) => s.id === id);
         const bars = barsBySessionId.get(id);
@@ -2794,8 +2816,11 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
             // Seed: stable hash of the script text + sorted session IDs.
             // Computed inline so the memo's cache key sees consistent
             // values; the engine uses this directly via the overlay.
+            // Uses `committedSessionIds` (the run-pipeline source of
+            // truth) so the seed changes only when the user clicks Run,
+            // not on every chip toggle.
             optimizeSeed: hasOptimize
-              ? deriveSeed(appliedScriptText, Array.from(selectedSessionIds))
+              ? deriveSeed(appliedScriptText, Array.from(committedSessionIds))
               : undefined,
           }
         : null;
@@ -3061,7 +3086,7 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
       optimizationWarnings:
         allOptimizationWarnings.length > 0 ? allOptimizationWarnings : undefined,
     };
-  }, [selectedSessionIds, sessions, barsBySessionId, currentStrategy, params, rules, indicatorConfig, scriptNumericOverrides, scriptTradePrints, scriptOptimizeOverrides, scriptOptimizeAll, scriptWarmup, scriptFilterIfs, scriptExitIfs, appliedScriptText, scriptParams, scriptParamMeta]);
+  }, [committedSessionIds, sessions, barsBySessionId, currentStrategy, params, rules, indicatorConfig, scriptNumericOverrides, scriptTradePrints, scriptOptimizeOverrides, scriptOptimizeAll, scriptWarmup, scriptFilterIfs, scriptExitIfs, appliedScriptText, scriptParams, scriptParamMeta]);
 
   // ─── Apply context filters (ADX / ATR / Trend / Bollinger) ────────
   // Runs BEFORE the time filter so the chain is:
@@ -3475,7 +3500,7 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
     scriptFilterIfs,
     scriptExitIfs,
     appliedScriptText,
-    selectedSessionIds,
+    committedSessionIds,
     asyncOptResult,
   ]);
   const trades = tradesAndOptimization.trades;
@@ -3680,7 +3705,7 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
         : null,
       filterIfs: scriptFilterIfs.map((d) => `${d.scope ?? "both"}|${d.source}`),
       exitIfs: scriptExitIfs.map((d) => `${d.scope ?? "both"}|${d.source}`),
-      seed: deriveSeed(appliedScriptText, Array.from(selectedSessionIds)),
+      seed: deriveSeed(appliedScriptText, Array.from(committedSessionIds)),
     });
 
     if (asyncOptResult && asyncOptResult.configKey === configKey) {
@@ -3751,7 +3776,7 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
           atrByZoneId: runResult.syntheticAtrByZoneId,
           optimizeOverrides: overlayForFilterSim.optimizeOverrides!,
           joint: overlayForFilterSim.optimizeAll ?? false,
-          seed: deriveSeed(appliedScriptText, Array.from(selectedSessionIds)),
+          seed: deriveSeed(appliedScriptText, Array.from(committedSessionIds)),
           tradePrints: overlayForFilterSim.tradePrints,
           indicatorByZone: overlayForFilterSim.indicatorByZone,
           filterIfs: overlayForFilterSim.filterIfs,
@@ -3819,7 +3844,7 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
     scriptFilterIfs,
     scriptExitIfs,
     appliedScriptText,
-    selectedSessionIds,
+    committedSessionIds,
   ]);
 
   // Pass `rules` so a manual tick-config override (Fills & Costs panel)
@@ -4028,7 +4053,10 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
         zones: timeFilteredZones,
         barsByZoneId: runResult.syntheticBarsByZoneId,
         stats: summary,
-        selectedSessionIds,
+        // Report the sessions that the run was ACTUALLY computed against
+        // (the committed set), not the user's current chip-grid selection
+        // — those can diverge once chip toggles no longer auto-run.
+        selectedSessionIds: committedSessionIds,
         sessions,
         metrics: tradesAndOptimization.metrics,
         filterIfs: scriptFilterIfs,
