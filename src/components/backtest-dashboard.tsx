@@ -2056,6 +2056,33 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
     setIsRunning(false);
   }, []);
 
+  /** Manual heap relief — clears every cache the dashboard owns. Use
+   *  when the dashboard feels slow after many runs with different
+   *  scripts (the same scenario the per-Run automatic prune handles
+   *  passively, surfaced here as an explicit lever for the worst case).
+   *  Forces re-fetch + re-aggregation on the NEXT Run, but lets the
+   *  user reset the heap floor without a full page reload — which would
+   *  also lose script draft, selection, and editor state.
+   *
+   *  Disabled while a run is in flight: the per-session walk reads
+   *  `ticksBySessionIdRef.current.get(s.id)` mid-loop, and yanking the
+   *  Maps out from under it would silently produce all-NaN tick
+   *  indicators in any session whose blob got cleared between the loop
+   *  iteration and the prior fetch. Cheap to disable — the user can
+   *  always Cancel first, then Reset. */
+  const handleResetCaches = useCallback(() => {
+    ticksBySessionIdRef.current.clear();
+    tickRangesBySessionIdRef.current.clear();
+    barAggregationSecondsRef.current.clear();
+    backtestCacheRef.current.clear();
+    // Also drop the loaded-bars Map so a subsequent Run re-aggregates
+    // from scratch. We keep the selectedSessionIds set untouched so the
+    // user's chip selection survives — the trigger useEffect at the
+    // selectedSessionIds dep will re-fire fetchBarsForSession for each
+    // selected session.
+    setBarsBySessionId(new Map());
+  }, []);
+
   // ─── Bar cache: session_id → ReplayBar[] ─────────────────────────
   // Filled lazily as days are selected. Toggling a day off does NOT clear the
   // cache so re-selecting it is instant. `loadingSessionIds` tracks fetches
@@ -2115,6 +2142,41 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
   // stale entries without scanning the bars themselves. Stays in a ref
   // (not state) because consumers only read it via fetchBarsForSession.
   const barAggregationSecondsRef = useRef<Map<number, number>>(new Map());
+
+  // ── Tick-cache LRU cap ───────────────────────────────────────────────
+  // Each ParsedTicks entry holds tens of MB of typed arrays (Float64Array
+  // bid/ask buffers, Int32Array timestamps, etc.). Without a bound, the
+  // three Maps above grow monotonically as the user clicks Run with
+  // different day selections — the dashboard never frees them. After an
+  // afternoon of script-tweaking across many days, the heap fills with
+  // unreachable-but-pinned tick blobs and GC pauses get progressively
+  // worse, manifesting as "the dashboard gets slower the longer I use it."
+  // Cap is intentionally generous (12 sessions ≈ 700MB worst case for
+  // tick_bidask blobs); a typical walk-forward window is 5-10 days, well
+  // under the cap so the common case never evicts.
+  const TICK_CACHE_MAX_SESSIONS = 12;
+
+  // Walks the three tick caches (Map insertion order = LRU oldest-first)
+  // and deletes entries until size ≤ cap. Called after each insertion in
+  // the fetcher (see fetchBarsForSession) and from the commit-time sweep
+  // effect (below) when the user runs against a different selection. All
+  // three Maps are kept in sync because they share the sessionId key —
+  // dropping a tick blob without dropping its tickRanges/aggregationSeconds
+  // would leave dangling consumer state.
+  const evictTickCacheToCap = useCallback(() => {
+    const ticksMap = ticksBySessionIdRef.current;
+    if (ticksMap.size <= TICK_CACHE_MAX_SESSIONS) return;
+    const overflow = ticksMap.size - TICK_CACHE_MAX_SESSIONS;
+    const it = ticksMap.keys();
+    for (let i = 0; i < overflow; i++) {
+      const next = it.next();
+      if (next.done) break;
+      const sid = next.value;
+      ticksBySessionIdRef.current.delete(sid);
+      tickRangesBySessionIdRef.current.delete(sid);
+      barAggregationSecondsRef.current.delete(sid);
+    }
+  }, []);
 
   // Same for the active aggregation timeframe — the fetcher reads it
   // through a ref so the useCallback can keep stable identity.
@@ -2323,7 +2385,21 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
               3600
             );
             parsed = await fetchAndParseTicks(signedUrl);
+            // Delete-then-set so a re-fetch bumps this session to the
+            // tail of the Map's insertion-order iteration (= newest-first
+            // in our LRU scheme). Without the explicit delete, .set() on
+            // an existing key keeps the entry at its ORIGINAL position,
+            // which would mean a frequently-used session could be evicted
+            // before a stale-but-recently-inserted one.
+            ticksBySessionIdRef.current.delete(sessionId);
             ticksBySessionIdRef.current.set(sessionId, parsed);
+            // Eviction triggered after insertion so a fresh fetch drops
+            // the oldest unused tick blob if we'd otherwise exceed the
+            // cap. Note that tickRanges/aggregationSeconds for THIS
+            // session are written below — we evict here to avoid
+            // touching this session's slot before its sibling Maps are
+            // populated.
+            evictTickCacheToCap();
           }
 
           // 2. Aggregate to bars at the active timeframe. Always reads
@@ -2338,7 +2414,14 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
             { kind: "time", seconds: sec },
             sessionId
           );
+          // Same delete-then-set LRU bump as above so re-aggregating a
+          // session moves all three Maps' entries to the newest position
+          // together. Keeps the three Maps in sync with the ticks Map's
+          // ordering — if we didn't bump in lockstep, evictTickCacheToCap
+          // could drop a tickRanges entry whose ticks are still resident.
+          barAggregationSecondsRef.current.delete(sessionId);
           barAggregationSecondsRef.current.set(sessionId, sec);
+          tickRangesBySessionIdRef.current.delete(sessionId);
           tickRangesBySessionIdRef.current.set(sessionId, aggregated.tickRanges);
 
           setBarsBySessionId((prev) => {
@@ -2444,6 +2527,34 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [aggregationTimeframeSec]);
+
+  // ── Commit-time tick-cache sweep ───────────────────────────────────
+  // When the user clicks Run with a different selection than the previous
+  // commit, drop tick-cache entries for sessions that are NOT in the new
+  // committed set IF the cache is over its size cap. The "if over cap"
+  // guard means the common case (small selections, alternating between
+  // 2-3 sessions) never evicts, so chip-toggling stays free — see the
+  // ref-cache UX comment near barsBySessionIdRef. Only when the user has
+  // accumulated more than TICK_CACHE_MAX_SESSIONS distinct tick blobs
+  // across runs does this kick in. Bound by `committedSessionIds` (the
+  // Run-click commit) rather than `selectedSessionIds` (which changes on
+  // every chip toggle) so toggling chips between runs doesn't trigger
+  // re-fetch — only an actual Run with a different day range does.
+  useEffect(() => {
+    if (ticksBySessionIdRef.current.size <= TICK_CACHE_MAX_SESSIONS) return;
+    // Snapshot keys before mutating — deleting while iterating .keys()
+    // is well-defined for Map but Array.from is clearer and decouples
+    // the iteration from mutation order.
+    for (const id of Array.from(ticksBySessionIdRef.current.keys())) {
+      if (committedSessionIds.has(id)) continue;
+      ticksBySessionIdRef.current.delete(id);
+      tickRangesBySessionIdRef.current.delete(id);
+      barAggregationSecondsRef.current.delete(id);
+      // Bail as soon as we're back under the cap — no need to drop
+      // every non-committed entry if we only had one over.
+      if (ticksBySessionIdRef.current.size <= TICK_CACHE_MAX_SESSIONS) break;
+    }
+  }, [committedSessionIds]);
 
   // Toggle one session in/out of the selection
   const toggleSession = (id: number) => {
@@ -2968,6 +3079,34 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
           }
         : null,
     });
+
+    // ── Stale-config cache prune ────────────────────────────────────────
+    // The 60-entry insertion-order LRU on backtestCacheRef is keyed by
+    // sessionId only. When the user tweaks the script and re-runs, every
+    // cached entry whose stored configKey doesn't match the new configKey
+    // is dead weight — the configKey check in the per-session loop will
+    // always recompute, but the stale `result` object (with its large
+    // synthetic-bar / tick-ctx / ATR Maps) stays pinned in its session
+    // slot until that slot is overwritten by a future run.
+    //
+    // After many script tweaks across overlapping selections, the cache
+    // accumulates a session's worth of dead-config result objects per
+    // tweak. The unreferenced-but-pinned data drives GC pressure and is
+    // the primary cause of the dashboard "getting slower over time"
+    // during heavy script iteration.
+    //
+    // Conservative prune: drop entries whose configKey is stale AND whose
+    // session is NOT in the current commit. Entries for sessions that ARE
+    // in this run survive (with their stale config) because the per-
+    // session loop below will overwrite them in-place this run anyway —
+    // pruning them here would just delete-and-immediately-re-add. O(60)
+    // walk; effectively free.
+    const cacheToPrune = backtestCacheRef.current;
+    for (const [sid, entry] of cacheToPrune) {
+      if (entry.configKey !== configKey && !committedSessionIds.has(sid)) {
+        cacheToPrune.delete(sid);
+      }
+    }
 
     const allTrades: SimZoneResult[] = [];
     const allZones: TradeZone[] = [];
@@ -6007,6 +6146,30 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
               title="Replace the editor contents with the canonical default script — every schema field at its default value. Discards your edits and ignores the dashboard's current state."
             >
               Load Defaults
+            </button>
+            {/* Reset Caches — manual heap relief. The dashboard owns
+                three large caches (tick blobs, aggregated bars, per-
+                session backtest results) that the per-Run prune logic
+                already trims aggressively. This button is the explicit
+                lever for the worst case: when the user has tweaked
+                scripts so many times that the heap feels weighty even
+                after the automatic prune. Clearing forces re-fetch +
+                re-aggregation on the next Run (one-time cost) but
+                returns the heap to a clean floor without losing the
+                script draft, selection, or editor state that a page
+                reload would discard. Disabled mid-run because the per-
+                session walk reads `ticksBySessionIdRef` inline. */}
+            <button
+              onClick={handleResetCaches}
+              disabled={isRunning || scriptRunProgress !== null}
+              className={`px-2.5 py-1 rounded text-xs font-medium transition-colors ${
+                isRunning || scriptRunProgress !== null
+                  ? "bg-white/5 text-muted-foreground/40 cursor-not-allowed"
+                  : "bg-white/5 text-muted-foreground hover:text-foreground hover:bg-white/10"
+              }`}
+              title="Clear tick blobs, aggregated bars, and per-session result caches. Use if the dashboard feels slow after many runs with different scripts. The next Run will re-fetch + re-aggregate everything (one-time cost). Disabled while a run is in flight."
+            >
+              Reset Caches
             </button>
             {/* Run / Cancel toggle. While the async optimizer is in
                 flight (`scriptRunProgress` non-null) the button flips
