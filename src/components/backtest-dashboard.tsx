@@ -2942,12 +2942,15 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
       stratOptimizeSpecs = parsedStrategy.optimizeSpecs;
       const hasSignals = parsedStrategy.stmts.some((s) => s.kind === "signal");
       if (hasSignals && parsedStrategy.errors.every((e) => e.severity !== "error")) {
-        // Keep `let` bindings (referenced by signal expressions) and
-        // the signal stmts themselves. Drop generic `assign` stmts —
-        // those route through the existing line-based DSL machinery
-        // (rules.X = …, filters.X = …) and shouldn't double-apply.
+        // Keep `let` bindings (referenced by signal expressions),
+        // signal stmts, and `graph = <expr>` directives (the engine
+        // surfaces them as runResult.graphDirectives so the dashboard
+        // can render P&L histograms in Trade Segment Analysis). Drop
+        // generic `assign` stmts — those route through the existing
+        // line-based DSL machinery (rules.X = …, filters.X = …) and
+        // shouldn't double-apply.
         const stmts = parsedStrategy.stmts.filter(
-          (s) => s.kind === "let" || s.kind === "signal"
+          (s) => s.kind === "let" || s.kind === "signal" || s.kind === "graph"
         );
         const paramOverrides: Record<string, number> = { ...params };
         for (const ref of parsedStrategy.paramRefs) {
