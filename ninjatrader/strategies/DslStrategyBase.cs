@@ -411,6 +411,15 @@ namespace NinjaTrader.NinjaScript.Strategies
         private int  _evalLogCount; // bumped per Eval-line emission
         private int  _evalLogLimit = 50; // first N in-window bars logged verbosely
 
+        // ── Per-bar signal audit (phantom-trade diagnostic) ─────────────
+        // One row per bar where LongCondition() OR ShortCondition() was
+        // true, capturing whether the candidate dispatched and — if not —
+        // which gate rejected it. Written to signal_audit_<id>.csv at
+        // strategy end, alongside the per-trade CSV. Used to pin down the
+        // ~170 dashboard-only "phantom trades" against NT8's rejections
+        // when diff-backtests.mjs flags them.
+        private readonly List<string> _signalAuditRows = new List<string>();
+
         /// <summary>Print only when VerboseLogging is enabled. Cuts the
         /// caller's "if (VerboseLogging) Print(...)" boilerplate.</summary>
         private void Log(string msg)
@@ -495,6 +504,10 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // as PresetStrategy.ExportTradesCsv() so a single tool
                 // can compare both legacy presets and DSL transpiles.
                 ExportTradesCsv();
+                // Phantom-trade diagnostic — one row per fired-signal bar
+                // including the gate that rejected it (if any). Pairs with
+                // the per-trade CSV: same backtest, same outgoing/ folder.
+                ExportSignalAuditCsv();
             }
         }
 
@@ -637,6 +650,99 @@ namespace NinjaTrader.NinjaScript.Strategies
             catch (Exception ex)
             {
                 Print("[DslStrategyBase] ExportTradesCsv ERROR: " + ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// Append one row to the signal-audit buffer. Called at every
+        /// gate that rejects a fired candidate, plus at successful
+        /// dispatch. Only invoke when `direction` actually fired this
+        /// bar — otherwise the file balloons with no-signal noise.
+        ///
+        /// Columns capture the bar timestamp, which side fired, the
+        /// verdict ("dispatched" / "rejected"), the gate that produced
+        /// the verdict, and a handful of state fields useful when
+        /// diffing against the dashboard's phantom trades:
+        ///   - close, atr14: bar identity + indicator value parity
+        ///   - bars_since_last_long_fire / _short_fire: cooldown state
+        ///     for the DSL's release-on-dip lockout
+        ///   - cooldown_min_remaining: minutes left on the SimRules-level
+        ///     CooldownBetweenTradesBars gate (-1 if not in cooldown)
+        /// </summary>
+        private void RecordSignalAudit(string direction, string verdict, string reason)
+        {
+            try
+            {
+                double atr14 = DslIndicators.Atr(_bars, 0, 14);
+                double bsLong  = _dsl != null ? _dsl.BarsSinceLastFiringLong(CurrentBar)  : double.NaN;
+                double bsShort = _dsl != null ? _dsl.BarsSinceLastFiringShort(CurrentBar) : double.NaN;
+                double cooldownMin = -1;
+                if (_rules.CooldownBetweenTradesEnabled
+                    && _rules.CooldownBetweenTradesBars > 0
+                    && _lastKeptExitTime.HasValue)
+                {
+                    double elapsed = (Time[0] - _lastKeptExitTime.Value).TotalMinutes;
+                    double remaining = _rules.CooldownBetweenTradesBars - elapsed;
+                    cooldownMin = remaining > 0 ? remaining : 0;
+                }
+
+                var sb = new StringBuilder();
+                sb.Append(Time[0].ToString("yyyy-MM-ddTHH:mm:ss", CultureInfo.InvariantCulture)); sb.Append(',');
+                sb.Append(Time[0].ToUniversalTime().ToString("yyyy-MM-ddTHH:mm:ssZ", CultureInfo.InvariantCulture)); sb.Append(',');
+                sb.Append(CurrentBar.ToString(CultureInfo.InvariantCulture)); sb.Append(',');
+                sb.Append(direction); sb.Append(',');
+                sb.Append(verdict); sb.Append(',');
+                sb.Append(reason); sb.Append(',');
+                sb.Append(Close[0].ToString("F2", CultureInfo.InvariantCulture)); sb.Append(',');
+                sb.Append(Dsl.IsFinite(atr14) ? atr14.ToString("F4", CultureInfo.InvariantCulture) : "NaN"); sb.Append(',');
+                sb.Append(Dsl.IsFinite(bsLong)  ? bsLong.ToString ("F0", CultureInfo.InvariantCulture) : "Inf"); sb.Append(',');
+                sb.Append(Dsl.IsFinite(bsShort) ? bsShort.ToString("F0", CultureInfo.InvariantCulture) : "Inf"); sb.Append(',');
+                sb.Append(cooldownMin.ToString("F2", CultureInfo.InvariantCulture));
+                _signalAuditRows.Add(sb.ToString());
+            }
+            catch
+            {
+                // Audit must never break the strategy. Swallow silently —
+                // missing rows are easier to debug than a crashed run.
+            }
+        }
+
+        /// <summary>
+        /// Write the buffered signal-audit rows to
+        /// {UserDataDir}/outgoing/signal_audit_{id}.csv. Mirrors the file-
+        /// id format of ExportTradesCsv so corresponding pairs land
+        /// adjacent in the outgoing/ folder. Skipped when no rows were
+        /// recorded (e.g. the script never had a signal evaluate true).
+        /// </summary>
+        private void ExportSignalAuditCsv()
+        {
+            try
+            {
+                int n = _signalAuditRows.Count;
+                if (n == 0) return;
+
+                string outgoingDir = Path.Combine(NinjaTrader.Core.Globals.UserDataDir, "outgoing");
+                Directory.CreateDirectory(outgoingDir);
+
+                string fileId =
+                    DateTime.UtcNow.ToString("yyyyMMdd_HHmmss_fff", CultureInfo.InvariantCulture)
+                    + "_" + (Name ?? "dsl") + "_" + n + "rows";
+                string outputPath = Path.Combine(outgoingDir, "signal_audit_" + fileId + ".csv");
+
+                var sb = new StringBuilder();
+                sb.Append("bar_time_session,bar_time_utc,bar_index,direction,verdict,reason,");
+                sb.Append("close,atr14,bars_since_last_long_fire,bars_since_last_short_fire,cooldown_min_remaining\n");
+                for (int i = 0; i < n; i++)
+                {
+                    sb.Append(_signalAuditRows[i]);
+                    sb.Append('\n');
+                }
+                File.WriteAllText(outputPath, sb.ToString(), new UTF8Encoding(false));
+                Print("[DslStrategyBase] Signal audit CSV written: " + outputPath + " (" + n + " rows)");
+            }
+            catch (Exception ex)
+            {
+                Print("[DslStrategyBase] ExportSignalAuditCsv ERROR: " + ex.Message);
             }
         }
 
@@ -783,25 +889,54 @@ namespace NinjaTrader.NinjaScript.Strategies
             // Round-5: count bars that reach signal-eval as "post-warmup".
             _ssTotalPostWarmup++;
 
-            if (_dailyHalted) { _ssDailyHaltSkipped++; return; }
+            if (_dailyHalted)
+            {
+                _ssDailyHaltSkipped++;
+                if (longFired)  RecordSignalAudit("Long",  "rejected", "daily_halt");
+                if (shortFired) RecordSignalAudit("Short", "rejected", "daily_halt");
+                return;
+            }
 
             // ── Per-day caps + cooldown gate ────────────────────────
             if (_rules.MaxTradesPerDayEnabled
                 && _rules.MaxTradesPerDay > 0
-                && _dailyTradesEntered >= _rules.MaxTradesPerDay) { _ssMaxTradesSkipped++; return; }
+                && _dailyTradesEntered >= _rules.MaxTradesPerDay)
+            {
+                _ssMaxTradesSkipped++;
+                if (longFired)  RecordSignalAudit("Long",  "rejected", "max_trades_per_day");
+                if (shortFired) RecordSignalAudit("Short", "rejected", "max_trades_per_day");
+                return;
+            }
             if (_rules.MaxLossesPerDayEnabled
                 && _rules.MaxLossesPerDay > 0
-                && _dailyLosses >= _rules.MaxLossesPerDay) { _ssMaxLossesSkipped++; return; }
+                && _dailyLosses >= _rules.MaxLossesPerDay)
+            {
+                _ssMaxLossesSkipped++;
+                if (longFired)  RecordSignalAudit("Long",  "rejected", "max_losses_per_day");
+                if (shortFired) RecordSignalAudit("Short", "rejected", "max_losses_per_day");
+                return;
+            }
             if (_rules.CooldownBetweenTradesEnabled
                 && _rules.CooldownBetweenTradesBars > 0
                 && _lastKeptExitTime.HasValue)
             {
                 double minutes = (Time[0] - _lastKeptExitTime.Value).TotalMinutes;
-                if (minutes < _rules.CooldownBetweenTradesBars) { _ssCooldownSkipped++; return; }
+                if (minutes < _rules.CooldownBetweenTradesBars)
+                {
+                    _ssCooldownSkipped++;
+                    if (longFired)  RecordSignalAudit("Long",  "rejected", "cooldown_between_trades");
+                    if (shortFired) RecordSignalAudit("Short", "rejected", "cooldown_between_trades");
+                    return;
+                }
             }
 
             // ── Time-of-day filter ───────────────────────────────────
-            if (!TimeFilterPasses(Time[0])) return;
+            if (!TimeFilterPasses(Time[0]))
+            {
+                if (longFired)  RecordSignalAudit("Long",  "rejected", "time_filter");
+                if (shortFired) RecordSignalAudit("Short", "rejected", "time_filter");
+                return;
+            }
             _ssTimePassed++;
 
             // longFired / shortFired were computed above (round-9).
@@ -839,12 +974,14 @@ namespace NinjaTrader.NinjaScript.Strategies
             {
                 Log("[" + (Name ?? "DslStrategyBase") + "] Long rejected by trend filter at bar " + CurrentBar);
                 _ssLongTrendRejected++;
+                RecordSignalAudit("Long", "rejected", "trend_filter");
                 longFired = false;
             }
             if (shortFired && !trendShortOk)
             {
                 Log("[" + (Name ?? "DslStrategyBase") + "] Short rejected by trend filter at bar " + CurrentBar);
                 _ssShortTrendRejected++;
+                RecordSignalAudit("Short", "rejected", "trend_filter");
                 shortFired = false;
             }
             if (!_loggedFirstEval)
@@ -875,9 +1012,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // happens regardless of dispatch-gate outcome.
                 var entryRules = _rules.Clone();
                 bool filterPass = LongApplyFilters(entryRules);
-                if (!filterPass) _ssLongFilterIfRejected++;
+                if (!filterPass) { _ssLongFilterIfRejected++; RecordSignalAudit("Long", "rejected", "filter_if"); }
                 bool modeAllowed = filterPass && PositionModeAllows("Long");
-                if (filterPass && !modeAllowed) _ssLongModeRejected++;
+                if (filterPass && !modeAllowed) { _ssLongModeRejected++; RecordSignalAudit("Long", "rejected", "position_mode"); }
                 Log("[" + (Name ?? "DslStrategyBase") + "] LONG signal at bar " + CurrentBar
                     + " " + Time[0].ToString("HH:mm:ss", CultureInfo.InvariantCulture)
                     + " close=" + Close[0].ToString("F2", CultureInfo.InvariantCulture)
@@ -899,6 +1036,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     _lastKeptExitTime = Time[0];
                     firedLong = true;
                     _ssLongDispatched++;
+                    RecordSignalAudit("Long", "dispatched", "");
                 }
             }
             if (!firedLong && shortFired)
@@ -906,9 +1044,9 @@ namespace NinjaTrader.NinjaScript.Strategies
                 // Firing-tracker push moved up above (round-9).
                 var entryRules = _rules.Clone();
                 bool filterPass = ShortApplyFilters(entryRules);
-                if (!filterPass) _ssShortFilterIfRejected++;
+                if (!filterPass) { _ssShortFilterIfRejected++; RecordSignalAudit("Short", "rejected", "filter_if"); }
                 bool modeAllowed = filterPass && PositionModeAllows("Short");
-                if (filterPass && !modeAllowed) _ssShortModeRejected++;
+                if (filterPass && !modeAllowed) { _ssShortModeRejected++; RecordSignalAudit("Short", "rejected", "position_mode"); }
                 Log("[" + (Name ?? "DslStrategyBase") + "] SHORT signal at bar " + CurrentBar
                     + " " + Time[0].ToString("HH:mm:ss", CultureInfo.InvariantCulture)
                     + " close=" + Close[0].ToString("F2", CultureInfo.InvariantCulture)
@@ -920,6 +1058,7 @@ namespace NinjaTrader.NinjaScript.Strategies
                     // Round-13: see Long branch comment above.
                     _lastKeptExitTime = Time[0];
                     _ssShortDispatched++;
+                    RecordSignalAudit("Short", "dispatched", "");
                 }
             }
         }
