@@ -720,8 +720,11 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
     setParams({ ...safe.params });
     setParamsVersion((v) => v + 1);
 
-    setRules(safe.rules);
-    setRulesVersion((v) => v + 1);
+    // INTENTIONALLY DO NOT setRules(safe.rules) here. Rules now come
+    // exclusively from the DSL editor — applying the preset's `script`
+    // field (which the next debounce of handleApplyScript will parse)
+    // is what populates the rules state. If the preset's script lacks
+    // a `rules.X = Y` directive, that field stays at DEFAULT_SIM_RULES.
 
     // Filter values flow from the preset's `script` field (parsed and
     // applied automatically by handleApplyScript on the next debounce).
@@ -963,12 +966,16 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
     );
     setTimeframeFilter(s.timeframeFilter ?? "");
 
-    // Strategy + params + rules — same flow handleLoadPreset uses.
+    // Strategy + params — same flow handleLoadPreset uses.
     setStrategyId(safe.strategyId);
     setParams({ ...safe.params });
     setParamsVersion((v) => v + 1);
-    setRules(safe.rules);
-    setRulesVersion((v) => v + 1);
+    // Rules are NOT applied from the remote snapshot. The DSL editor
+    // is the single source of truth — when the remote script syncs
+    // through (and handleApplyScript re-parses it), rules rebuild from
+    // DEFAULT_SIM_RULES + DSL `rules.X = Y` directives. Applying a
+    // remote `safe.rules` here would re-introduce the cooldown /
+    // fillMode leak the user reported.
 
     // Filter values are no longer applied directly from the remote
     // snapshot — they ride along on the parsed applied script (which
@@ -1921,29 +1928,18 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
           (inferred as Record<string, boolean>)[enKey as string] = true;
         }
       }
-      // Merge order: previous state → all-disabled → inferred enables
-      // from value-field presence → script's explicit overrides last.
-      setRules((prev) => ({ ...prev, ...inferred, ...cfg.rules }));
+      // Rebuild from DEFAULT_SIM_RULES every time, NOT from prev. The
+      // DSL editor is the only source of truth for rules — anything
+      // not declared in the script must fall back to the defaults so
+      // a previously-loaded preset / a stale cross-tab snapshot can't
+      // smuggle a rule (e.g. cooldownBetweenTradesEnabled = true) into
+      // the live state and from there into NT8 via TO NT8.
+      setRules({ ...DEFAULT_SIM_RULES, ...inferred, ...cfg.rules });
       setRulesVersion((v) => v + 1);
     } else {
-      // Script has no rules at all — still reset the *Enabled flags to
-      // false so a previously-applied script with `rules.stopLossPoints`
-      // doesn't leave its enable lit when the next script omits it.
-      setRules((prev) => ({
-        ...prev,
-        stopLossEnabled: false,
-        takeProfitEnabled: false,
-        trailingStopEnabled: false,
-        timedExitEnabled: false,
-        breakEvenEnabled: false,
-        extensionBarsEnabled: false,
-        dailyStopLossEnabled: false,
-        dailyTakeProfitEnabled: false,
-        maxTradesPerDayEnabled: false,
-        maxLossesPerDayEnabled: false,
-        cooldownBetweenTradesEnabled: false,
-        scalingEnabled: false,
-      }));
+      // Script has no rules at all — reset to defaults wholesale so
+      // nothing from a prior script / preset survives.
+      setRules({ ...DEFAULT_SIM_RULES });
       setRulesVersion((v) => v + 1);
     }
 
@@ -4391,8 +4387,11 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
         cancelRef,
         runResult.syntheticAtrByZoneId
       ).then((result) => {
-        setRules((prev) => ({ ...prev, ...result.bestRules }));
-        setRulesVersion((v) => v + 1);
+        // Optimizer no longer mutates the live rules state — the DSL
+        // editor owns rules. The result still surfaces in the UI so
+        // the user can copy the tuned values into the DSL by hand
+        // (e.g. add `rules.slAtrAdjust = 18` to the script).
+        void result;
         setOptimizing(false);
         setOptimizeProgress(null);
       });
@@ -4431,8 +4430,10 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
         atrCancelRef,
         runResult.syntheticAtrByZoneId
       ).then((result) => {
-        setRules((prev) => ({ ...prev, ...result.bestRules }));
-        setRulesVersion((v) => v + 1);
+        // ATR optimizer no longer mutates the live rules state — same
+        // policy as runOptimizeChunked: tuned values must be copied
+        // into the DSL by the user (e.g. `rules.slAtrAdjust = 22`).
+        void result;
         setOptimizingAtr(false);
         setOptimizeAtrProgress(null);
       });

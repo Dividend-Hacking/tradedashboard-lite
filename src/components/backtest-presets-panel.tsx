@@ -221,20 +221,20 @@ function BacktestPresetsPanelImpl({
     if (!selected) return;
     setConvertState("running");
     try {
-      // Live overrides win over the saved preset row. The user's
-      // intuition was right: when in local mode, the saved preset rules
-      // (sourced from Supabase OR local SQLite, whichever the active
-      // mode resolves to) were drifting from the rules currently shown
-      // in the dashboard's rules editor. Re-transpiling kept producing
-      // the same stale C# because /api/convert-to-nt8 reads
-      // `preset.rules` and we were sending `selected.rules` rather
-      // than the live editor state.
+      // The DSL editor is the ONLY source of truth for rules and
+      // filters. Send empty objects so the transpiler emits only the
+      // `rules.X = Y` and `filter.if = …` directives parsed out of
+      // the DSL itself — every field the DSL doesn't set falls back
+      // to the C# class defaults in DslStrategyBase. This is what
+      // keeps NT8 from quietly inheriting stale per-preset rules
+      // (cooldownBetweenTrades, fillMode, etc.) that the user never
+      // wrote in the script.
       const presetForExport: BacktestPreset = {
         ...selected,
         script: liveScript && liveScript.length > 0 ? liveScript : selected.script,
         paramMeta: liveParamMeta ?? selected.paramMeta,
-        rules: liveRules ?? selected.rules,
-        filters: liveFilters ?? selected.filters,
+        rules: {} as BacktestPreset["rules"],
+        filters: {} as BacktestPreset["filters"],
       };
       const resp = await fetch("/api/convert-to-nt8", {
         method: "POST",
