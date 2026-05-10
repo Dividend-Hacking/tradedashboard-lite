@@ -4705,6 +4705,8 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
         onMoveBucket={handleMoveBucketPreset}
         liveScript={scriptText}
         liveParamMeta={scriptParamMeta}
+        liveRules={rules}
+        liveFilters={appliedFilters}
       />
 
       {/* Script editor lives in the RIGHT RAIL aside near the bottom of

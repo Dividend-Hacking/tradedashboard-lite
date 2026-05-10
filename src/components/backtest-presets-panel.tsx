@@ -62,6 +62,17 @@ interface BacktestPresetsPanelProps {
   liveScript?: string;
   /** Live param metadata, same rationale as liveScript. */
   liveParamMeta?: BacktestPreset["paramMeta"];
+  /** Live SimRules from the dashboard's rules editor — overrides
+   *  `selected.rules` for TO NT8. Without this, /api/convert-to-nt8
+   *  bakes the SAVED preset's rules into the C# file even after the
+   *  user has edited cooldown / fillMode / etc. in the dashboard,
+   *  causing NT8 to drift silently from the dashboard backtest. */
+  liveRules?: BacktestPreset["rules"];
+  /** Live PresetFilters from the dashboard, same rationale as
+   *  liveRules. The transpiler synthesizes `filter.if` directives
+   *  from legacy filters (adx, atr, trend, etc.) so a stale
+   *  `selected.filters` produces stale ADX/ATR gates in NT8. */
+  liveFilters?: BacktestPreset["filters"];
 }
 
 /** Tailwind classes for the small bucket badge, keyed by bucket. Each
@@ -87,6 +98,8 @@ function BacktestPresetsPanelImpl({
   onMoveBucket,
   liveScript,
   liveParamMeta,
+  liveRules,
+  liveFilters,
 }: BacktestPresetsPanelProps) {
   // Currently-selected preset id in the dropdown. "" = no selection (the
   // initial placeholder option). Kept here rather than in the parent
@@ -208,10 +221,20 @@ function BacktestPresetsPanelImpl({
     if (!selected) return;
     setConvertState("running");
     try {
+      // Live overrides win over the saved preset row. The user's
+      // intuition was right: when in local mode, the saved preset rules
+      // (sourced from Supabase OR local SQLite, whichever the active
+      // mode resolves to) were drifting from the rules currently shown
+      // in the dashboard's rules editor. Re-transpiling kept producing
+      // the same stale C# because /api/convert-to-nt8 reads
+      // `preset.rules` and we were sending `selected.rules` rather
+      // than the live editor state.
       const presetForExport: BacktestPreset = {
         ...selected,
         script: liveScript && liveScript.length > 0 ? liveScript : selected.script,
         paramMeta: liveParamMeta ?? selected.paramMeta,
+        rules: liveRules ?? selected.rules,
+        filters: liveFilters ?? selected.filters,
       };
       const resp = await fetch("/api/convert-to-nt8", {
         method: "POST",
