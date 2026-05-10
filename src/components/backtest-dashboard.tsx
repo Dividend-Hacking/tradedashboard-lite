@@ -1297,6 +1297,27 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
   // and React commits the new result.
   const [isRunning, setIsRunning] = useState(false);
 
+  // ── Run-trigger gate ─────────────────────────────────────────────────
+  // Counter that only increments when the user explicitly clicks Run
+  // (incremented at the END of handleApplyScript, which is itself only
+  // called from handleRun via the double-rAF). The per-session walk
+  // useEffect lists ONLY this id in its deps — everything else
+  // (committedSessionIds, scriptParams, rules, strategy, indicatorConfig,
+  // bars, …) is read via closure but does NOT trigger the effect on its
+  // own. This is what makes "only Run causes simulation" work: chip
+  // toggles, strategy-dropdown swaps, slider drags, and Reset Caches
+  // (which clears+refetches bars) all change underlying state but
+  // don't bump runRequestId, so the simulator stays put.
+  //
+  // Trade-off: clicking Run while bars are still loading walks ONLY the
+  // sessions whose bars happened to be loaded at click time. Late
+  // arrivals don't auto-include — the user clicks Run again to pick
+  // them up. This matches the user's stated intent ("only simulate
+  // when I press the run button") and is the simpler primitive to
+  // reason about than an "auto-refire when bars arrive AFTER an
+  // unsatisfied Run" gate.
+  const [runRequestId, setRunRequestId] = useState(0);
+
   // ── Disk-backed script (Claude Code bridge) ──────────────────────────
   // When non-null, every change to `scriptText` is debounced and PUT to
   // `backtests/scripts/<activeScriptName>`, AND a Server-Sent-Events
@@ -1984,6 +2005,15 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
     if (strategyChanged && !rewrite) {
       showToast(`Applied script · strategy → ${cfg.strategy}`);
     }
+
+    // Bump the run-trigger gate — this is the single signal the per-
+    // session walk effect below subscribes to. Putting it at the END of
+    // handleApplyScript ensures all the state setters above (script
+    // text, params, rules, filters, exits, optimize specs, …) are in
+    // the SAME render commit as the runRequestId bump. The effect then
+    // fires once with all inputs already up to date, instead of firing
+    // multiple times as each setter individually changed.
+    setRunRequestId((id) => id + 1);
   }, [scriptText, strategyId, showToast]);
 
   // Edits to `scriptText` no longer auto-trigger a parse + Apply. The
@@ -2858,10 +2888,19 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
       // collapse to the no-data view. This is the only branch where we
       // proactively wipe the prior result; mid-run dep changes keep the
       // prior result visible until the new run lands.
+      //
+      // Also clear isRunning here. The watcher effect that normally
+      // clears it (`if (isRunning && scriptRunProgress === null)`) is
+      // gated on `runResult` identity changing, but `emptyBacktestRunResult`
+      // is a stable ref — setting state to the same ref is a no-op on
+      // React's render side, so the watcher wouldn't fire and the
+      // spinner would stick on after a Run click that produced no
+      // ready sessions (e.g. clicked before bars loaded).
       setRunResultState(emptyBacktestRunResult);
       setScriptRunProgress(null);
       setSimRunStartedAt(null);
       setSimCurrentSessionLabel(null);
+      setIsRunning(false);
       return;
     }
 
@@ -3468,7 +3507,26 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
     return () => {
       myCancel.current = true;
     };
-  }, [committedSessionIds, sessions, barsBySessionId, currentStrategy, params, rules, indicatorConfig, scriptNumericOverrides, scriptTradePrints, scriptOptimizeOverrides, scriptOptimizeAll, scriptWarmup, scriptFilterIfs, scriptExitIfs, appliedScriptText, scriptParams, scriptParamMeta, emptyBacktestRunResult]);
+    // Effect deps are deliberately just `[runRequestId]` — every other
+    // input the run reads (committedSessionIds, scriptParams, rules,
+    // strategy, indicatorConfig, bars, script overlay state, …) lives
+    // in closure and is captured at the render where runRequestId
+    // changes. handleApplyScript bumps runRequestId at the END, AFTER
+    // all the other setters in handleRun's pipeline have batched into
+    // the same commit, so the closure reads consistent state.
+    //
+    // What this gates OUT: chip toggles, strategy-dropdown swaps,
+    // slider drags on rules/params, Reset Caches' bars-clear-then-
+    // refetch, and any other state change that the user hasn't
+    // explicitly committed via Run. Previously every one of those
+    // changes refired the run, which is what the user observed as
+    // "the dashboard re-simulates anytime I do anything."
+    //
+    // What this gates IN: only handleApplyScript → setRunRequestId
+    // increments. handleApplyScript is only called from handleRun
+    // (verified — the historical debounced auto-apply was removed).
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [runRequestId]);
 
   // The rest of the component reads `runResult` as a plain value — same
   // shape as the old useMemo returned. Indirection through state lets
