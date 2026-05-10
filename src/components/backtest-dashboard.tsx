@@ -2056,33 +2056,6 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
     setIsRunning(false);
   }, []);
 
-  /** Manual heap relief — clears every cache the dashboard owns. Use
-   *  when the dashboard feels slow after many runs with different
-   *  scripts (the same scenario the per-Run automatic prune handles
-   *  passively, surfaced here as an explicit lever for the worst case).
-   *  Forces re-fetch + re-aggregation on the NEXT Run, but lets the
-   *  user reset the heap floor without a full page reload — which would
-   *  also lose script draft, selection, and editor state.
-   *
-   *  Disabled while a run is in flight: the per-session walk reads
-   *  `ticksBySessionIdRef.current.get(s.id)` mid-loop, and yanking the
-   *  Maps out from under it would silently produce all-NaN tick
-   *  indicators in any session whose blob got cleared between the loop
-   *  iteration and the prior fetch. Cheap to disable — the user can
-   *  always Cancel first, then Reset. */
-  const handleResetCaches = useCallback(() => {
-    ticksBySessionIdRef.current.clear();
-    tickRangesBySessionIdRef.current.clear();
-    barAggregationSecondsRef.current.clear();
-    backtestCacheRef.current.clear();
-    // Also drop the loaded-bars Map so a subsequent Run re-aggregates
-    // from scratch. We keep the selectedSessionIds set untouched so the
-    // user's chip selection survives — the trigger useEffect at the
-    // selectedSessionIds dep will re-fire fetchBarsForSession for each
-    // selected session.
-    setBarsBySessionId(new Map());
-  }, []);
-
   // ─── Bar cache: session_id → ReplayBar[] ─────────────────────────
   // Filled lazily as days are selected. Toggling a day off does NOT clear the
   // cache so re-selecting it is instant. `loadingSessionIds` tracks fetches
@@ -2555,6 +2528,50 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
       if (ticksBySessionIdRef.current.size <= TICK_CACHE_MAX_SESSIONS) break;
     }
   }, [committedSessionIds]);
+
+  /** Manual heap relief — clears every cache the dashboard owns and
+   *  immediately re-fetches bars for whatever sessions are currently
+   *  selected so the dashboard isn't left in a "no data" hung state.
+   *
+   *  Why we have to drive the re-fetch ourselves: the trigger useEffect
+   *  that normally fires `fetchBarsForSession` is keyed on
+   *  `selectedSessionIds`. After Reset the selection set is unchanged,
+   *  so that effect won't refire. Without this manual loop the user
+   *  would see empty session chips that never load — which is exactly
+   *  what the user reported in the first iteration of this button.
+   *
+   *  Why we mutate the bars + loading REFS synchronously alongside the
+   *  setState: `fetchBarsForSession` short-circuits via
+   *  `barsBySessionIdRef.current.has(sessionId)` and
+   *  `loadingSessionIdsRef.current.has(sessionId)`. The ref-mirror
+   *  useEffects update those refs AFTER React commits, so a synchronous
+   *  `setBarsBySessionId(new Map()); fetchBarsForSession(id)` pair would
+   *  see the old (still-populated) ref and bail. Clearing the refs
+   *  ourselves makes the very next fetcher call see the empty state.
+   *
+   *  Placement note: this callback MUST live below `fetchBarsForSession`
+   *  in source order — useCallback evaluates its deps array eagerly
+   *  during render, and accessing the const before its declaration
+   *  would TDZ-throw. */
+  const handleResetCaches = useCallback(() => {
+    // Drop every cached payload the dashboard holds. All four are refs
+    // (synchronous mutation) — no batched state to wait on.
+    ticksBySessionIdRef.current.clear();
+    tickRangesBySessionIdRef.current.clear();
+    barAggregationSecondsRef.current.clear();
+    backtestCacheRef.current.clear();
+    // Synchronously clear the bars + loading REFS so the fetcher call
+    // below sees the empty state immediately rather than after the
+    // next React commit.
+    barsBySessionIdRef.current = new Map();
+    loadingSessionIdsRef.current = new Set();
+    setBarsBySessionId(new Map());
+    setLoadingSessionIds(new Set());
+    // Kick off re-fetches for the currently-selected sessions.
+    for (const id of selectedSessionIds) {
+      void fetchBarsForSession(id);
+    }
+  }, [fetchBarsForSession, selectedSessionIds]);
 
   // Toggle one session in/out of the selection
   const toggleSession = (id: number) => {
@@ -3185,6 +3202,16 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
     // any dep change (or unmount) flips the flag, the loop bails on
     // its next iteration, and the in-flight result is dropped instead
     // of clobbering a newer run's commit.
+    // Wall-clock timer for the run — used to log per-run duration and
+    // (when available) JS heap usage at start vs. end. Lets us catch
+    // monotonic slowdown across runs without forcing the user to
+    // open DevTools and run a profile session — they can just glance
+    // at the console after a few Run clicks and see if duration is
+    // climbing. Useful diagnostic for "runs feel slower over time"
+    // reports where the cause isn't immediately obvious.
+    const runStartedAt = performance.now();
+    type ChromeMemory = { usedJSHeapSize?: number; totalJSHeapSize?: number };
+    const memBefore = (performance as unknown as { memory?: ChromeMemory }).memory;
     void (async () => {
     for (let sIdx = 0; sIdx < ranSessions.length; sIdx++) {
       // Cancel check at the TOP of each iteration. If the user changed
@@ -3413,6 +3440,27 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
     setScriptRunProgress(null);
     setSimRunStartedAt(null);
     setSimCurrentSessionLabel(null);
+
+    // Per-run telemetry — log the wall-clock duration and (when the
+    // browser exposes it) the JS-heap delta. The user can compare run
+    // 1 vs. run 5 in the console: if duration climbs run-over-run
+    // even though the same script is running on the same data, we
+    // know the slowdown is real and live. usedJSHeapSize is a
+    // Chrome-only API (window.performance.memory) — guard for the
+    // undefined case so it stays a no-op everywhere else.
+    const elapsedMs = Math.round(performance.now() - runStartedAt);
+    const memAfter = (performance as unknown as { memory?: ChromeMemory }).memory;
+    if (memBefore && memAfter) {
+      const beforeMB = ((memBefore.usedJSHeapSize ?? 0) / 1_048_576).toFixed(1);
+      const afterMB = ((memAfter.usedJSHeapSize ?? 0) / 1_048_576).toFixed(1);
+      console.log(
+        `[backtest-run] sessions=${ranSessions.length} elapsed=${elapsedMs}ms heap=${beforeMB}→${afterMB}MB`,
+      );
+    } else {
+      console.log(
+        `[backtest-run] sessions=${ranSessions.length} elapsed=${elapsedMs}ms`,
+      );
+    }
     })();
 
     // Cleanup: register the cancel-flag flip so dep-changes / unmount
