@@ -49,8 +49,10 @@ export interface ExtractorCtx {
 
 /** Builds a histogram bucketing numeric values into equal-width bins between
  *  the min and max present in the data. Returns one point per non-empty bin
- *  (empty bins are dropped so x-axis labels don't get noisy on sparse data). */
-function bucketEqualWidth(
+ *  (empty bins are dropped so x-axis labels don't get noisy on sparse data).
+ *  Exported so dashboard `graph = <expr>` directives can bucket arbitrary
+ *  per-trade values without duplicating this logic. */
+export function bucketEqualWidth(
   rows: { value: number; pnl: number }[],
   bucketCount: number,
   formatLabel: (lo: number, hi: number) => string

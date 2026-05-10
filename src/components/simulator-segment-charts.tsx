@@ -2,12 +2,16 @@
  * SimulatorSegmentCharts — analytics histograms below the trade table.
  *
  * Renders a grid of per-dimension P&L histograms over the simulator's
- * SimZoneResult[]. For continuous metrics (ADX, ATR, RSI, MAE, MFE, time in
- * trade, trade #, distance from EMA20, Bollinger BW, volume) a bucket-count
- * input on the chart header re-bins the data live; for categorical
- * dimensions (direction, EMA20 / EMA200 position, Bollinger position,
- * trend correlation, hour, day of week, exit reason, position size, streak
- * before) the buckets are fixed.
+ * SimZoneResult[]. The default set covers trade-outcome dimensions (MAE,
+ * MFE, time in trade, trade #) and categorical dimensions (direction,
+ * exit reason, hour, day of week, streak before, position size).
+ *
+ * Entry-time indicator histograms (ATR/ADX/EMA/Bollinger/Volume/RSI/Trend
+ * Correlation) are NOT rendered by default any more — users opt into the
+ * specific indicator buckets they care about by writing
+ * `graph = <expr>` (or `graph["Title"] = <expr>`) in the strategy DSL.
+ * Each directive arrives here in `graphData` already evaluated at every
+ * surviving trade's entry bar; this component just buckets and renders.
  *
  * All builders use `r.scaledPoints` so the histograms reflect actual
  * size-aware realized P&L when the scaling modifier is on, matching the
@@ -18,58 +22,52 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { TradeZone, TradeZoneBar } from "@/types/trade-zone";
+import { TradeZone } from "@/types/trade-zone";
 import { SimZoneResult } from "@/lib/utils/zone-simulator";
 import { PnlByCategory } from "./charts/pnl-by-category";
 import {
   computeContextMaps,
-  buildByAdx,
-  buildByAtr,
-  buildByBollingerBw,
-  buildByDistEma20,
-  buildByVolume,
-  buildByRsi,
   buildByTimeInTrade,
   buildByMae,
   buildByMfe,
   buildByTradeNumber,
   buildByDirection,
-  buildByEma20,
-  buildByEma200,
-  buildByBollinger,
-  buildByTrendCorrelation,
   buildByHourOfDay,
   buildByDayOfWeek,
   buildByExitReason,
   buildByPositionSize,
   buildByStreakBefore,
+  bucketEqualWidth,
 } from "@/lib/utils/sim-segment-stats";
+
+/** One per-trade row produced by evaluating a `graph = <expr>` directive
+ *  at every surviving trade's entry bar. The dashboard pairs the
+ *  expression's numeric result with `t.scaledPoints` so this component
+ *  only needs to bucket — same shape `bucketEqualWidth` already takes. */
+export interface GraphDirectiveData {
+  /** Display title for the histogram (RHS source text or explicit
+   *  `graph["Title"]` label). */
+  title: string;
+  /** One row per surviving trade. NaNs are pre-filtered upstream. */
+  rows: Array<{ value: number; pnl: number }>;
+}
 
 interface SimulatorSegmentChartsProps {
   results: SimZoneResult[];
   zones: TradeZone[];
-  /** In-zone bars — used for the volume-at-entry chart. */
-  barsByZoneId?: Map<number, TradeZoneBar[]>;
-  /** Pre-entry context bars — used for RSI(14) computation. Optional;
-   *  the RSI chart simply hides when this isn't loaded. */
-  preEntryBarsByZoneId?: Map<number, TradeZoneBar[]> | null;
-  /** Per-zone ATR(14) computed from replay bars; falls back to ctx_atr14. */
-  atrByZoneId?: Map<number, number> | null;
   /** Whether the scaling modifier is currently on — used to decide if the
    *  per-position-size chart should render (otherwise every trade is ×1
    *  and the chart degenerates to a single bar). */
   scalingEnabled?: boolean;
+  /** User-declared `graph = <expr>` histograms, one per directive. Each
+   *  is rendered at the bottom of the segment-charts grid using the same
+   *  `<PnlByCategory>` component as the built-in dimensions. */
+  graphData?: GraphDirectiveData[];
 }
 
 // Default bucket counts per chart. Picked to give "useful out of the box"
 // granularity — users can tune per-chart with the inline input.
 const DEFAULT_BUCKETS: Record<string, number> = {
-  adx: 6,
-  atr: 5,
-  bollingerBw: 6,
-  distEma20: 7,
-  volume: 5,
-  rsi: 10, // 10 bins → 10pt RSI bands (0–10, 10–20, ...)
   timeInTrade: 6,
   mae: 6,
   mfe: 6,
@@ -79,10 +77,8 @@ const DEFAULT_BUCKETS: Record<string, number> = {
 export function SimulatorSegmentCharts({
   results,
   zones,
-  barsByZoneId,
-  preEntryBarsByZoneId,
-  atrByZoneId,
   scalingEnabled,
+  graphData,
 }: SimulatorSegmentChartsProps) {
   // One bucket-count value per continuous chart. State keyed by chart id.
   const [buckets, setBuckets] = useState<Record<string, number>>(DEFAULT_BUCKETS);
@@ -96,33 +92,35 @@ export function SimulatorSegmentCharts({
 
   // Build all chart data sets together so the useMemo deps are explicit and
   // a single results / zones change triggers one re-bin sweep.
+  //
+  // `graphPoints` buckets each user-declared `graph = <expr>` directive
+  // with equal-width 10-bin binning — chosen over quantile so outliers the
+  // user explicitly asked to plot stay visible at the tails. Empty bins
+  // are dropped by `bucketEqualWidth` so an arbitrary expression's natural
+  // range still renders cleanly.
   const data = useMemo(() => {
     const z = { zonesById: ctxMaps.zonesById };
-    const zAtr = { zonesById: ctxMaps.zonesById, atrByZoneId };
-    const zPre = { zonesById: ctxMaps.zonesById, preEntryBarsByZoneId };
     return {
-      adx: buildByAdx(results, z, buckets.adx),
-      atr: buildByAtr(results, zAtr, buckets.atr),
-      bollingerBw: buildByBollingerBw(results, z, buckets.bollingerBw),
-      distEma20: buildByDistEma20(results, z, buckets.distEma20),
-      volume: buildByVolume(results, { barsByZoneId }, buckets.volume),
-      rsi: buildByRsi(results, zPre, buckets.rsi),
       timeInTrade: buildByTimeInTrade(results, buckets.timeInTrade),
       mae: buildByMae(results, buckets.mae),
       mfe: buildByMfe(results, buckets.mfe),
       tradeNumber: buildByTradeNumber(results, buckets.tradeNumber),
       direction: buildByDirection(results, z),
-      ema20: buildByEma20(results, z),
-      ema200: buildByEma200(results, z),
-      bollinger: buildByBollinger(results, z),
-      trendCorr: buildByTrendCorrelation(results, z),
       hourOfDay: buildByHourOfDay(results),
       dayOfWeek: buildByDayOfWeek(results),
       exitReason: buildByExitReason(results),
       positionSize: scalingEnabled ? buildByPositionSize(results) : [],
       streakBefore: buildByStreakBefore(results, ctxMaps.streakBefore),
+      graphPoints: (graphData ?? []).map((g) => ({
+        title: g.title,
+        points: bucketEqualWidth(
+          g.rows,
+          10,
+          (lo, hi) => `${lo.toFixed(2)}–${hi.toFixed(2)}`
+        ),
+      })),
     };
-  }, [results, ctxMaps, buckets, barsByZoneId, preEntryBarsByZoneId, atrByZoneId, scalingEnabled]);
+  }, [results, ctxMaps, buckets, scalingEnabled, graphData]);
 
   // Don't render anything when there are no results yet — keeps the
   // dashboard clean during the initial loading state.
@@ -186,20 +184,10 @@ export function SimulatorSegmentCharts({
       </div>
 
       {/* Two-column responsive grid — each chart is a self-contained panel
-          with its own optional bucket input on the right of its title. */}
+          with its own optional bucket input on the right of its title.
+          Entry-time indicator histograms have moved to user-declared
+          `graph = <expr>` directives, rendered in the trailing block. */}
       <div className="grid grid-cols-1 lg:grid-cols-2 gap-4">
-        {/* ── Market context (entry-time analytics) ── */}
-        <PnlByCategory title="ADX (Trend Strength)" data={data.adx} metric={metric} headerRight={bucketInput("adx")} />
-        <PnlByCategory title="ATR (Volatility)" data={data.atr} metric={metric} headerRight={bucketInput("atr")} />
-        <PnlByCategory title="EMA20 Position" data={data.ema20} metric={metric} />
-        <PnlByCategory title="EMA200 Position" data={data.ema200} metric={metric} />
-        <PnlByCategory title="Bollinger Position" data={data.bollinger} metric={metric} />
-        <PnlByCategory title="Bollinger Bandwidth" data={data.bollingerBw} metric={metric} headerRight={bucketInput("bollingerBw")} />
-        <PnlByCategory title="Distance from EMA20 (ATR)" data={data.distEma20} metric={metric} headerRight={bucketInput("distEma20")} />
-        <PnlByCategory title="Volume at Entry" data={data.volume} metric={metric} headerRight={bucketInput("volume")} />
-        <PnlByCategory title="RSI(14) at Entry" data={data.rsi} metric={metric} headerRight={bucketInput("rsi")} />
-        <PnlByCategory title="Trend Correlation" data={data.trendCorr} metric={metric} />
-
         {/* ── Trade characteristics (outcome-time analytics) ── */}
         <PnlByCategory title="Time in Trade" data={data.timeInTrade} metric={metric} headerRight={bucketInput("timeInTrade")} />
         <PnlByCategory title="MAE (Adverse Excursion)" data={data.mae} metric={metric} headerRight={bucketInput("mae")} />
@@ -218,6 +206,20 @@ export function SimulatorSegmentCharts({
         {scalingEnabled && (
           <PnlByCategory title="Position Size" data={data.positionSize} metric={metric} />
         )}
+
+        {/* ── User-declared `graph = <expr>` histograms ──
+            One panel per directive, rendered after the built-ins so the
+            ad-hoc plots stay together at the bottom of the section. The
+            shared `metric` prop flows in unchanged so the section's
+            Total/Avg toggle flips these along with everything else. */}
+        {data.graphPoints.map((g, i) => (
+          <PnlByCategory
+            key={`graph-${i}-${g.title}`}
+            title={g.title}
+            data={g.points}
+            metric={metric}
+          />
+        ))}
       </div>
     </div>
   );

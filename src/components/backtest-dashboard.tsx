@@ -151,6 +151,7 @@ import { downloadScriptReferenceMarkdown } from "@/lib/utils/script-reference-ex
 import { buildRunSummary } from "@/lib/utils/run-summary";
 import {
   buildSummarySymbolTable,
+  evaluate,
   evaluateSummaryPrintsWithEntries,
   expressionReferencesEntryContext,
   precomputeIndicators,
@@ -3182,6 +3183,12 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
       Array<{ tradeIndex: number; value: number; objective: number; trialsRun: number }>
     > = {};
     const allOptimizationWarnings: string[] = [];
+    // Strategy-level `graph = <expr>` directives — identical across the
+    // sessions in a run, so we keep the first non-empty array seen and
+    // pass it through to the committed runResult. The dashboard's
+    // `graphDataResult` memo evaluates each directive's expr at every
+    // surviving trade's entry bar.
+    let allGraphDirectives: BacktestRunResult["graphDirectives"];
 
     const cache = backtestCacheRef.current;
     // Engine requires a strategyOverride (built-in template fallback was
@@ -3335,6 +3342,13 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
       if (result.optimizationWarnings) {
         allOptimizationWarnings.push(...result.optimizationWarnings);
       }
+      if (
+        !allGraphDirectives &&
+        result.graphDirectives &&
+        result.graphDirectives.length > 0
+      ) {
+        allGraphDirectives = result.graphDirectives;
+      }
 
       // Per-session progress update — the banner shows
       //   "Simulating · 2026-04-08 · NQ · 7 / 22"
@@ -3475,6 +3489,7 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
           : undefined,
       optimizationWarnings:
         allOptimizationWarnings.length > 0 ? allOptimizationWarnings : undefined,
+      graphDirectives: allGraphDirectives,
     });
     setScriptRunProgress(null);
     setSimRunStartedAt(null);
@@ -4665,6 +4680,94 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
     runResult.syntheticZones,
     runResult.syntheticBarsByZoneId,
     runResult.syntheticPreEntryBarsByZoneId,
+  ]);
+
+  // ── `graph = <expr>` directives ────────────────────────────────────
+  // Each directive is evaluated once per surviving trade at that
+  // trade's entry bar, then paired with the trade's scaledPoints to
+  // form the `{ value, pnl }` rows the segment-charts component
+  // buckets and renders. The pipeline mirrors `summaryPrintsResult`
+  // above:
+  //   1. Build one indicator-precompute over every directive's expr so
+  //      Wilder ATR/EMA/ADX converge to NT8 values cross-session.
+  //   2. For each surviving trade, build an EntryEvalCtx (entry bar +
+  //      indicator lookups + tickConfig) — same shape the summary
+  //      print pass uses.
+  //   3. Evaluate each directive's expr against the ctx, drop NaNs so
+  //      undefined branches (e.g. a `let` that's NaN at start-of-
+  //      session) don't poison the equal-width bucketing downstream.
+  // The output's shape matches `GraphDirectiveData[]` in
+  // simulator-segment-charts.tsx so the prop wires up directly.
+  const graphDataResult = useMemo(() => {
+    const directives = runResult.graphDirectives;
+    if (!directives || directives.length === 0 || trades.length === 0) {
+      return [];
+    }
+    const exprs: ScriptExpr[] = directives.map((d) => d.expr);
+    const indicatorByZone = precomputeIndicators(
+      runResult.syntheticZones,
+      runResult.syntheticBarsByZoneId,
+      exprs,
+      runResult.syntheticIndicatorPreEntryBarsByZoneId,
+      runResult.syntheticTickCtxByZoneId.size > 0
+        ? runResult.syntheticTickCtxByZoneId
+        : undefined,
+    );
+    const zoneById = new Map<number, TradeZone>();
+    for (const z of runResult.syntheticZones) zoneById.set(z.id, z);
+
+    // Build entry contexts ONCE up front so each directive reuses the
+    // same per-trade context — N directives × M trades stays O(N+M)
+    // for the ctx work, then O(N×M) for the eval itself.
+    const entryCtxs: Array<{ ctx: EntryEvalCtx; pnl: number }> = [];
+    for (const t of trades) {
+      const zone = zoneById.get(t.zoneId);
+      if (!zone) continue;
+      const bars = runResult.syntheticBarsByZoneId.get(zone.id);
+      if (!bars || bars.length === 0) continue;
+      const sorted = [...bars].sort((a, b) => a.bar_index - b.bar_index);
+      const entryBar = sorted.find((b) => b.bar_index === 0) ?? sorted[0];
+      const indicatorByKey =
+        indicatorByZone.get(zone.id) ?? new Map<string, number[]>();
+      const tickCfg = resolveTickConfig(zone.instrument, rules);
+      entryCtxs.push({
+        ctx: {
+          bar: entryBar,
+          barIndex: entryBar.bar_index,
+          indicatorByKey,
+          zone,
+          tickConfig: {
+            ticksPerPoint: tickCfg.ticksPerPoint,
+            tickValue: tickCfg.tickValue,
+            pointValue: tickCfg.pointValue,
+          },
+        },
+        // P&L axis matches the existing histograms: scaledPoints, so
+        // when scaling is on the directive chart aligns with the
+        // equity curve / stat cards rather than showing per-contract
+        // raw points.
+        pnl: t.scaledPoints,
+      });
+    }
+
+    return directives.map((d) => {
+      const rows: Array<{ value: number; pnl: number }> = [];
+      for (const { ctx, pnl } of entryCtxs) {
+        const v = evaluate(d.expr, { kind: "entry", ...ctx });
+        if (Number.isFinite(v)) {
+          rows.push({ value: v, pnl });
+        }
+      }
+      return { title: d.title, rows };
+    });
+  }, [
+    runResult.graphDirectives,
+    runResult.syntheticZones,
+    runResult.syntheticBarsByZoneId,
+    runResult.syntheticIndicatorPreEntryBarsByZoneId,
+    runResult.syntheticTickCtxByZoneId,
+    trades,
+    rules,
   ]);
 
   // Per-trade prints union of label keys — the trade table needs to know
@@ -6031,18 +6134,18 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
         scalingEnabled={rules.scalingEnabled}
       />
 
-      {/* Segment-analysis histograms — group results by ADX/ATR/EMA/Bollinger
-          /volume/RSI/time-of-day/MAE/MFE/etc. Each continuous chart has an
-          inline bucket-count input so users can re-bin live. Reads ctx_*
-          fields off the synthetic zones plus the per-zone bar / atr / pre-entry
-          maps the backtest engine emits. */}
+      {/* Segment-analysis histograms — outcome dimensions (MAE / MFE / time
+          in trade / trade #) and categorical dimensions (direction, exit
+          reason, hour, day, streak before, position size). Entry-time
+          indicator buckets (ATR / ADX / EMA / Bollinger / volume / RSI /
+          trend correlation) used to live here unconditionally; they're
+          now opt-in via `graph = <expr>` in the strategy DSL and arrive
+          via `graphData`. */}
       <SimulatorSegmentCharts
         results={trades}
         zones={timeFilteredZones}
-        barsByZoneId={runResult.syntheticBarsByZoneId}
-        preEntryBarsByZoneId={runResult.syntheticPreEntryBarsByZoneId}
-        atrByZoneId={runResult.syntheticAtrByZoneId}
         scalingEnabled={rules.scalingEnabled}
+        graphData={graphDataResult}
       />
 
       {/* ── Optimize SL/TP/TSL Config Modal ─────────────────────────
@@ -6108,6 +6211,22 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
           warning={scriptChartInputs.warning}
         />
       )}
+
+      {/* ── Script output panel ─────────────────────────────────────
+          Strategy prints, per-trade prints, and optimization history.
+          Lives at the bottom of the left analyses rail (instead of
+          stacked under the editor on the right) so output reads in the
+          same column as the rest of the run output: equity curve,
+          trades table, segment charts. Renders in both UI and chart
+          sub-modes — the output is meaningful regardless of which
+          left-rail view the user is on. */}
+      <ScriptOutputPanel
+        summaryPrints={summaryPrintsResult}
+        trades={trades}
+        tradePrintLabels={tradePrintsLabels}
+        optimizationHistory={tradesAndOptimization.optimizationHistory}
+        warnings={tradesAndOptimization.optimizationWarnings}
+      />
 
       </div>
 
@@ -6395,13 +6514,10 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
             errors={scriptErrors}
             placeholder="Type strategy = ... then params, rules, and filters. Use ⌃space for suggestions."
           />
-          <ScriptOutputPanel
-            summaryPrints={summaryPrintsResult}
-            trades={trades}
-            tradePrintLabels={tradePrintsLabels}
-            optimizationHistory={tradesAndOptimization.optimizationHistory}
-            warnings={tradesAndOptimization.optimizationWarnings}
-          />
+          {/* The script output panel used to live here — it now sits at
+              the bottom of the left analyses rail so output reads in the
+              same column as the equity curve / trades table / segment
+              charts. The editor stays alone on the right rail. */}
         </aside>
       </>
 

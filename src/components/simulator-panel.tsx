@@ -1303,15 +1303,16 @@ export function SimulatorPanel({ zones, sections }: SimulatorPanelProps) {
         scalingEnabled={rules.scalingEnabled}
       />
 
-      {/* Segment-analysis histograms — group results by ADX/ATR/EMA/Bollinger
-          /volume/RSI/time-of-day/MAE/MFE/etc. Each continuous chart has an
-          inline bucket-count input so users can re-bin live. */}
+      {/* Segment-analysis histograms — outcome dimensions (MAE/MFE/time
+          in trade/trade #) and categorical dimensions (direction, exit
+          reason, hour, day, streak before, position size). Entry-time
+          indicator buckets used to render here unconditionally; they're
+          now opt-in via `graph = <expr>` in the strategy DSL on the
+          backtesting tab. The risk simulator has no DSL editor of its
+          own, so it just passes the built-ins. */}
       <SimulatorSegmentCharts
         results={results}
         zones={timeFilteredZones}
-        barsByZoneId={effectiveBarsByZoneId ?? undefined}
-        preEntryBarsByZoneId={preEntryBarsByZoneId}
-        atrByZoneId={atrByZoneId}
         scalingEnabled={rules.scalingEnabled}
       />
 

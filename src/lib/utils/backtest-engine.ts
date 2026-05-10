@@ -1656,6 +1656,16 @@ export interface BacktestRunResult {
    *  warmed up", "OptimizeAll downgraded to independent due to mixed
    *  objectives". Surfaced as a yellow banner in the dashboard. */
   optimizationWarnings?: string[];
+  /** `graph = <expr>` directives lifted from the strategy DSL. Each
+   *  entry's expression has had its `let` dependencies inlined and any
+   *  Kalman dotted-idents rewritten by the strategy parser, so the
+   *  dashboard can run them through its entry-context evaluator
+   *  unchanged. The list is strategy-level (every session in a multi-
+   *  day run produces the same directives), so the multi-session
+   *  aggregator only needs to copy this from the first session's
+   *  result. Undefined / empty when the script has no `graph` lines or
+   *  when the strategy-DSL signal block is absent. */
+  graphDirectives?: Array<{ title: string; expr: Expr; source: string }>;
 }
 
 /** Convert one ReplayBar to a TradeZoneBar with the supplied zone_id and
@@ -1932,7 +1942,7 @@ export function runBacktestForSession(args: {
     }
   }
 
-  const rawSignals = evaluateStrategyScript({
+  const stratEvalResult = evaluateStrategyScript({
     stmts: strategyOverride.stmts,
     paramOverrides: strategyOverride.paramOverrides,
     bars: combinedBars,
@@ -1941,7 +1951,14 @@ export function runBacktestForSession(args: {
     minBarIndex: warmupCount,
     tickCtx: evalTickCtx,
     varValues: signalVarValues,
-  }).signals;
+  });
+  const rawSignals = stratEvalResult.signals;
+  // `graph = <expr>` directives — strategy-level (don't depend on the
+  // bar walk's signal output), captured here so the per-session result
+  // can carry them forward. The multi-session aggregator copies from
+  // the first session's result since every session in a run sees the
+  // same parsed strategy script and therefore the same directive list.
+  const stratGraphs = stratEvalResult.graphs;
 
   // Rebase signal indices back to session-local space so downstream zone
   // construction (which reads `bars[sig.barIndex]`) stays unchanged. The
@@ -2238,6 +2255,10 @@ export function runBacktestForSession(args: {
     totalSignals: signals.length,
     optimizationHistory,
     optimizationWarnings,
+    // `graph = <expr>` directives — strategy-level so the same array is
+    // returned for every session in a multi-day run; the multi-session
+    // aggregator copies from the first non-empty result.
+    graphDirectives: stratGraphs.length > 0 ? stratGraphs : undefined,
   };
 }
 
@@ -2287,6 +2308,12 @@ export function runBacktestAcrossSessions(args: {
   const allTickCtx = new Map<number, TickContext>();
   let idOffset = 0;
   let totalSignals = 0;
+  // Strategy-level graph directives — identical across sessions because
+  // they're parsed from the same script. Take from the first session
+  // that returned a non-empty list (sessions with `bars.length === 0`
+  // short-circuit and don't run the evaluator). Stays undefined when no
+  // session in the run had a populated directive array.
+  let graphDirectives: BacktestRunResult["graphDirectives"];
 
   for (const sess of sessions) {
     const r = runBacktestForSession({
@@ -2313,6 +2340,9 @@ export function runBacktestAcrossSessions(args: {
     for (const [k, v] of r.syntheticTickCtxByZoneId) allTickCtx.set(k, v);
     idOffset += r.syntheticZones.length;
     totalSignals += r.totalSignals;
+    if (!graphDirectives && r.graphDirectives && r.graphDirectives.length > 0) {
+      graphDirectives = r.graphDirectives;
+    }
   }
 
   // Sort trades chronologically so the equity curve / per-day chart render in
@@ -2330,6 +2360,7 @@ export function runBacktestAcrossSessions(args: {
     syntheticAtrByZoneId: allAtr,
     syntheticTickCtxByZoneId: allTickCtx,
     totalSignals,
+    graphDirectives,
   };
 }
 

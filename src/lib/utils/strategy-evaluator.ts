@@ -86,7 +86,15 @@ export interface BacktestSignal {
 export type Stmt =
   | { kind: "let"; name: string; expr: Expr; line: number; source: string }
   | { kind: "signal"; side: "long" | "short"; expr: Expr; line: number; source: string }
-  | { kind: "assign"; path: string; expr: Expr; line: number; source: string };
+  | { kind: "assign"; path: string; expr: Expr; line: number; source: string }
+  // `graph = <expr>` or `graph["Title"] = <expr>` — declares a P&L
+  // histogram that the dashboard renders at the bottom of the segment-
+  // analysis grid. The expr is evaluated at every surviving trade's
+  // entry bar; per-trade values are bucketed equal-width and plotted
+  // via the same <PnlByCategory> component the built-in dimensions
+  // already use. `title` defaults to a trimmed slice of the RHS source
+  // when no explicit `["..."]` label is supplied.
+  | { kind: "graph"; title: string; expr: Expr; line: number; source: string };
 
 export interface ParseError {
   line: number;
@@ -273,6 +281,53 @@ export function parseStrategyScript(text: string): ParsedStrategyScript {
         continue;
       }
       stmts.push({ kind: "signal", side, expr: c.expr, line: ll.line, source: rhs.trim() });
+      continue;
+    }
+
+    // `graph = <expr>` or `graph["Title"] = <expr>` — declares an
+    // ad-hoc P&L histogram. Two forms:
+    //   graph = atr(14)                        → title = "atr(14)"
+    //   graph["My Title"] = atr(14) / close    → title = "My Title"
+    // Both compile through the same expression compiler used by `let`
+    // and `signal.*.if`, so let-bound idents, arithmetic, indicator
+    // calls, etc. all work. The match must run BEFORE the generic
+    // `path = expr` fallback, otherwise `graph = …` would be routed to
+    // the line-based DSL machinery and silently dropped.
+    const graphTitledMatch = trimmed.match(
+      /^graph\s*\[\s*"([^"]+)"\s*\]\s*=\s*([\s\S]+)$/
+    );
+    const graphPlainMatch = graphTitledMatch
+      ? null
+      : trimmed.match(/^graph\s*=\s*([\s\S]+)$/);
+    if (graphTitledMatch || graphPlainMatch) {
+      const explicitTitle = graphTitledMatch ? graphTitledMatch[1] : null;
+      const rhs = (graphTitledMatch ? graphTitledMatch[2] : graphPlainMatch![1]).trim();
+      if (rhs === "") {
+        errors.push({
+          line: ll.line,
+          message: `graph: missing expression on the right of '='`,
+          severity: "error",
+        });
+        continue;
+      }
+      const lifted = liftRhs(rhs, ll.line, "graph");
+      if (!lifted.ok) continue;
+      const c = compile(lifted.text);
+      if (!c.ok) {
+        errors.push({ line: ll.line, message: `graph: ${c.error}`, severity: "error" });
+        continue;
+      }
+      // Default title is the trimmed RHS source, capped so the chart
+      // header doesn't wrap or truncate awkwardly. Explicit title via
+      // `graph["..."]` always wins.
+      const title = explicitTitle ?? (rhs.length > 40 ? `${rhs.slice(0, 39)}…` : rhs);
+      stmts.push({
+        kind: "graph",
+        title,
+        expr: c.expr,
+        line: ll.line,
+        source: rhs,
+      });
       continue;
     }
 
@@ -792,6 +847,15 @@ export interface EvaluateResult {
    *  let-binding lookup. Empty when the script has no lets or no
    *  strategy-DSL signal block. */
   letBindings: Map<string, Expr>;
+  /** `graph = <expr>` (and `graph["Title"] = <expr>`) directives
+   *  declared in the strategy script. The dashboard evaluates each
+   *  expression at every surviving trade's entry bar and renders a
+   *  histogram in Trade Segment Analysis. Each entry's `expr` has had
+   *  its `let` dependencies inlined and Kalman dotted-idents rewritten
+   *  by the parser, so the dashboard's entry-context evaluator can run
+   *  it without further preprocessing. Empty when the script has no
+   *  graph directives. */
+  graphs: Array<{ title: string; expr: Expr; source: string }>;
 }
 
 /** Build the resolved-let-bindings map for a parsed strategy script.
@@ -824,6 +888,13 @@ export function evaluateStrategyScript(opts: EvaluateOptions): EvaluateResult {
   let signalLong: Expr | null = null;
   let signalShort: Expr | null = null;
   const assigns: AssignOverlay[] = [];
+  // `graph = <expr>` directives — collected here and returned so the
+  // dashboard can evaluate each expression at every surviving trade's
+  // entry bar. By the time we hit this loop the let-inline + Kalman-
+  // rewrite passes upstream have already mutated `s.expr` in place, so
+  // these exprs are ready for the entry-context evaluator without any
+  // additional preprocessing.
+  const graphs: Array<{ title: string; expr: Expr; source: string }> = [];
 
   for (const s of stmts) {
     if (s.kind === "let") {
@@ -831,6 +902,8 @@ export function evaluateStrategyScript(opts: EvaluateOptions): EvaluateResult {
     } else if (s.kind === "signal") {
       if (s.side === "long") signalLong = s.expr;
       else signalShort = s.expr;
+    } else if (s.kind === "graph") {
+      graphs.push({ title: s.title, expr: s.expr, source: s.source });
     } else {
       assigns.push({ path: s.path, expr: s.expr, source: s.source });
     }
@@ -839,7 +912,7 @@ export function evaluateStrategyScript(opts: EvaluateOptions): EvaluateResult {
   const letBindings = buildLetBindings(stmts);
 
   if (!signalLong && !signalShort) {
-    return { signals: [], assigns, letBindings };
+    return { signals: [], assigns, letBindings, graphs };
   }
 
   // Build the per-run shared state. Preserve bid/ask volumes so any
@@ -965,7 +1038,7 @@ export function evaluateStrategyScript(opts: EvaluateOptions): EvaluateResult {
     }
   }
 
-  return { signals, assigns, letBindings };
+  return { signals, assigns, letBindings, graphs };
 }
 
 /** Read the per-bar diag-dump config from localStorage. Used by the
