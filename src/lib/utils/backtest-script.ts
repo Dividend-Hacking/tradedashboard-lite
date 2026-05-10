@@ -284,14 +284,14 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     type: "enum",
     section: "Strategy",
     description:
-      "Picks which strategy generates the trade signals. Each strategy has its own knobs (see the Strategy params section). Note: this just switches the strategy — it does NOT reset your params. Use `loadstrategy` instead if you want a fresh start.",
+      "Picks the baseline signal generator. Most modern scripts express their entry logic directly with `signal.long.if` / `signal.short.if` and don't rely on the strategy's hard-coded behavior — in that case pick anything (the strategy is overridden trade-by-trade). Soft-set: does NOT touch `params.*`.",
     default: STRATEGIES[0].id,
     options: STRATEGIES.map((s) => s.id),
     enumerable: true,
     examples: [
       {
         snippet: "strategy = signal_v2",
-        scenario: "Switch to the signal_v2 strategy, keeping any params you've already set.",
+        scenario: "Switch the baseline strategy. Prefer overriding entries with `signal.long.if = ...` rather than depending on the strategy's built-in logic.",
       },
     ],
   },
@@ -300,14 +300,14 @@ export const SCRIPT_SCHEMA: ScriptSchemaEntry[] = [
     type: "enum",
     section: "Strategy",
     description:
-      "Switch strategy AND wipe all params.* back to that strategy's defaults. Use this when you want a clean slate. Any params.* lines you write AFTER it still take effect (they override the freshly-loaded defaults).",
+      "⚠️ LEGACY. Switches strategy AND resets every `params.*` to that strategy's defaults. Only useful when restoring an old preset. New scripts should express their logic directly via `signal.*.if`, `exit.*.if`, `filter.if`, `let`, and `var` — avoid `loadstrategy` entirely.",
     default: STRATEGIES[0].id,
     options: STRATEGIES.map((s) => s.id),
     enumerable: true,
     examples: [
       {
         snippet: "loadstrategy = signal_v2",
-        scenario: "Switch to signal_v2 and reset every param to that strategy's defaults.",
+        scenario: "Legacy: restore signal_v2's hard-coded defaults. In new work, write the rules inline with the modern DSL instead.",
       },
     ],
   },

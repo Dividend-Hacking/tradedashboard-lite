@@ -54,28 +54,34 @@ interface IndicatorFamily {
   description: string;
   /** Worked examples — code snippet + plain-English scenario. */
   examples?: ExampleEntry[];
+  /** Group bucket for the docs page (e.g. "Moving averages",
+   *  "Volatility & range"). The renderer inserts a visible group
+   *  heading whenever consecutive cards transition to a new group, so
+   *  long lists scan-read like a reference book instead of a flat
+   *  dump. Required field — keep families ordered by group below. */
+  group: string;
 }
 
+// Group labels — kept as constants so a typo doesn't silently fragment a
+// group. Any string passed to IndicatorFamily.group must match one of these.
+const G_TREND_MA = "Moving averages (smoothed trend lines)";
+const G_TREND_DIR = "Trend direction & strength";
+const G_MOMENTUM = "Momentum & oscillators";
+const G_VOLATILITY = "Volatility & range";
+const G_BANDS = "Bands & channels";
+const G_VOLUME = "Volume & money flow";
+const G_STATS = "Statistical";
+const G_BAR_SHAPE = "Bar shape & reference prices";
+const G_LOOKBACK = "Lookback helpers";
+const G_ORDER_FLOW = "Order flow (requires bid/ask data)";
+const G_VOLUME_PROFILE = "Volume profile (requires tick data)";
+const G_TICK_MICRO = "Tick microstructure (requires tick data)";
+const G_ADVANCED = "Advanced — strategy DSL only";
+
 const INDICATOR_FAMILIES: IndicatorFamily[] = [
+  // ─── Moving averages ──────────────────────────────────────────────────
   {
-    headline: "ATR[period]",
-    forms: ["ATR(period)", "ATR (= ATR(14))", "ATR14"],
-    description:
-      "How much the price normally swings around in one bar. Bigger ATR = wild day, small ATR = quiet day. Great for sizing stops based on today's actual volatility instead of guessing a fixed point value.",
-    examples: [
-      {
-        snippet: "rules.stopLossPoints = ATR * 1.5",
-        scenario:
-          "Set the stop to one and a half times today's typical price swing — wider on volatile days, tighter on quiet ones.",
-      },
-      {
-        snippet: "filter.if = ATR(14) > 0.5",
-        scenario:
-          "Only trade when the market is moving enough — skip flat, dead sessions.",
-      },
-    ],
-  },
-  {
+    group: G_TREND_MA,
     headline: "EMA[period]",
     forms: ["EMA(period)", "EMA20", "EMA50", "EMA200"],
     description:
@@ -93,6 +99,7 @@ const INDICATOR_FAMILIES: IndicatorFamily[] = [
     ],
   },
   {
+    group: G_TREND_MA,
     headline: "SMA[period]",
     forms: ["SMA(period)", "SMA20", "SMA50", "SMA200"],
     description:
@@ -106,6 +113,61 @@ const INDICATOR_FAMILIES: IndicatorFamily[] = [
     ],
   },
   {
+    group: G_TREND_MA,
+    headline: "WMA[period]",
+    forms: ["WMA(period)", "WMA20"],
+    description:
+      "A moving average that gives more weight to recent bars and less to older ones. Reacts faster than SMA but smoother than EMA. Technical: linear weights 1..N over the last N closes.",
+    examples: [
+      {
+        snippet: "filter.if = close > WMA(20)",
+        scenario: "Take trades only when price is above a recency-weighted trend line.",
+      },
+    ],
+  },
+  {
+    group: G_TREND_MA,
+    headline: "HMA[period]",
+    forms: ["HMA(period)", "HMA20"],
+    description:
+      "Hull Moving Average — designed to follow price quickly without lagging behind much. Looks smoother than EMA but reacts faster. Good for trend lines you want to feel \"current\".",
+    examples: [
+      {
+        snippet: "filter.if = close > HMA(20)",
+        scenario: "Trade with trend using a fast, smooth trend line.",
+      },
+    ],
+  },
+  {
+    group: G_TREND_MA,
+    headline: "DEMA[period] / TEMA[period]",
+    forms: ["DEMA(period)", "TEMA(period)", "DEMA20", "TEMA20"],
+    description:
+      "Sped-up versions of EMA. DEMA = double exponential, TEMA = triple. Both react quicker to price changes than a plain EMA at the same period — useful when EMA feels too slow.",
+    examples: [
+      {
+        snippet: "filter.if = close > TEMA(20)",
+        scenario: "Trade with trend using an EMA that responds extra-quickly.",
+      },
+    ],
+  },
+  {
+    group: G_TREND_MA,
+    headline: "VWMA[period]",
+    forms: ["VWMA(period)", "VWMA20"],
+    description:
+      "A moving average where high-volume bars count more than low-volume ones. Tracks where the real money is being put to work, not just where price has been. Technical: sum(close × volume) / sum(volume).",
+    examples: [
+      {
+        snippet: "filter.if = close > VWMA(20)",
+        scenario: "Trade when price is above the volume-heavy average — confirms trend with real activity.",
+      },
+    ],
+  },
+
+  // ─── Trend direction & strength ──────────────────────────────────────
+  {
+    group: G_TREND_DIR,
     headline: "ADX[period]",
     forms: ["ADX(period)", "ADX (= ADX(14))", "ADX14"],
     description:
@@ -123,83 +185,101 @@ const INDICATOR_FAMILIES: IndicatorFamily[] = [
     ],
   },
   {
-    headline: "volume[period]",
-    forms: ["volume(period)", "trailVol(period)", "volume (current bar)"],
+    group: G_TREND_DIR,
+    headline: "DIplus / DIminus",
+    forms: ["DIplus(period=14)", "DIminus(period=14)"],
     description:
-      "How many contracts/shares traded. Without parentheses, `volume` is just THIS bar's volume. With `(period)` it's the average volume over the last N bars — useful for spotting bursts.",
+      "The two halves of ADX, separated. DI+ measures upside push, DI- measures downside push. DI+ above DI- = uptrend. Pair with ADX itself for a \"trend AND strength\" filter.",
     examples: [
       {
-        snippet: "filter.if = volume > volume(20) * 1.5",
-        scenario:
-          "Only trade when this bar's volume is at least 50% above the recent average — a sign of real interest.",
+        snippet: "filter.if = DIplus(14) > DIminus(14) && ADX > 25",
+        scenario: "Only take longs in a strong uptrend (direction + strength both confirmed).",
       },
     ],
   },
   {
-    headline: "stdev[period]",
-    forms: ["stdev(period)"],
+    group: G_TREND_DIR,
+    headline: "Supertrend(period=10, mult=3)",
+    forms: ["Supertrend(period, mult)", "Supertrend (= Supertrend(10, 3))"],
     description:
-      "How spread out price returns have been over the last N bars. Higher = wilder market, lower = calmer market. Used as a volatility gauge by Bollinger Bands and Z-score filters.",
+      "A single line that flips above and below price as the trend changes. Positive value = uptrend (line is below price). Negative value = downtrend (line is above). Easy way to know whether to be long or short.",
     examples: [
       {
-        snippet: "rules.stopLossPoints = stdev(20) * 100",
-        scenario: "Scale your stop to recent return volatility instead of price points.",
+        snippet: "filter.if = Supertrend > 0",
+        scenario: "Only take long trades when Supertrend says we're in an uptrend.",
+      },
+    ],
+  },
+  {
+    group: G_TREND_DIR,
+    headline: "PSAR(step=0.02, max=0.2)",
+    forms: ["PSAR(step, max)", "PSAR (= PSAR(0.02, 0.2))"],
+    description:
+      "Parabolic SAR — those little dots that appear above or below price on a chart. When dots are below price, we're in an uptrend. When dots flip above, the trend may have changed. Often used as a trailing stop.",
+    examples: [
+      {
+        snippet: "filter.if = close > PSAR()",
+        scenario: "Only trade longs when price is above the PSAR dots (uptrend confirmed).",
+      },
+    ],
+  },
+  {
+    group: G_TREND_DIR,
+    headline: "Aroon_up / Aroon_down / Aroon_osc",
+    forms: [
+      "Aroon_up(period=14)",
+      "Aroon_down(period=14)",
+      "Aroon_osc(period=14)",
+    ],
+    description:
+      "Aroon shows how fresh the recent high or low is, on a 0–100 scale. Up = 100 means \"brand new high just happened\". Down = 100 means \"brand new low just happened\". The oscillator is Up minus Down — positive means uptrend, negative means downtrend.",
+    examples: [
+      {
+        snippet: "filter.if = Aroon_up(14) > 80",
+        scenario: "Only trade longs when a new 14-bar high happened very recently.",
+      },
+      {
+        snippet: "filter.if = Aroon_osc(14) > 0",
+        scenario: "Only trade in the direction of the current trend per Aroon.",
+      },
+    ],
+  },
+  {
+    group: G_TREND_DIR,
+    headline: "VortexPlus / VortexMinus",
+    forms: ["VortexPlus(period=14)", "VortexMinus(period=14)"],
+    description:
+      "Two lines that try to spot trend changes. VI+ rising and crossing above VI- = bullish turn. VI- rising and crossing above VI+ = bearish turn. Use whichever line is bigger as the trend direction.",
+    examples: [
+      {
+        snippet: "filter.if = VortexPlus(14) > VortexMinus(14)",
+        scenario: "Only take longs when the bullish vortex line is dominant.",
+      },
+    ],
+  },
+  {
+    group: G_TREND_DIR,
+    headline: "Ichimoku_tenkan / kijun / senkouA / senkouB / chikou",
+    forms: [
+      "Ichimoku_tenkan(period=9)",
+      "Ichimoku_kijun(period=26)",
+      "Ichimoku_senkouA(fast=9, slow=26)",
+      "Ichimoku_senkouB(period=52)",
+      "Ichimoku_chikou(period=26)",
+    ],
+    description:
+      "Ichimoku is a multi-line system that paints a \"cloud\" around price. Tenkan = fast trend midpoint. Kijun = slow trend midpoint. Senkou A/B = the cloud edges. Chikou = a comparison line. Price above the cloud = bullish, below = bearish.",
+    examples: [
+      {
+        snippet: "filter.if = close > Ichimoku_kijun(26)",
+        scenario: "Only take longs when price is above the slow Ichimoku midline.",
       },
     ],
   },
 
-  // ─── Extended moving averages ──────────────────────────────────────────
+  // ─── Momentum & oscillators ──────────────────────────────────────────
   {
-    headline: "WMA[period]",
-    forms: ["WMA(period)", "WMA20"],
-    description:
-      "A moving average that gives more weight to recent bars and less to older ones. Reacts faster than SMA but smoother than EMA. Technical: linear weights 1..N over the last N closes.",
-    examples: [
-      {
-        snippet: "filter.if = close > WMA(20)",
-        scenario: "Take trades only when price is above a recency-weighted trend line.",
-      },
-    ],
-  },
-  {
-    headline: "HMA[period]",
-    forms: ["HMA(period)", "HMA20"],
-    description:
-      "Hull Moving Average — designed to follow price quickly without lagging behind much. Looks smoother than EMA but reacts faster. Good for trend lines you want to feel \"current\".",
-    examples: [
-      {
-        snippet: "filter.if = close > HMA(20)",
-        scenario: "Trade with trend using a fast, smooth trend line.",
-      },
-    ],
-  },
-  {
-    headline: "DEMA[period] / TEMA[period]",
-    forms: ["DEMA(period)", "TEMA(period)", "DEMA20", "TEMA20"],
-    description:
-      "Sped-up versions of EMA. DEMA = double exponential, TEMA = triple. Both react quicker to price changes than a plain EMA at the same period — useful when EMA feels too slow.",
-    examples: [
-      {
-        snippet: "filter.if = close > TEMA(20)",
-        scenario: "Trade with trend using an EMA that responds extra-quickly.",
-      },
-    ],
-  },
-  {
-    headline: "VWMA[period]",
-    forms: ["VWMA(period)", "VWMA20"],
-    description:
-      "A moving average where high-volume bars count more than low-volume ones. Tracks where the real money is being put to work, not just where price has been. Technical: sum(close × volume) / sum(volume).",
-    examples: [
-      {
-        snippet: "filter.if = close > VWMA(20)",
-        scenario: "Trade when price is above the volume-heavy average — confirms trend with real activity.",
-      },
-    ],
-  },
-
-  // ─── Momentum / oscillators ────────────────────────────────────────────
-  {
+    group: G_MOMENTUM,
     headline: "RSI[period]",
     forms: ["RSI(period)", "RSI (= RSI(14))", "RSI14"],
     description:
@@ -218,6 +298,7 @@ const INDICATOR_FAMILIES: IndicatorFamily[] = [
     ],
   },
   {
+    group: G_MOMENTUM,
     headline: "ROC[period] / MOM[period]",
     forms: ["ROC(period)", "MOM(period)", "ROC10", "MOM10"],
     description:
@@ -234,6 +315,7 @@ const INDICATOR_FAMILIES: IndicatorFamily[] = [
     ],
   },
   {
+    group: G_MOMENTUM,
     headline: "CCI[period]",
     forms: ["CCI(period)", "CCI20"],
     description:
@@ -246,6 +328,7 @@ const INDICATOR_FAMILIES: IndicatorFamily[] = [
     ],
   },
   {
+    group: G_MOMENTUM,
     headline: "WilliamsR[period]",
     forms: ["WilliamsR(period)"],
     description:
@@ -258,6 +341,7 @@ const INDICATOR_FAMILIES: IndicatorFamily[] = [
     ],
   },
   {
+    group: G_MOMENTUM,
     headline: "TRIX[period] / MFI[period]",
     forms: ["TRIX(period)", "MFI(period)", "TRIX14", "MFI14"],
     description:
@@ -273,9 +357,28 @@ const INDICATOR_FAMILIES: IndicatorFamily[] = [
       },
     ],
   },
-
-  // ─── Multi-output families ─────────────────────────────────────────────
   {
+    group: G_MOMENTUM,
+    headline: "Stoch_K / Stoch_D",
+    forms: [
+      "Stoch_K(period)",
+      "Stoch_D(period, smoothK=3, smoothD=3)",
+    ],
+    description:
+      "Stochastic — a 0–100 reading of where price closed within its recent high–low range. %K is the fast version, %D is a smoothed slower line. Above 80 = top of the range (overbought); below 20 = bottom (oversold).",
+    examples: [
+      {
+        snippet: "filter.if = Stoch_K(14) < 20",
+        scenario: "Trade only when the fast stochastic shows oversold conditions.",
+      },
+      {
+        snippet: "filter.if = Stoch_K(14) > Stoch_D(14)",
+        scenario: "Take longs when the fast line crosses above the slow line.",
+      },
+    ],
+  },
+  {
+    group: G_MOMENTUM,
     headline: "MACD_line / MACD_signal / MACD_hist",
     forms: [
       "MACD_line(fast, slow)",
@@ -296,6 +399,94 @@ const INDICATOR_FAMILIES: IndicatorFamily[] = [
     ],
   },
   {
+    group: G_MOMENTUM,
+    headline: "AO / UO / Fisher",
+    forms: [
+      "AO", "AO()",
+      "UO(short=7, mid=14, long=28)",
+      "Fisher(period=10)",
+    ],
+    description:
+      "Three momentum gauges. AO (Awesome Oscillator) = a simple difference of two median-price averages. UO (Ultimate Oscillator) = a 0–100 score blending buying pressure across three time windows. Fisher = a transform that makes momentum extremes stick out more clearly.",
+    examples: [
+      {
+        snippet: "filter.if = AO > 0",
+        scenario: "Only trade longs when the Awesome Oscillator is positive.",
+      },
+      {
+        snippet: "filter.if = UO(7, 14, 28) > 70",
+        scenario: "Only trade longs in clearly-buying conditions across multiple time windows.",
+      },
+    ],
+  },
+
+  // ─── Volatility & range ──────────────────────────────────────────────
+  {
+    group: G_VOLATILITY,
+    headline: "ATR[period]",
+    forms: ["ATR(period)", "ATR (= ATR(14))", "ATR14"],
+    description:
+      "How much the price normally swings around in one bar. Bigger ATR = wild day, small ATR = quiet day. Great for sizing stops based on today's actual volatility instead of guessing a fixed point value.",
+    examples: [
+      {
+        snippet: "rules.stopLossPoints = ATR * 1.5",
+        scenario:
+          "Set the stop to one and a half times today's typical price swing — wider on volatile days, tighter on quiet ones.",
+      },
+      {
+        snippet: "filter.if = ATR(14) > 0.5",
+        scenario:
+          "Only trade when the market is moving enough — skip flat, dead sessions.",
+      },
+    ],
+  },
+  {
+    group: G_VOLATILITY,
+    headline: "TR / NATR[period] / HV[period]",
+    forms: ["TR", "TR()", "NATR(period)", "HV(period)", "NATR14", "HV20"],
+    description:
+      "Three ways to measure price wiggle. TR = how big this single bar was (its range, including any gap from the last close). NATR = ATR shown as a percent of price (great for comparing volatility across different instruments). HV = how spread out returns have been recently.",
+    examples: [
+      {
+        snippet: "filter.if = NATR(14) > 0.5",
+        scenario: "Skip days when price wiggle is less than 0.5% of price — too quiet to bother.",
+      },
+      {
+        snippet: "rules.stopLossPoints = TR * 1.5",
+        scenario: "Size your stop based on how big the entry bar itself was.",
+      },
+    ],
+  },
+  {
+    group: G_VOLATILITY,
+    headline: "stdev[period]",
+    forms: ["stdev(period)"],
+    description:
+      "How spread out price returns have been over the last N bars. Higher = wilder market, lower = calmer market. Used as a volatility gauge by Bollinger Bands and Z-score filters.",
+    examples: [
+      {
+        snippet: "rules.stopLossPoints = stdev(20) * 100",
+        scenario: "Scale your stop to recent return volatility instead of price points.",
+      },
+    ],
+  },
+  {
+    group: G_VOLATILITY,
+    headline: "Choppiness / Ulcer",
+    forms: ["Choppiness(period=14)", "Ulcer(period=14)"],
+    description:
+      "Choppiness Index = a 0–100 score where high (above ~62) means \"market is going sideways\" and low (below ~38) means \"there's a real trend\". Ulcer Index = a downside-only volatility gauge — measures how deep the recent drawdowns have been.",
+    examples: [
+      {
+        snippet: "filter.if = Choppiness(14) < 38",
+        scenario: "Only trade in trending conditions; skip sideways chop.",
+      },
+    ],
+  },
+
+  // ─── Bands & channels ────────────────────────────────────────────────
+  {
+    group: G_BANDS,
     headline: "BB_upper / BB_mid / BB_lower / BB_width / BB_percent",
     forms: [
       "BB_mid(period)",
@@ -324,25 +515,25 @@ const INDICATOR_FAMILIES: IndicatorFamily[] = [
     ],
   },
   {
-    headline: "Stoch_K / Stoch_D",
+    group: G_BANDS,
+    headline: "Keltner_upper / Keltner_mid / Keltner_lower",
     forms: [
-      "Stoch_K(period)",
-      "Stoch_D(period, smoothK=3, smoothD=3)",
+      "Keltner_mid(period)",
+      "Keltner_upper(period, mult=2)",
+      "Keltner_lower(period, mult=2)",
     ],
     description:
-      "Stochastic — a 0–100 reading of where price closed within its recent high–low range. %K is the fast version, %D is a smoothed slower line. Above 80 = top of the range (overbought); below 20 = bottom (oversold).",
+      "Keltner Channels draw an upper and lower band around price using ATR (typical wiggle) instead of standard deviation. Compared to Bollinger Bands they hold their shape better in strong trends, so they're nice for trend-following entries.",
     examples: [
       {
-        snippet: "filter.if = Stoch_K(14) < 20",
-        scenario: "Trade only when the fast stochastic shows oversold conditions.",
-      },
-      {
-        snippet: "filter.if = Stoch_K(14) > Stoch_D(14)",
-        scenario: "Take longs when the fast line crosses above the slow line.",
+        snippet: "filter.if = close > Keltner_upper(20)",
+        scenario:
+          "Only take longs when price has broken above the upper Keltner band — strong-trend breakout.",
       },
     ],
   },
   {
+    group: G_BANDS,
     headline: "Donchian_upper / Donchian_lower / Donchian_mid",
     forms: [
       "Donchian_upper(period)",
@@ -363,26 +554,23 @@ const INDICATOR_FAMILIES: IndicatorFamily[] = [
     ],
   },
 
-  // ─── Volatility ────────────────────────────────────────────────────────
+  // ─── Volume & money flow ─────────────────────────────────────────────
   {
-    headline: "TR / NATR[period] / HV[period]",
-    forms: ["TR", "TR()", "NATR(period)", "HV(period)", "NATR14", "HV20"],
+    group: G_VOLUME,
+    headline: "volume[period]",
+    forms: ["volume(period)", "trailVol(period)", "volume (current bar)"],
     description:
-      "Three ways to measure price wiggle. TR = how big this single bar was (its range, including any gap from the last close). NATR = ATR shown as a percent of price (great for comparing volatility across different instruments). HV = how spread out returns have been recently.",
+      "How many contracts/shares traded. Without parentheses, `volume` is just THIS bar's volume. With `(period)` it's the average volume over the last N bars — useful for spotting bursts.",
     examples: [
       {
-        snippet: "filter.if = NATR(14) > 0.5",
-        scenario: "Skip days when price wiggle is less than 0.5% of price — too quiet to bother.",
-      },
-      {
-        snippet: "rules.stopLossPoints = TR * 1.5",
-        scenario: "Size your stop based on how big the entry bar itself was.",
+        snippet: "filter.if = volume > volume(20) * 1.5",
+        scenario:
+          "Only trade when this bar's volume is at least 50% above the recent average — a sign of real interest.",
       },
     ],
   },
-
-  // ─── Volume / cumulative ───────────────────────────────────────────────
   {
+    group: G_VOLUME,
     headline: "OBV / AD / CMF[period]",
     forms: [
       "OBV", "OBV()",
@@ -403,9 +591,53 @@ const INDICATOR_FAMILIES: IndicatorFamily[] = [
       },
     ],
   },
-
-  // ─── Bar-shape scalars ─────────────────────────────────────────────────
   {
+    group: G_VOLUME,
+    headline: "VWAP / KVO / ForceIndex / EMV / NVI / PVI",
+    forms: [
+      "VWAP(period)",
+      "KVO(fast=34, slow=55)",
+      "ForceIndex(period=13)",
+      "EMV(period=14)",
+      "NVI", "NVI()",
+      "PVI", "PVI()",
+    ],
+    description:
+      "More volume-based readings. VWAP = a fair-value price that accounts for how much volume happened at each price. KVO and ForceIndex = momentum readings that include volume. EMV = Ease of Movement (how easily price moves with low volume). NVI/PVI = running indices that only update on quiet days vs busy days respectively.",
+    examples: [
+      {
+        snippet: "filter.if = close > VWAP(50)",
+        scenario: "Only take longs when price is above the 50-bar volume-weighted fair-value line.",
+      },
+    ],
+  },
+
+  // ─── Statistical ─────────────────────────────────────────────────────
+  {
+    group: G_STATS,
+    headline: "Zscore / LRSlope / LRIntercept / LRValue / R2",
+    forms: [
+      "Zscore(period)",
+      "LRSlope(period)", "LRIntercept(period)",
+      "LRValue(period)", "R2(period)",
+    ],
+    description:
+      "Statistical readings of the last N closes. Zscore = how many standard deviations price is above/below its average (extreme readings = mean-reversion candidates). LRSlope = the slope of a best-fit line through the closes (positive = uptrend). R2 = how cleanly that line actually fits — closer to 1 means a strong, smooth trend.",
+    examples: [
+      {
+        snippet: "filter.if = abs(Zscore(20)) > 2",
+        scenario: "Only trade when price is unusually far from its 20-bar average — mean-reversion setup.",
+      },
+      {
+        snippet: "filter.if = LRSlope(50) > 0 && R2(50) > 0.7",
+        scenario: "Only trade in clean, well-defined uptrends.",
+      },
+    ],
+  },
+
+  // ─── Bar shape & reference prices ────────────────────────────────────
+  {
+    group: G_BAR_SHAPE,
     headline: "range / body / upper_wick / lower_wick",
     forms: ["range", "body", "upper_wick", "lower_wick"],
     description:
@@ -422,6 +654,7 @@ const INDICATOR_FAMILIES: IndicatorFamily[] = [
     ],
   },
   {
+    group: G_BAR_SHAPE,
     headline: "typical / median_price / weighted_close",
     forms: ["typical", "median_price", "weighted_close"],
     description:
@@ -434,8 +667,9 @@ const INDICATOR_FAMILIES: IndicatorFamily[] = [
     ],
   },
 
-  // ─── Lookback scalars ──────────────────────────────────────────────────
+  // ─── Lookback helpers ────────────────────────────────────────────────
   {
+    group: G_LOOKBACK,
     headline: "HHV[period] / LLV[period]",
     forms: ["HHV(period)", "LLV(period)", "HHV20", "LLV20"],
     description:
@@ -452,6 +686,7 @@ const INDICATOR_FAMILIES: IndicatorFamily[] = [
     ],
   },
   {
+    group: G_LOOKBACK,
     headline: "close_n(n) / high_n(n) / low_n(n) / open_n(n) / volume_n(n)",
     forms: [
       "close_n(n)", "high_n(n)", "low_n(n)", "open_n(n)", "volume_n(n)",
@@ -469,8 +704,8 @@ const INDICATOR_FAMILIES: IndicatorFamily[] = [
       },
     ],
   },
-
   {
+    group: G_LOOKBACK,
     headline: "ticks(n) / point(n)",
     forms: [
       "ticks(n)",
@@ -495,6 +730,7 @@ const INDICATOR_FAMILIES: IndicatorFamily[] = [
 
   // ─── Order flow / cumulative delta ───────────────────────────────────
   {
+    group: G_ORDER_FLOW,
     headline: "CVD",
     forms: ["CVD", "CVD()"],
     description:
@@ -508,194 +744,9 @@ const INDICATOR_FAMILIES: IndicatorFamily[] = [
     ],
   },
 
-  // ─── Trend / channels ────────────────────────────────────────────────
-  {
-    headline: "Keltner_upper / Keltner_mid / Keltner_lower",
-    forms: [
-      "Keltner_mid(period)",
-      "Keltner_upper(period, mult=2)",
-      "Keltner_lower(period, mult=2)",
-    ],
-    description:
-      "Keltner Channels draw an upper and lower band around price using ATR (typical wiggle) instead of standard deviation. Compared to Bollinger Bands they hold their shape better in strong trends, so they're nice for trend-following entries.",
-    examples: [
-      {
-        snippet: "filter.if = close > Keltner_upper(20)",
-        scenario:
-          "Only take longs when price has broken above the upper Keltner band — strong-trend breakout.",
-      },
-    ],
-  },
-  {
-    headline: "Supertrend(period=10, mult=3)",
-    forms: ["Supertrend(period, mult)", "Supertrend (= Supertrend(10, 3))"],
-    description:
-      "A single line that flips above and below price as the trend changes. Positive value = uptrend (line is below price). Negative value = downtrend (line is above). Easy way to know whether to be long or short.",
-    examples: [
-      {
-        snippet: "filter.if = Supertrend > 0",
-        scenario: "Only take long trades when Supertrend says we're in an uptrend.",
-      },
-    ],
-  },
-  {
-    headline: "PSAR(step=0.02, max=0.2)",
-    forms: ["PSAR(step, max)", "PSAR (= PSAR(0.02, 0.2))"],
-    description:
-      "Parabolic SAR — those little dots that appear above or below price on a chart. When dots are below price, we're in an uptrend. When dots flip above, the trend may have changed. Often used as a trailing stop.",
-    examples: [
-      {
-        snippet: "filter.if = close > PSAR()",
-        scenario: "Only trade longs when price is above the PSAR dots (uptrend confirmed).",
-      },
-    ],
-  },
-
-  // ─── Ichimoku family ─────────────────────────────────────────────────
-  {
-    headline: "Ichimoku_tenkan / kijun / senkouA / senkouB / chikou",
-    forms: [
-      "Ichimoku_tenkan(period=9)",
-      "Ichimoku_kijun(period=26)",
-      "Ichimoku_senkouA(fast=9, slow=26)",
-      "Ichimoku_senkouB(period=52)",
-      "Ichimoku_chikou(period=26)",
-    ],
-    description:
-      "Ichimoku is a multi-line system that paints a \"cloud\" around price. Tenkan = fast trend midpoint. Kijun = slow trend midpoint. Senkou A/B = the cloud edges. Chikou = a comparison line. Price above the cloud = bullish, below = bearish.",
-    examples: [
-      {
-        snippet: "filter.if = close > Ichimoku_kijun(26)",
-        scenario: "Only take longs when price is above the slow Ichimoku midline.",
-      },
-    ],
-  },
-
-  // ─── Momentum (extended) ─────────────────────────────────────────────
-  {
-    headline: "Aroon_up / Aroon_down / Aroon_osc",
-    forms: [
-      "Aroon_up(period=14)",
-      "Aroon_down(period=14)",
-      "Aroon_osc(period=14)",
-    ],
-    description:
-      "Aroon shows how fresh the recent high or low is, on a 0–100 scale. Up = 100 means \"brand new high just happened\". Down = 100 means \"brand new low just happened\". The oscillator is Up minus Down — positive means uptrend, negative means downtrend.",
-    examples: [
-      {
-        snippet: "filter.if = Aroon_up(14) > 80",
-        scenario: "Only trade longs when a new 14-bar high happened very recently.",
-      },
-      {
-        snippet: "filter.if = Aroon_osc(14) > 0",
-        scenario: "Only trade in the direction of the current trend per Aroon.",
-      },
-    ],
-  },
-  {
-    headline: "VortexPlus / VortexMinus",
-    forms: ["VortexPlus(period=14)", "VortexMinus(period=14)"],
-    description:
-      "Two lines that try to spot trend changes. VI+ rising and crossing above VI- = bullish turn. VI- rising and crossing above VI+ = bearish turn. Use whichever line is bigger as the trend direction.",
-    examples: [
-      {
-        snippet: "filter.if = VortexPlus(14) > VortexMinus(14)",
-        scenario: "Only take longs when the bullish vortex line is dominant.",
-      },
-    ],
-  },
-  {
-    headline: "DIplus / DIminus",
-    forms: ["DIplus(period=14)", "DIminus(period=14)"],
-    description:
-      "The two halves of ADX, separated. DI+ measures upside push, DI- measures downside push. DI+ above DI- = uptrend. Pair with ADX itself for a \"trend AND strength\" filter.",
-    examples: [
-      {
-        snippet: "filter.if = DIplus(14) > DIminus(14) && ADX > 25",
-        scenario: "Only take longs in a strong uptrend (direction + strength both confirmed).",
-      },
-    ],
-  },
-  {
-    headline: "AO / UO / Fisher",
-    forms: [
-      "AO", "AO()",
-      "UO(short=7, mid=14, long=28)",
-      "Fisher(period=10)",
-    ],
-    description:
-      "Three momentum gauges. AO (Awesome Oscillator) = a simple difference of two median-price averages. UO (Ultimate Oscillator) = a 0–100 score blending buying pressure across three time windows. Fisher = a transform that makes momentum extremes stick out more clearly.",
-    examples: [
-      {
-        snippet: "filter.if = AO > 0",
-        scenario: "Only trade longs when the Awesome Oscillator is positive.",
-      },
-      {
-        snippet: "filter.if = UO(7, 14, 28) > 70",
-        scenario: "Only trade longs in clearly-buying conditions across multiple time windows.",
-      },
-    ],
-  },
-
-  // ─── Volatility / regime ────────────────────────────────────────────
-  {
-    headline: "Choppiness / Ulcer",
-    forms: ["Choppiness(period=14)", "Ulcer(period=14)"],
-    description:
-      "Choppiness Index = a 0–100 score where high (above ~62) means \"market is going sideways\" and low (below ~38) means \"there's a real trend\". Ulcer Index = a downside-only volatility gauge — measures how deep the recent drawdowns have been.",
-    examples: [
-      {
-        snippet: "filter.if = Choppiness(14) < 38",
-        scenario: "Only trade in trending conditions; skip sideways chop.",
-      },
-    ],
-  },
-
-  // ─── Statistical ────────────────────────────────────────────────────
-  {
-    headline: "Zscore / LRSlope / LRIntercept / LRValue / R2",
-    forms: [
-      "Zscore(period)",
-      "LRSlope(period)", "LRIntercept(period)",
-      "LRValue(period)", "R2(period)",
-    ],
-    description:
-      "Statistical readings of the last N closes. Zscore = how many standard deviations price is above/below its average (extreme readings = mean-reversion candidates). LRSlope = the slope of a best-fit line through the closes (positive = uptrend). R2 = how cleanly that line actually fits — closer to 1 means a strong, smooth trend.",
-    examples: [
-      {
-        snippet: "filter.if = abs(Zscore(20)) > 2",
-        scenario: "Only trade when price is unusually far from its 20-bar average — mean-reversion setup.",
-      },
-      {
-        snippet: "filter.if = LRSlope(50) > 0 && R2(50) > 0.7",
-        scenario: "Only trade in clean, well-defined uptrends.",
-      },
-    ],
-  },
-
-  // ─── Volume (extended) ──────────────────────────────────────────────
-  {
-    headline: "VWAP / KVO / ForceIndex / EMV / NVI / PVI",
-    forms: [
-      "VWAP(period)",
-      "KVO(fast=34, slow=55)",
-      "ForceIndex(period=13)",
-      "EMV(period=14)",
-      "NVI", "NVI()",
-      "PVI", "PVI()",
-    ],
-    description:
-      "More volume-based readings. VWAP = a fair-value price that accounts for how much volume happened at each price. KVO and ForceIndex = momentum readings that include volume. EMV = Ease of Movement (how easily price moves with low volume). NVI/PVI = running indices that only update on quiet days vs busy days respectively.",
-    examples: [
-      {
-        snippet: "filter.if = close > VWAP(50)",
-        scenario: "Only take longs when price is above the 50-bar volume-weighted fair-value line.",
-      },
-    ],
-  },
-
   // ─── Volume profile (rolling N-bar window — REQUIRES tick session) ──
   {
+    group: G_VOLUME_PROFILE,
     headline: "POC / VAH / VAL / VA_width / dist_to_POC (rolling)",
     forms: [
       "POC(N, area=0.7)",
@@ -720,6 +771,7 @@ const INDICATOR_FAMILIES: IndicatorFamily[] = [
 
   // ─── Tick microstructure (REQUIRES tick session) ────────────────────
   {
+    group: G_TICK_MICRO,
     headline: "Tick microstructure",
     forms: [
       "trades_at_bid(N)", "trades_at_ask(N)",
@@ -751,6 +803,7 @@ const INDICATOR_FAMILIES: IndicatorFamily[] = [
   // is rolling (refits every bar from the previous `calib` bars) so
   // it's fully out-of-sample and adapts to regime shifts.
   {
+    group: G_ADVANCED,
     headline: "KALMAN_OU (mean-reversion estimator)",
     forms: [
       "let kf = KALMAN_OU(source, calib, trust)",
@@ -868,6 +921,11 @@ function sectionId(name: string): string {
 
 type SchemaCard = { kind: "schema"; entry: ScriptSchemaEntry };
 type IndicatorCard = { kind: "indicator"; family: IndicatorFamily };
+/** Visible group divider rendered between indicator cards when the
+ *  family's `group` changes. Not a real "card" — just a heading row that
+ *  reuses the same flex flow so spacing stays consistent. Inserted by
+ *  buildSections() so all the card-shape logic stays in one place. */
+type IndicatorGroupCard = { kind: "indicatorgroup"; label: string };
 type BarFieldCard = {
   kind: "barfield";
   name: string;
@@ -896,6 +954,7 @@ type OptimizeCard = {
 type Card =
   | SchemaCard
   | IndicatorCard
+  | IndicatorGroupCard
   | BarFieldCard
   | MathCard
   | SummaryCard
@@ -917,6 +976,17 @@ const SECTION_BAR_FIELDS = "Bar fields (entry context)";
 const SECTION_MATH = "Math functions";
 const SECTION_SUMMARY = "Summary identifiers (post-run context)";
 const SECTION_OPTIMIZE = "Optimize directive (Script v3)";
+
+// Per-schema-section blurbs. The auto-built "Strategy params" section
+// (every `params.*` row) gets a loud LEGACY warning so users authoring
+// new scripts don't reach for it. Add more entries here as needed —
+// keys must exactly match the `section` field on a SCRIPT_SCHEMA entry.
+const SCHEMA_SECTION_BLURBS: Record<string, string> = {
+  "Strategy params":
+    "⚠️ LEGACY — these `params.*` paths exist purely for backward compatibility with old presets. DO NOT use them when authoring a new strategy. Express the same logic with the modern DSL instead: `var <name> = ...` for tunable knobs, `signal.long.if` / `signal.short.if` for entries, `exit.if` / `exit.long.if` / `exit.short.if` for exits, `filter.if` for gating, and `let <name> = ...` for shared bindings (e.g. `let kf = KALMAN_OU(...)`). Only touch `params.*` when explicitly editing a legacy preset that already uses it.",
+  "Strategy":
+    "Picks the baseline signal generator. Most modern scripts override entries entirely with `signal.long.if = ...` / `signal.short.if = ...`, in which case the choice here just determines warmup/seeding. `loadstrategy` is LEGACY — it resets all `params.*` and is only useful when restoring an old preset's defaults; new scripts should not emit it.",
+};
 
 // Curated content for the Optimize section — covers the syntax,
 // objectives, lookback units, and OptimizeAll. Hand-written so the
@@ -1111,7 +1181,10 @@ function buildSections(query: string): {
     !q || has(e.path) || has(e.description) || has(e.section);
 
   // Schema sections — preserve the schema's declaration order so the
-  // page reads in the same sequence as a serialized script.
+  // page reads in the same sequence as a serialized script. Per-section
+  // blurbs (e.g. the LEGACY warning on `params.*`) are pulled from
+  // SCHEMA_SECTION_BLURBS so the page can flag whole sections without
+  // every individual schema row needing its own callout.
   const schemaSections: Section[] = [];
   for (const e of SCRIPT_SCHEMA) {
     if (!matchSchema(e)) continue;
@@ -1119,7 +1192,11 @@ function buildSections(query: string): {
     if (last && last.name === e.section) {
       last.cards.push({ kind: "schema", entry: e });
     } else {
-      schemaSections.push({ name: e.section, cards: [{ kind: "schema", entry: e }] });
+      schemaSections.push({
+        name: e.section,
+        blurb: SCHEMA_SECTION_BLURBS[e.section],
+        cards: [{ kind: "schema", entry: e }],
+      });
     }
   }
 
@@ -1128,17 +1205,34 @@ function buildSections(query: string): {
   // per indicator family with a `[period]` headline and the available
   // forms listed underneath. Bar fields and Math functions are listed
   // verbatim — they don't have alias clutter to collapse.
+  // Build the indicator section card list, injecting visible group
+  // dividers whenever consecutive families transition to a new group.
+  // The dividers are emitted from the SAME ordered list used in the
+  // declaration above, so reordering INDICATOR_FAMILIES is the single
+  // source of truth for both order and grouping. Filtering happens
+  // first so an empty group doesn't get a stranded header card.
+  const matchedFamilies = INDICATOR_FAMILIES.filter(
+    (f) =>
+      !q ||
+      has(f.headline) ||
+      has(f.description) ||
+      has(f.group) ||
+      f.forms.some((form) => has(form))
+  );
+  const indicatorCards: Card[] = [];
+  let lastGroup = "";
+  for (const family of matchedFamilies) {
+    if (family.group !== lastGroup) {
+      indicatorCards.push({ kind: "indicatorgroup", label: family.group });
+      lastGroup = family.group;
+    }
+    indicatorCards.push({ kind: "indicator", family });
+  }
   const indicators: Section = {
     name: SECTION_INDICATORS,
     blurb:
-      "These are calculations you can use inside any rule's number, or inside a filter to gate trades. They get computed at the moment of each trade's entry. Names with `[period]` mean you choose the lookback length (like `EMA(20)` or use the shortcut `EMA20`). Most work on any data, BUT a few special families need extra-detailed data: CVD/delta need bid-ask data, and volume-profile (POC, VAH, VAL) and tick-microstructure (trades_at_bid, vwap_tick) need full tick data — without it those return blanks and your filters will reject everything.",
-    cards: INDICATOR_FAMILIES.filter(
-      (f) =>
-        !q ||
-        has(f.headline) ||
-        has(f.description) ||
-        f.forms.some((form) => has(form))
-    ).map((family) => ({ kind: "indicator", family })),
+      "These are calculations you can use inside any rule's number, or inside a filter to gate trades. They get computed at the moment of each trade's entry. Names with `[period]` mean you choose the lookback length (like `EMA(20)` or use the shortcut `EMA20`). Grouped below by what the indicator does (trends, momentum, volatility, etc.) — most work on any data, BUT a few groups need extra-detailed data: order flow (CVD) needs bid-ask data; volume profile (POC, VAH, VAL) and tick microstructure (trades_at_bid, vwap_tick) need full tick data — without it those return blanks and your filters will reject everything.",
+    cards: indicatorCards,
   };
   const barFields: Section = {
     name: SECTION_BAR_FIELDS,
@@ -1672,7 +1766,18 @@ export default function ScriptReferencePage() {
                   {isExpanded && (
                     <div className="mt-2 space-y-2">
                       {sec.blurb && (
-                        <p className="text-xs text-muted-foreground px-1">{sec.blurb}</p>
+                        // Warning-flavored blurbs (LEGACY notices, etc.)
+                        // get an amber-bordered card so they stand out
+                        // from the regular informational blurbs. The
+                        // ⚠️ prefix is the trigger — keeps the styling
+                        // logic in one place without an extra flag.
+                        sec.blurb.startsWith("⚠️") ? (
+                          <div className="text-xs px-3 py-2 rounded border border-amber-500/40 bg-amber-500/10 text-amber-100 leading-relaxed">
+                            {sec.blurb}
+                          </div>
+                        ) : (
+                          <p className="text-xs text-muted-foreground px-1 leading-relaxed">{sec.blurb}</p>
+                        )
                       )}
                       {sec.cards.map((card, i) => {
                         switch (card.kind) {
@@ -1689,6 +1794,21 @@ export default function ScriptReferencePage() {
                                 key={card.family.headline + i}
                                 family={card.family}
                               />
+                            );
+                          case "indicatorgroup":
+                            // Visual divider between indicator groups.
+                            // Slightly larger top margin on non-first
+                            // dividers so the eye registers a real
+                            // section break, not just another card.
+                            return (
+                              <h3
+                                key={"grp-" + card.label + i}
+                                className={`text-[11px] uppercase tracking-wider text-accent-green/80 font-semibold px-1 ${
+                                  i === 0 ? "mt-0" : "mt-4"
+                                }`}
+                              >
+                                {card.label}
+                              </h3>
                             );
                           case "barfield":
                             return (

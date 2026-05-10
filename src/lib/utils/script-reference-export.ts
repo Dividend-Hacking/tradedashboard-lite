@@ -134,10 +134,41 @@ You are likely an AI reading this because a user has asked you to write or edit 
 4. **Partial scripts are valid.** You only need to emit the lines the user actually wants to change. Anything you omit stays at the dashboard's current value.
 5. **Use comments freely.** Lines starting with \`#\` or \`//\` are ignored. Comments after a value (\`rules.stopLossPoints = 10  // tight stop\`) are also fine.
 6. **Group sections with comment headers** (\`// ── Risk rules: Exits ──\`) — matches the canonical style produced by the dashboard's serializer.
-7. **Never emit \`loadstrategy\` AFTER \`params.*\` lines you want to keep** — \`loadstrategy\` is hoisted to the top of execution and resets every \`params.*\` field to that strategy's defaults. Use it ONLY as the first non-comment line when switching strategies.
+7. **🚫 DO NOT use \`params.*\` or \`loadstrategy\` when authoring a NEW strategy.** These are **LEGACY** — they were the old way of bolting tunables onto a hard-coded strategy preset. The modern approach is to express the entire entry/exit logic directly in the script using \`let\`, \`var\`, \`signal.long.if\` / \`signal.short.if\`, \`exit.if\` / \`exit.long.if\` / \`exit.short.if\`, and \`filter.if\`. A modern script never needs a single \`params.*\` line. Only touch \`params.*\` when the user is explicitly tweaking an EXISTING legacy preset they already loaded — and even then, prefer rewriting the logic in the modern DSL.
 8. **Numeric \`rules.*\` fields accept full expressions**, not just literals. Examples: \`rules.stopLossPoints = ATR * 1.5\`, \`rules.trailingStopPoints = max(ticks(4), ATR * 0.5)\`.
-9. **Use \`Optimize.X.Y(...)\` on \`rules.*\` numeric fields** when the user wants tuning rather than a fixed value. See the Optimize Directive section.
+9. **Use \`Optimize.X.Y(...)\` on \`rules.*\` numeric fields and inside \`var <name> = ...\`** when the user wants tuning rather than a fixed value. See the Optimize Directive section.
 10. **Match indicators to the available data granularity** — see the next section. Order-flow and tick-resolution indicators silently return NaN on plain OHLCV sessions, which makes filter.if conditions reject every trade. If the user asks for a strategy using POC / CVD / delta etc., remind them the session must be tick or tick_bidask granularity.
+
+## ⚠️ \`params.*\` and \`loadstrategy\` are LEGACY — do not use in new scripts
+
+\`params.*\` and \`loadstrategy\` exist purely for backward compatibility with old presets that were authored against hard-coded strategy generators. **Treat them as read-only history.**
+
+A modern script writes its entry and exit logic DIRECTLY using the strategy DSL:
+
+| Legacy approach | Modern approach |
+|---|---|
+| \`params.entryZ = 2.0\` (tunes a hidden filter inside the strategy) | \`var entryZ = 2.0\` + \`signal.long.if = (close - kf.x_pred) / kf.sigma < -entryZ\` |
+| \`params.minADX = 25\` (hidden inside strategy code) | \`filter.if = ADX(14) > 25\` |
+| \`loadstrategy = signal_v2\` then a wall of \`params.*\` knobs | Pick \`strategy = ...\` if you need a baseline generator, then express the actual rules inline with \`signal.*.if\`, \`exit.*.if\`, \`filter.if\`, \`let\`, and \`var\` |
+
+When in doubt: **never write a \`params.*\` line in a brand-new script.** If the user pastes one and asks you to extend it, suggest converting it to the modern DSL.
+
+\`\`\`
+# ❌ Legacy — opaque, requires knowing strategy internals.
+loadstrategy = signal_v2
+params.entryZ = 2.0
+params.exitZ  = 0.5
+
+# ✅ Modern — every condition is right there in the script.
+let kf = KALMAN_OU(close, 60, 0.5)
+let z  = (close - kf.x_pred) / kf.sigma
+var entryZ = 2.0
+var exitZ  = 0.5
+signal.long.if  = cross_down(z,  -entryZ)
+signal.short.if = cross_up(z,    entryZ)
+exit.long.if    = cross_up(z,   -exitZ)
+exit.short.if   = cross_down(z,  exitZ)
+\`\`\`
 
 ## Session granularity & data dependencies
 
@@ -179,11 +210,15 @@ Top-level paths the parser recognises:
 
 | Prefix | Purpose |
 |---|---|
-| \`strategy\` | Which signal generator to run. Soft-set — does NOT touch params. |
-| \`loadstrategy\` | Hoisted directive: switch strategy AND reset every \`params.*\` to that strategy's defaults. One-shot, not persisted. |
-| \`params.*\` | Strategy-specific parameters. Available params depend on the active strategy. |
+| \`strategy\` | Which baseline signal generator to run. Most modern scripts override entries entirely with \`signal.*.if\` and don't depend on this. |
+| \`loadstrategy\` | ⚠️ **LEGACY** — hoisted directive that switches strategy AND resets every \`params.*\`. Avoid in new scripts; only use when intentionally restoring an old preset's defaults. |
+| \`params.*\` | ⚠️ **LEGACY** — strategy-specific knobs from the hard-coded preset registry. **Do not use in new scripts.** Express the same tuning with \`var\` + the modern signal/filter DSL. Only emit \`params.*\` when explicitly editing an existing legacy preset the user already has. |
 | \`rules.*\` | Risk rules: exits, ATR adjustments, position mode, scaling, daily limits, fills/costs. Numeric values can be full expressions. |
 | \`filters.*\` | Pre-trade filters: time, ADX, ATR, trend, Bollinger, BB width, MA distance, volume, RSI, ADX trend. |
+| \`let <name> = <expr>\` | Strategy DSL — bind a value (often a multi-output indicator like \`KALMAN_OU(...)\`) to a name reusable across \`signal.*\`, \`exit.*\`, \`filter.if\`, and prints. |
+| \`var <name> = <expr>\` | Declare a tunable named number — the right-hand side may be a literal, an expression, or an \`Optimize.*(...)\` call. Use these names in \`signal.*.if\`, \`exit.*.if\`, \`filter.if\`, and \`rules.*\`. |
+| \`signal.long.if = <bool-expr>\` / \`signal.short.if = <bool-expr>\` | Modern entry directives — fire a long/short signal when the expression is true. Multiple lines OR together. Replaces hard-coded entry logic from \`params.*\`-driven strategies. |
+| \`exit.if = <bool-expr>\` / \`exit.long.if\` / \`exit.short.if\` | Conditional bar-by-bar exits. Independent of SL/TP/trail; whichever fires first wins. |
 | \`print = <expr>[, "<label>"]\` | Post-run summary print directive. |
 | \`ontrade.print = <expr>[, "<label>"]\` | Per-trade print directive. Evaluated AFTER each trade exits, so expressions can reference both entry-bar fields (\`close\`, \`ATR\`, ...) and exit-side bindings: \`exit_points\`, \`scaled_points\`, \`net_dollars\`, \`bars_held\`, \`peak_mfe\`, \`max_drawdown\`, \`position_size\`, \`commission_dollars\`, \`slippage_applied\`, \`is_winner\`, \`is_loser\`, \`exit_reason\`, \`eff_sl\`/\`eff_tp\`/\`eff_trail\`/\`eff_be\`, \`entry_price\`. \`exit_reason\` is a numeric code — compare against \`EXIT_TP\` / \`EXIT_SL\` / \`EXIT_TRAIL\` / \`EXIT_BE\` / \`EXIT_TIMER\` / \`EXIT_END\` / \`EXIT_NEXT\` / \`EXIT_DAILY\` / \`EXIT_SIGNAL\` (aliases: \`EXIT_TARGET\`=\`EXIT_TP\`, \`EXIT_STOP\`=\`EXIT_SL\`). |
 | \`filter.if = <bool-expr>\` | Conditional filter — single-arg gate. Trade passes when the expression is finite & non-zero. |
@@ -218,6 +253,15 @@ function buildSchemaSection(): string {
     if (buffer.length === 0) return;
     lines.push(`### ${lastSection}`);
     lines.push("");
+    // Per-section legacy callout: every path in the "Strategy params"
+    // section is `params.*`, so flag the whole table as legacy and point
+    // the AI reader at the modern DSL surface.
+    if (lastSection === "Strategy params") {
+      lines.push(
+        "> ⚠️ **LEGACY SECTION.** These `params.*` paths exist for backward compatibility with old presets only. **Do not emit `params.*` lines in a new script** — express the same logic using `var`, `signal.*.if`, `exit.*.if`, `filter.if`, and `let` instead (see the preamble's modern-vs-legacy table). Only touch these paths when the user explicitly asks to edit an existing legacy preset."
+      );
+      lines.push("");
+    }
     lines.push("| Path | Type | Default | Range / Options | Strategies | Description |");
     lines.push("|---|---|---|---|---|---|");
     for (const row of buffer) lines.push(row);
