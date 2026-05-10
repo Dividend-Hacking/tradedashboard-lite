@@ -2994,13 +2994,15 @@ export function parseBacktestScript(text: string): ParseResult {
     if (stripped.startsWith("//") || stripped.startsWith("#")) continue;
 
     // Strategy DSL — `let <name> = …`, `signal.long.if = …`,
-    // `signal.short.if = …`. These are parsed and evaluated by the
-    // strategy-evaluator module. Skip them here so the line-based DSL
-    // parser doesn't try to coerce them into the config schema and
-    // emit phantom "unknown path" warnings.
+    // `signal.short.if = …`, `graph = …` / `graph["Title"] = …`. These
+    // are parsed and evaluated by the strategy-evaluator module. Skip
+    // them here so the line-based DSL parser doesn't try to coerce
+    // them into the config schema and emit phantom "unknown path"
+    // warnings.
     if (
       /^let\s+/.test(stripped) ||
-      /^signal\.(long|short)\.if\s*=/.test(stripped)
+      /^signal\.(long|short)\.if\s*=/.test(stripped) ||
+      /^graph\s*(\[|=)/.test(stripped)
     ) {
       inStrategyContinuation = true;
       prevEndsWithOp = endsWithContinuationOp(stripped);
