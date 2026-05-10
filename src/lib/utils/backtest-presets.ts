@@ -352,6 +352,11 @@ export interface BacktestPreset {
    *  in `"new"` (defaulted in normalizePresetForLoad and createPreset for
    *  forward-compat with older saves). */
   bucket?: PipelineBucket;
+  /** Free-form per-preset notes. Edited from the /pipeline detail panel —
+   *  the backtest dashboard does not surface this field. Stored as TEXT in
+   *  Supabase + SQLite (nullable) so older presets show up with an empty
+   *  textarea. Not exported to NT8 — purely a curation/UX field. */
+  notes?: string;
 }
 
 /** Patch shape accepted by setPresetBucket — just the destination stage. */
@@ -627,6 +632,32 @@ export function renamePreset(id: string, name: string): BacktestPreset | null {
   return next;
 }
 
+/** Update only the free-form notes on a preset. Used by the /pipeline
+ *  detail panel; kept separate from updatePreset so we don't have to
+ *  synthesize a full payload patch (params/rules/filters) just to save
+ *  notes. Empty / whitespace-only input is normalized to undefined so the
+ *  DB stores NULL and the textarea renders blank on next load. */
+export function updatePresetNotes(
+  id: string,
+  notes: string
+): BacktestPreset | null {
+  const list = loadPresets();
+  const idx = list.findIndex((p) => p.id === id);
+  if (idx < 0) return null;
+  const trimmed = notes.trim();
+  const normalized = trimmed.length === 0 ? undefined : notes;
+  const next: BacktestPreset = {
+    ...list[idx],
+    notes: normalized,
+    updatedAt: new Date().toISOString(),
+  };
+  list[idx] = next;
+  writePresets(list);
+  pushPresetToBackend(next).catch(() => {});
+  emitPresetsChanged();
+  return next;
+}
+
 /** Remove a preset by id. No-op if not found. localStorage update is
  *  synchronous; backend delete fires in the background. */
 export function deletePreset(id: string): void {
@@ -663,6 +694,7 @@ export function normalizePresetForLoad(preset: BacktestPreset): BacktestPreset {
     script: preset.script,
     paramMeta: preset.paramMeta,
     bucket: preset.bucket ?? "new",
+    notes: preset.notes,
     rules: { ...DEFAULT_SIM_RULES, ...preset.rules },
     filters: {
       time: (() => {

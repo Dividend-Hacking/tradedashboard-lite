@@ -1629,6 +1629,7 @@ export const presetsRepo = {
       script: (r.script as string | null | undefined) ?? undefined,
       paramMeta:
         readJson<BacktestPreset["paramMeta"]>(r.param_meta) ?? undefined,
+      notes: (r.notes as string | null | undefined) ?? undefined,
     }));
   },
 
@@ -1637,8 +1638,8 @@ export const presetsRepo = {
       .prepare(
         `INSERT INTO backtest_presets
           (id, name, version, strategy_id, params, rules, filters,
-           bucket, script, param_meta, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+           bucket, script, param_meta, notes, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(id) DO UPDATE SET
            name = excluded.name,
            version = excluded.version,
@@ -1649,6 +1650,7 @@ export const presetsRepo = {
            bucket = excluded.bucket,
            script = excluded.script,
            param_meta = excluded.param_meta,
+           notes = excluded.notes,
            updated_at = excluded.updated_at`
       )
       .run(
@@ -1662,6 +1664,7 @@ export const presetsRepo = {
         preset.bucket ?? "new",
         preset.script ?? null,
         preset.paramMeta ? writeJson(preset.paramMeta) : null,
+        preset.notes ?? null,
         preset.createdAt,
         preset.updatedAt
       );

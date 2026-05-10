@@ -782,6 +782,9 @@ interface PresetRow {
   // dropped on every cross-device sync).
   script?: string | null;
   param_meta?: BacktestPreset["paramMeta"] | null;
+  // Free-form per-preset notes surfaced in the /pipeline detail panel.
+  // Nullable so existing rows backfill cleanly.
+  notes?: string | null;
 }
 
 function rowToPreset(row: PresetRow): BacktestPreset {
@@ -798,6 +801,7 @@ function rowToPreset(row: PresetRow): BacktestPreset {
     bucket: row.bucket ?? "new",
     script: row.script ?? undefined,
     paramMeta: row.param_meta ?? undefined,
+    notes: row.notes ?? undefined,
   };
 }
 
@@ -815,6 +819,7 @@ function presetToRow(p: BacktestPreset): PresetRow {
     bucket: p.bucket ?? "new",
     script: p.script ?? null,
     param_meta: p.paramMeta ?? null,
+    notes: p.notes ?? null,
   };
 }
 

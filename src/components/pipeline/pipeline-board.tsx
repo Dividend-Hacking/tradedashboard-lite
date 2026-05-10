@@ -33,6 +33,7 @@ import {
   syncPresetsFromSupabase,
   setPresetBucket,
   renamePreset,
+  updatePresetNotes,
   deletePreset,
   PIPELINE_BUCKETS,
   PIPELINE_BUCKET_LABELS,
@@ -320,8 +321,11 @@ function PresetDetailPanel({
 }) {
   // The parent re-mounts this panel via `key={open.id}` so a fresh
   // `useState(preset.name)` always picks up the current preset's name —
-  // no re-seed effect needed.
+  // no re-seed effect needed. Same pattern for notes: the textarea is
+  // seeded once from the persisted value and the user clicks Save to
+  // commit (no debounced auto-save — keeps the round-trip explicit).
   const [name, setName] = useState(preset.name);
+  const [notes, setNotes] = useState(preset.notes ?? "");
 
   const created = new Date(preset.createdAt);
   const updated = new Date(preset.updatedAt);
@@ -338,6 +342,17 @@ function PresetDetailPanel({
     const trimmed = name.trim();
     if (trimmed.length === 0 || trimmed === preset.name) return;
     renamePreset(preset.id, trimmed);
+    onChange();
+  };
+
+  // Persist notes only when the user clicks Save AND the value has actually
+  // changed vs. what's stored. Trim-compare so adding/removing trailing
+  // whitespace doesn't count as an edit.
+  const persistedNotes = preset.notes ?? "";
+  const notesDirty = notes !== persistedNotes;
+  const handleSaveNotes = () => {
+    if (!notesDirty) return;
+    updatePresetNotes(preset.id, notes);
     onChange();
   };
 
@@ -431,6 +446,32 @@ function PresetDetailPanel({
                 </option>
               ))}
             </select>
+          </div>
+
+          <div>
+            <label className="block text-[10px] uppercase tracking-wider text-muted-foreground mb-1">
+              Notes
+            </label>
+            <textarea
+              value={notes}
+              onChange={(e) => setNotes(e.target.value)}
+              placeholder="Add notes about this strategy — observations, todo items, why it's in this bucket, etc."
+              rows={5}
+              className="w-full bg-background border border-card-border rounded px-2 py-1.5 text-sm text-foreground focus:outline-none focus:ring-1 focus:ring-accent-green resize-y"
+            />
+            <div className="flex justify-end mt-1.5">
+              <button
+                onClick={handleSaveNotes}
+                disabled={!notesDirty}
+                className={`px-3 py-1.5 rounded text-xs font-medium transition-colors ${
+                  !notesDirty
+                    ? "bg-white/5 text-muted-foreground/40 cursor-not-allowed"
+                    : "bg-accent-green/20 text-accent-green hover:bg-accent-green/30"
+                }`}
+              >
+                Save notes
+              </button>
+            </div>
           </div>
 
           <div className="grid grid-cols-2 gap-3 pt-2 border-t border-card-border">
