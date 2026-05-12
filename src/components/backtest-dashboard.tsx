@@ -2943,7 +2943,22 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
       const parsedStrategy = parseStrategyScript(appliedScriptText);
       stratOptimizeSpecs = parsedStrategy.optimizeSpecs;
       const hasSignals = parsedStrategy.stmts.some((s) => s.kind === "signal");
-      if (hasSignals && parsedStrategy.errors.every((e) => e.severity !== "error")) {
+      // chart/graph directives are evaluated independently of trades — they
+      // walk every bar (chart) or every trade entry (graph) and don't
+      // require a signal expression to exist. Allow the run to proceed when
+      // the script declares only `chart = …` / `graph = …` so users can
+      // visualize indicators on the price chart without first wiring up a
+      // signal. The engine handles the no-signals case cleanly: 0 signals
+      // → 0 zones → 0 trades, but chartDirectives/graphDirectives still
+      // flow back into runResult and the dashboard's per-bar evaluation
+      // memos render them.
+      const hasChartsOrGraphs = parsedStrategy.stmts.some(
+        (s) => s.kind === "chart" || s.kind === "graph"
+      );
+      if (
+        (hasSignals || hasChartsOrGraphs) &&
+        parsedStrategy.errors.every((e) => e.severity !== "error")
+      ) {
         // Keep `let` bindings (referenced by signal expressions),
         // signal stmts, `graph = <expr>` directives (engine surfaces
         // them as runResult.graphDirectives → segment-analysis
