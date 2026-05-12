@@ -38,6 +38,26 @@ export type ParsedTicks = {
    *   2 = ask (buy-aggressor — trade lifted the ask)
    */
   sides: Uint8Array;
+  /**
+   * Best-bid price at the moment of the trade (NaN if unknown — either the
+   * blob predates the v2 quote columns, or the trade fired before any
+   * bid quote event was observed in the day).
+   */
+  bestBids: Float64Array;
+  /** Best-ask price at the moment of the trade (NaN if unknown). */
+  bestAsks: Float64Array;
+  /** Best-bid size at the moment of the trade (0 if unknown). */
+  bestBidSizes: Int32Array;
+  /** Best-ask size at the moment of the trade (0 if unknown). */
+  bestAskSizes: Int32Array;
+  /**
+   * True when the source CSV included the top-of-book quote columns
+   * (best_bid, best_ask, best_bid_size, best_ask_size). False for legacy
+   * 5-column blobs — in that case the four quote typed arrays are still
+   * allocated, but they are filled with NaN/0 and indicators that depend
+   * on them will yield NaN.
+   */
+  hasQuotes: boolean;
 };
 
 /** How to bucket ticks into bars. */
@@ -74,13 +94,24 @@ function encodeSide(s: string): number {
 /**
  * Parse the tick CSV produced by `DataExporter.cs ProcessTickRequest`.
  *
- * Header line (skipped): `tick_index,tick_time,price,size,side\n`
- * Row format:           `0,2026-04-15T13:30:00.123,18234.5000,3,ask\n`
+ * Two schema versions are supported and detected automatically by sniffing
+ * the header row:
+ *   v1 (legacy, 5 cols):
+ *     `tick_index,tick_time,price,size,side\n`
+ *     `0,2026-04-15T13:30:00.123,18234.5000,3,ask\n`
+ *   v2 (with top-of-book quotes, 9 cols):
+ *     `tick_index,tick_time,price,size,side,best_bid,best_ask,best_bid_size,best_ask_size\n`
+ *     `0,2026-04-15T13:30:00.123,18234.5000,3,ask,18234.2500,18234.5000,40,12\n`
+ *
+ * For v1 blobs the `bestBids`/`bestAsks` arrays are still allocated (same
+ * length as everything else) and filled with `NaN`; the size arrays are
+ * filled with `0`. The `hasQuotes` flag on the result tells callers/
+ * indicators whether the quote columns are meaningful.
  *
  * We deliberately avoid `String.split('\n')` and `String.split(',')` because
- * for a 5M-tick day those would allocate ~25M intermediate strings (5M ×
- * five fields). Instead we walk the input once with `indexOf` to find the
- * line and field boundaries, and slice + parse only what we need.
+ * for a 5M-tick day those would allocate ~25M intermediate strings. Instead
+ * we walk the input once with `indexOf` to find line and field boundaries,
+ * and slice + parse only what we need.
  *
  * The schema is fixed (no quoting / escaping), so we can hard-code field
  * positions instead of running a generic CSV state machine.
@@ -100,10 +131,31 @@ export function parseTickCsv(text: string): ParsedTicks {
   // Subtract the header row.
   const dataRowEstimate = Math.max(0, lineCount - 1);
 
+  // Sniff the header to decide whether the new quote columns are present.
+  // v1 = 5 fields → 4 commas. v2 = 9 fields → 8 commas. Counting commas in
+  // the first line is cheaper than a split.
+  const firstNl = text.indexOf("\n");
+  const headerEnd = firstNl === -1 ? text.length : firstNl;
+  let headerCommas = 0;
+  for (let i = 0; i < headerEnd; i++) {
+    if (text.charCodeAt(i) === 44 /* ',' */) headerCommas++;
+  }
+  const hasQuotes = headerCommas >= 8;
+
   const times = new Float64Array(dataRowEstimate);
   const prices = new Float64Array(dataRowEstimate);
   const sizes = new Int32Array(dataRowEstimate);
   const sides = new Uint8Array(dataRowEstimate);
+  const bestBids = new Float64Array(dataRowEstimate);
+  const bestAsks = new Float64Array(dataRowEstimate);
+  const bestBidSizes = new Int32Array(dataRowEstimate);
+  const bestAskSizes = new Int32Array(dataRowEstimate);
+  // For v1 blobs we want the price arrays to read as "unknown" (NaN), not 0.
+  // Int32Array default of 0 is already correct for the size arrays.
+  if (!hasQuotes) {
+    bestBids.fill(NaN);
+    bestAsks.fill(NaN);
+  }
 
   let pos = 0;
   let isHeader = true;
@@ -126,7 +178,7 @@ export function parseTickCsv(text: string): ParsedTicks {
       continue;
     }
 
-    // Five comma-separated fields. We locate each comma with `indexOf`.
+    // Locate the first 5 commas (shared by both v1 and v2).
     const c1 = text.indexOf(",", pos);
     if (c1 === -1 || c1 >= nl) { pos = nl + 1; continue; } // malformed → skip
     const c2 = text.indexOf(",", c1 + 1);
@@ -141,7 +193,24 @@ export function parseTickCsv(text: string): ParsedTicks {
     const timeStr = text.substring(c1 + 1, c2);
     const priceStr = text.substring(c2 + 1, c3);
     const sizeStr = text.substring(c3 + 1, c4);
-    const sideStr = text.substring(c4 + 1, nl);
+
+    // `side` ends at the next comma (v2) or the end of the line (v1).
+    let sideEnd: number;
+    let c5 = -1, c6 = -1, c7 = -1, c8 = -1;
+    if (hasQuotes) {
+      c5 = text.indexOf(",", c4 + 1);
+      if (c5 === -1 || c5 >= nl) { pos = nl + 1; continue; }
+      c6 = text.indexOf(",", c5 + 1);
+      if (c6 === -1 || c6 >= nl) { pos = nl + 1; continue; }
+      c7 = text.indexOf(",", c6 + 1);
+      if (c7 === -1 || c7 >= nl) { pos = nl + 1; continue; }
+      c8 = text.indexOf(",", c7 + 1);
+      if (c8 === -1 || c8 >= nl) { pos = nl + 1; continue; }
+      sideEnd = c5;
+    } else {
+      sideEnd = nl;
+    }
+    const sideStr = text.substring(c4 + 1, sideEnd);
 
     // Parse timestamp. Format from NT8: yyyy-MM-ddTHH:mm:ss.fff
     // We need ms epoch. `Date.parse` understands ISO; treat the string as
@@ -163,6 +232,21 @@ export function parseTickCsv(text: string): ParsedTicks {
     prices[written] = p;
     sizes[written] = sz | 0;
     sides[written] = encodeSide(sideStr);
+
+    if (hasQuotes) {
+      // Empty quote field means "no quote event observed yet on this day"
+      // (writer leaves them blank rather than emitting 0 or NaN). Map empty
+      // → NaN for prices, 0 for sizes.
+      const bbStr = text.substring(c5 + 1, c6);
+      const baStr = text.substring(c6 + 1, c7);
+      const bbszStr = text.substring(c7 + 1, c8);
+      const baszStr = text.substring(c8 + 1, nl);
+      bestBids[written]     = bbStr.length === 0 ? NaN : +bbStr;
+      bestAsks[written]     = baStr.length === 0 ? NaN : +baStr;
+      bestBidSizes[written] = bbszStr.length === 0 ? 0  : (+bbszStr) | 0;
+      bestAskSizes[written] = baszStr.length === 0 ? 0  : (+baszStr) | 0;
+    }
+
     written++;
     pos = nl + 1;
   }
@@ -170,7 +254,10 @@ export function parseTickCsv(text: string): ParsedTicks {
   // If we skipped any malformed rows, the typed arrays have unused tail
   // slots. Slice down to the actual count so callers see clean data.
   if (written === dataRowEstimate) {
-    return { count: written, times, prices, sizes, sides };
+    return {
+      count: written, times, prices, sizes, sides,
+      bestBids, bestAsks, bestBidSizes, bestAskSizes, hasQuotes,
+    };
   }
   return {
     count: written,
@@ -178,6 +265,11 @@ export function parseTickCsv(text: string): ParsedTicks {
     prices: prices.slice(0, written),
     sizes: sizes.slice(0, written),
     sides: sides.slice(0, written),
+    bestBids: bestBids.slice(0, written),
+    bestAsks: bestAsks.slice(0, written),
+    bestBidSizes: bestBidSizes.slice(0, written),
+    bestAskSizes: bestAskSizes.slice(0, written),
+    hasQuotes,
   };
 }
 

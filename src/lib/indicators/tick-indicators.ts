@@ -410,3 +410,178 @@ function tickWindowCount(
   }
   return out;
 }
+
+// ─── Top-of-book quote indicators ──────────────────────────────────────────
+//
+// These read from the optional `bestBids`/`bestAsks`/`bestBidSizes`/
+// `bestAskSizes` typed arrays added in the v2 tick CSV schema. They
+// degrade cleanly when those arrays are absent or sparse: the
+// `hasQuotes` flag short-circuits to all-NaN, and individual ticks
+// missing quote data are skipped from the per-window aggregate rather
+// than poisoning it with NaN.
+//
+// All five indicators share the same shape: per-bar window of ticks,
+// accumulate over ticks that have meaningful quote data (bid > 0 AND
+// ask > 0 — sizes are allowed to be 0 except where size weighting is
+// required), then divide.
+
+/** Mean bid-ask spread over the last N bars, computed per tick as
+ *  `best_ask − best_bid` and averaged across ticks in the window.
+ *  Returns NaN for bars whose window has no quote-bearing ticks, or
+ *  when the session predates the v2 quote columns. */
+export function meanSpreadSeries(
+  barCount: number,
+  ctx: TickContext,
+  windowBars: number,
+): number[] {
+  const out = new Array(barCount).fill(NaN);
+  if (!ctx.ticks.hasQuotes) return out;
+  const bb = ctx.ticks.bestBids;
+  const ba = ctx.ticks.bestAsks;
+  for (let i = windowBars - 1; i < barCount; i++) {
+    const range = windowTickRange(i, windowBars, ctx.barTickRanges);
+    if (!range) continue;
+    let sum = 0;
+    let n = 0;
+    for (let k = range.start; k < range.end; k++) {
+      const b = bb[k];
+      const a = ba[k];
+      if (b > 0 && a > 0) {
+        sum += a - b;
+        n++;
+      }
+    }
+    if (n > 0) out[i] = sum / n;
+  }
+  return out;
+}
+
+/** Mean best-bid size over the last N bars. Skips ticks that have no
+ *  observed bid quote. Useful to spot thinning vs. stacked bids. */
+export function bidSizeSeries(
+  barCount: number,
+  ctx: TickContext,
+  windowBars: number,
+): number[] {
+  const out = new Array(barCount).fill(NaN);
+  if (!ctx.ticks.hasQuotes) return out;
+  const sz = ctx.ticks.bestBidSizes;
+  for (let i = windowBars - 1; i < barCount; i++) {
+    const range = windowTickRange(i, windowBars, ctx.barTickRanges);
+    if (!range) continue;
+    let sum = 0;
+    let n = 0;
+    for (let k = range.start; k < range.end; k++) {
+      const s = sz[k];
+      if (s > 0) {
+        sum += s;
+        n++;
+      }
+    }
+    if (n > 0) out[i] = sum / n;
+  }
+  return out;
+}
+
+/** Mean best-ask size over the last N bars. */
+export function askSizeSeries(
+  barCount: number,
+  ctx: TickContext,
+  windowBars: number,
+): number[] {
+  const out = new Array(barCount).fill(NaN);
+  if (!ctx.ticks.hasQuotes) return out;
+  const sz = ctx.ticks.bestAskSizes;
+  for (let i = windowBars - 1; i < barCount; i++) {
+    const range = windowTickRange(i, windowBars, ctx.barTickRanges);
+    if (!range) continue;
+    let sum = 0;
+    let n = 0;
+    for (let k = range.start; k < range.end; k++) {
+      const s = sz[k];
+      if (s > 0) {
+        sum += s;
+        n++;
+      }
+    }
+    if (n > 0) out[i] = sum / n;
+  }
+  return out;
+}
+
+/** Resting-liquidity imbalance — `(ΣaskSize − ΣbidSize) / (ΣaskSize +
+ *  ΣbidSize)` over the last N bars. Range [−1, 1]. Mirrors
+ *  `tickImbalanceSeries` (which is about aggressor counts) but reflects
+ *  the side that's stacked at the inside quote:
+ *    positive → more offers resting (sellers willing to wait)
+ *    negative → more bids resting (buyers willing to wait)
+ *
+ *  We sum sizes before dividing (rather than averaging per-tick ratios)
+ *  so a few ticks with large size aren't underweighted by ticks with
+ *  small size. */
+export function quoteImbalanceSeries(
+  barCount: number,
+  ctx: TickContext,
+  windowBars: number,
+): number[] {
+  const out = new Array(barCount).fill(NaN);
+  if (!ctx.ticks.hasQuotes) return out;
+  const bs = ctx.ticks.bestBidSizes;
+  const as_ = ctx.ticks.bestAskSizes;
+  for (let i = windowBars - 1; i < barCount; i++) {
+    const range = windowTickRange(i, windowBars, ctx.barTickRanges);
+    if (!range) continue;
+    let bidSum = 0;
+    let askSum = 0;
+    for (let k = range.start; k < range.end; k++) {
+      bidSum += bs[k];
+      askSum += as_[k];
+    }
+    const total = bidSum + askSum;
+    if (total > 0) out[i] = (askSum - bidSum) / total;
+  }
+  return out;
+}
+
+/** Microprice — size-weighted mid quote, averaged over ticks in the
+ *  last N bars. Per-tick formula:
+ *    `(bid * askSize + ask * bidSize) / (bidSize + askSize)`
+ *  i.e. the price tilts toward the side with LESS resting size, since
+ *  that side will move next. A widely-used short-term fair-value proxy
+ *  that often beats the simple mid for prediction.
+ *
+ *  We average the per-tick microprice (rather than computing once on
+ *  summed sizes) because each tick's microprice is itself a valid
+ *  fair-value estimate at that instant; the simple mean weights each
+ *  observation equally. */
+export function micropriceSeries(
+  barCount: number,
+  ctx: TickContext,
+  windowBars: number,
+): number[] {
+  const out = new Array(barCount).fill(NaN);
+  if (!ctx.ticks.hasQuotes) return out;
+  const bb = ctx.ticks.bestBids;
+  const ba = ctx.ticks.bestAsks;
+  const bs = ctx.ticks.bestBidSizes;
+  const as_ = ctx.ticks.bestAskSizes;
+  for (let i = windowBars - 1; i < barCount; i++) {
+    const range = windowTickRange(i, windowBars, ctx.barTickRanges);
+    if (!range) continue;
+    let sum = 0;
+    let n = 0;
+    for (let k = range.start; k < range.end; k++) {
+      const b = bb[k];
+      const a = ba[k];
+      const bSz = bs[k];
+      const aSz = as_[k];
+      const total = bSz + aSz;
+      if (b > 0 && a > 0 && total > 0) {
+        sum += (b * aSz + a * bSz) / total;
+        n++;
+      }
+    }
+    if (n > 0) out[i] = sum / n;
+  }
+  return out;
+}

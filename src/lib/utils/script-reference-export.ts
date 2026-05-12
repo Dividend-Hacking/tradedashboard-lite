@@ -187,6 +187,7 @@ Symbol families and their data requirements:
 - **Order-flow bar fields** (\`bar_volume_bid\`, \`bar_volume_ask\`, \`buy_volume\`, \`sell_volume\`, \`delta\`, \`delta_ratio\`, \`buy_pressure\`) and **cumulative delta** (\`CVD()\`) — require \`ohlcv_bidask\` or \`tick_bidask\`. Return NaN on plain \`ohlcv\` / \`tick\`.
 - **Volume profile** (\`POC(N)\`, \`VAH(N)\`, \`VAL(N)\`, \`VA_width(N)\`, \`dist_to_POC(N)\`) — require \`tick\` or \`tick_bidask\` (the profile is built from raw trade prices). Computed over a rolling N-bar window. NaN otherwise.
 - **Tick microstructure** (\`trades_at_bid(N)\`, \`trades_at_ask(N)\`, \`tick_imbalance(N)\`, \`tick_count(N)\`, \`mean_trade_size(N)\`, \`large_trade_count(N, threshold)\`, \`vwap_tick(N)\`) — require \`tick\` or \`tick_bidask\`. The bid/ask-attribution variants need \`tick_bidask\` specifically; without side info, \`trades_at_bid\` / \`trades_at_ask\` / \`tick_imbalance\` return all-zero counts.
+- **Top-of-book quote** (\`spread(N)\`, \`bid_size(N)\`, \`ask_size(N)\`, \`quote_imbalance(N)\`, \`microprice(N)\`) — see RESTING liquidity at the inside bid/ask rather than executed flow. Require a v2 tick session (CSV header includes \`best_bid\` / \`best_ask\` columns); legacy 5-column tick blobs return NaN. Currently backtest-only — not supported by the NT8 transpiler.
 
 The dashboard exposes the active granularity in the session picker; assume the user's selected sessions support the indicators you reference unless they explicitly mention OHLCV-only data.
 
@@ -372,7 +373,7 @@ function buildExpressionSection(): string {
   renderTable(
     "Function calls",
     calls,
-    "Parametric forms. The bare-suffix shortcuts (EMA20, EMA50, EMA200, ATR14, ADX14) are equivalent to calling these with the corresponding period. Volume-profile and tick-microstructure calls (POC, VAH, VAL, VA_width, dist_to_POC, trades_at_bid/ask, tick_imbalance, tick_count, mean_trade_size, large_trade_count, vwap_tick) compute over a rolling N-bar window and REQUIRE a tick / tick_bidask session — they return NaN on plain OHLCV."
+    "Parametric forms. The bare-suffix shortcuts (EMA20, EMA50, EMA200, ATR14, ADX14) are equivalent to calling these with the corresponding period. Volume-profile and tick-microstructure calls (POC, VAH, VAL, VA_width, dist_to_POC, trades_at_bid/ask, tick_imbalance, tick_count, mean_trade_size, large_trade_count, vwap_tick) compute over a rolling N-bar window and REQUIRE a tick / tick_bidask session — they return NaN on plain OHLCV. Top-of-book quote calls (spread, bid_size, ask_size, quote_imbalance, microprice) additionally require a v2 tick session (one whose CSV includes best_bid/best_ask columns)."
   );
   renderTable(
     "Math passthroughs",

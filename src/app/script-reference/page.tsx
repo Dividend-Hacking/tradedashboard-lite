@@ -794,6 +794,30 @@ const INDICATOR_FAMILIES: IndicatorFamily[] = [
     ],
   },
 
+  // ─── Top-of-book quote (RESTING liquidity, v2 tick session) ─────────
+  {
+    group: G_TICK_MICRO,
+    headline: "Top-of-book quote (resting liquidity)",
+    forms: [
+      "spread(N)",
+      "bid_size(N)", "ask_size(N)",
+      "quote_imbalance(N)",
+      "microprice(N)",
+    ],
+    description:
+      "What the order book LOOKS LIKE at the inside quote, averaged over the last N bars — distinct from the aggressor family above which sees executed flow. `spread` widens when liquidity thins. `bid_size` / `ask_size` show resting size at the BBO — stacked offers vs thin bids etc. `quote_imbalance` is a −1 to +1 score: positive = sellers waiting, negative = buyers waiting. `microprice` is a size-weighted fair-value mid (tilts toward the side with LESS resting size, since that side moves next). REQUIRES a v2 tick session — one whose CSV includes best_bid/best_ask columns. Legacy 5-column tick blobs return NaN. Backtest-only — not yet supported by the NT8 transpiler.",
+    examples: [
+      {
+        snippet: "filter.if = breakout_up and ask_size(10) < 20",
+        scenario: "Only take breakouts when offers above are thin — less liquidity for sellers to fade into.",
+      },
+      {
+        snippet: "filter.if = spread(20) < 0.5",
+        scenario: "Avoid trading during fast / illiquid moments — only act when the book is tight.",
+      },
+    ],
+  },
+
   // ─── Kalman-filtered Ornstein-Uhlenbeck (strategy DSL only) ─────────
   // Member access (`kf.x_pred`, `kf.x`, `kf.sigma`, …) only works
   // inside a strategy script via a `let X = KALMAN_OU(...)` binding —

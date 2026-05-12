@@ -1115,6 +1115,18 @@ namespace NinjaTrader.NinjaScript.AddOns
             var bidRemain = new Dictionary<long, long>();
             var askRemain = new Dictionary<long, long>();
 
+            // Time-ordered bid/ask quote event timelines (also only populated
+            // when withBidAskSide=true). NT8 delivers BarsRequest results in
+            // chronological order, so these lists are naturally sorted by time
+            // — no explicit sort needed. We snapshot from them later to record
+            // the best_bid/best_ask that was current at each trade tick.
+            var bidEvtTimes  = new List<DateTime>();
+            var bidEvtPrices = new List<double>();
+            var bidEvtSizes  = new List<long>();
+            var askEvtTimes  = new List<DateTime>();
+            var askEvtPrices = new List<double>();
+            var askEvtSizes  = new List<long>();
+
             Action<string> setError = msg =>
             {
                 lock (errLock)
@@ -1224,14 +1236,27 @@ namespace NinjaTrader.NinjaScript.AddOns
                             {
                                 int n = req.Bars.Count;
                                 int kept = 0;
+                                // Pre-size the event timeline lists; one append per
+                                // sized event matches the dict's "kept" path 1:1.
+                                if (bidEvtTimes.Capacity < bidEvtTimes.Count + n) bidEvtTimes.Capacity = bidEvtTimes.Count + n;
+                                if (bidEvtPrices.Capacity < bidEvtPrices.Count + n) bidEvtPrices.Capacity = bidEvtPrices.Count + n;
+                                if (bidEvtSizes.Capacity < bidEvtSizes.Count + n) bidEvtSizes.Capacity = bidEvtSizes.Count + n;
                                 for (int i = 0; i < n; i++)
                                 {
                                     long sz = req.Bars.GetVolume(i);
                                     if (sz <= 0) continue;
-                                    long key = packKey(req.Bars.GetTime(i), req.Bars.GetClose(i));
+                                    DateTime et = req.Bars.GetTime(i);
+                                    double ep = req.Bars.GetClose(i);
+                                    // Side-attribution dict (unchanged behavior).
+                                    long key = packKey(et, ep);
                                     long cur;
                                     bidRemain.TryGetValue(key, out cur);
                                     bidRemain[key] = cur + sz;
+                                    // Time-ordered event timeline — used later to
+                                    // snapshot the best bid current at each trade.
+                                    bidEvtTimes.Add(et);
+                                    bidEvtPrices.Add(ep);
+                                    bidEvtSizes.Add(sz);
                                     kept++;
                                 }
                                 Log(string.Format("DataExporter[batch]: Bid → {0} sized events", kept));
@@ -1240,14 +1265,22 @@ namespace NinjaTrader.NinjaScript.AddOns
                             {
                                 int n = req.Bars.Count;
                                 int kept = 0;
+                                if (askEvtTimes.Capacity < askEvtTimes.Count + n) askEvtTimes.Capacity = askEvtTimes.Count + n;
+                                if (askEvtPrices.Capacity < askEvtPrices.Count + n) askEvtPrices.Capacity = askEvtPrices.Count + n;
+                                if (askEvtSizes.Capacity < askEvtSizes.Count + n) askEvtSizes.Capacity = askEvtSizes.Count + n;
                                 for (int i = 0; i < n; i++)
                                 {
                                     long sz = req.Bars.GetVolume(i);
                                     if (sz <= 0) continue;
-                                    long key = packKey(req.Bars.GetTime(i), req.Bars.GetClose(i));
+                                    DateTime et = req.Bars.GetTime(i);
+                                    double ep = req.Bars.GetClose(i);
+                                    long key = packKey(et, ep);
                                     long cur;
                                     askRemain.TryGetValue(key, out cur);
                                     askRemain[key] = cur + sz;
+                                    askEvtTimes.Add(et);
+                                    askEvtPrices.Add(ep);
+                                    askEvtSizes.Add(sz);
                                     kept++;
                                 }
                                 Log(string.Format("DataExporter[batch]: Ask → {0} sized events", kept));
@@ -1314,6 +1347,15 @@ namespace NinjaTrader.NinjaScript.AddOns
             // monotonically (less random access overhead).
             int completedCount = 0;
             int totalUploadedTicks = 0;
+
+            // Quote-snapshot cursors. Days are processed chronologically and
+            // trades within a day are also chronological, so a single pair of
+            // cursors advances monotonically across the entire batch. Reset
+            // would only be needed if we processed days out of order.
+            int biCur = 0, aiCur = 0;
+            double curBid = double.NaN, curAsk = double.NaN;
+            long   curBidSz = 0,        curAskSz = 0;
+
             foreach (var r in rows)
             {
                 DateTime targetDate = DateTime.ParseExact(r.SessionDate, "yyyy-MM-dd",
@@ -1343,7 +1385,7 @@ namespace NinjaTrader.NinjaScript.AddOns
                     using (var gz = new GZipStream(msOut, CompressionLevel.Optimal, leaveOpen: true))
                     using (var sw = new StreamWriter(gz, new UTF8Encoding(false)))
                     {
-                        sw.Write("tick_index,tick_time,price,size,side\n");
+                        sw.Write("tick_index,tick_time,price,size,side,best_bid,best_ask,best_bid_size,best_ask_size\n");
                         for (int j = 0; j < finalCount; j++)
                         {
                             int i = keepIdx[j];
@@ -1374,6 +1416,26 @@ namespace NinjaTrader.NinjaScript.AddOns
                                     unattributed++;
                                 }
                             }
+                            // Advance the quote cursors up to this trade time so
+                            // curBid/curAsk reflect the most recent bid/ask quote
+                            // event at or before t. Strictly <= so a bid event with
+                            // an identical timestamp to the trade is "already in
+                            // effect" by the moment that trade printed.
+                            if (withBidAskSide)
+                            {
+                                while (biCur < bidEvtTimes.Count && bidEvtTimes[biCur] <= t)
+                                {
+                                    curBid   = bidEvtPrices[biCur];
+                                    curBidSz = bidEvtSizes[biCur];
+                                    biCur++;
+                                }
+                                while (aiCur < askEvtTimes.Count && askEvtTimes[aiCur] <= t)
+                                {
+                                    curAsk   = askEvtPrices[aiCur];
+                                    curAskSz = askEvtSizes[aiCur];
+                                    aiCur++;
+                                }
+                            }
                             sw.Write(j);
                             sw.Write(',');
                             sw.Write(t.ToString("yyyy-MM-ddTHH:mm:ss.fff", CultureInfo.InvariantCulture));
@@ -1383,6 +1445,19 @@ namespace NinjaTrader.NinjaScript.AddOns
                             sw.Write(size);
                             sw.Write(',');
                             sw.Write(side);
+                            sw.Write(',');
+                            // Quote snapshot — empty (not zero/NaN) for early
+                            // trades that arrive before any quote event. Empty
+                            // strings parse to NaN/0 on the frontend.
+                            if (!double.IsNaN(curBid))
+                                sw.Write(curBid.ToString("F4", CultureInfo.InvariantCulture));
+                            sw.Write(',');
+                            if (!double.IsNaN(curAsk))
+                                sw.Write(curAsk.ToString("F4", CultureInfo.InvariantCulture));
+                            sw.Write(',');
+                            if (curBidSz > 0) sw.Write(curBidSz);
+                            sw.Write(',');
+                            if (curAskSz > 0) sw.Write(curAskSz);
                             sw.Write('\n');
                         }
                     }

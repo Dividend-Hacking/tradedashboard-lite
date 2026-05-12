@@ -137,6 +137,11 @@ import {
   meanTradeSizeSeries,
   largeTradeCountSeries,
   vwapTickSeries,
+  meanSpreadSeries,
+  bidSizeSeries,
+  askSizeSeries,
+  quoteImbalanceSeries,
+  micropriceSeries,
   type TickContext,
 } from "@/lib/indicators/tick-indicators";
 import {
@@ -1114,6 +1119,10 @@ export const TICK_REQUIRED_INDICATORS = new Set<string>([
   "POC", "VAH", "VAL", "VA_width", "dist_to_POC",
   "trades_at_bid", "trades_at_ask", "tick_imbalance",
   "tick_count", "mean_trade_size", "large_trade_count", "vwap_tick",
+  // Top-of-book quote indicators (v2 tick CSV only — legacy 5-col
+  // sessions return all-NaN via the `hasQuotes` short-circuit inside
+  // each series helper).
+  "spread", "bid_size", "ask_size", "quote_imbalance", "microprice",
 ]);
 
 /** Apply standard defaults for indicators where the user may omit
@@ -1217,6 +1226,11 @@ export function applyArgDefaults(name: string, args: number[]): number[] {
     case "tick_count":
     case "mean_trade_size":
     case "vwap_tick":
+    case "spread":
+    case "bid_size":
+    case "ask_size":
+    case "quote_imbalance":
+    case "microprice":
       return args;
     case "large_trade_count":
       return args;
@@ -1520,6 +1534,17 @@ export function indicatorKeyForCall(name: string, args: number[]): string | null
       return `LARGECNT:${args[0]}:${args[1]}`;
     case "vwap_tick":
       return `VWAPTICK:${p}`;
+    // Top-of-book quote indicators (v2 tick CSV).
+    case "spread":
+      return `SPREAD:${p}`;
+    case "bid_size":
+      return `BIDSZ:${p}`;
+    case "ask_size":
+      return `ASKSZ:${p}`;
+    case "quote_imbalance":
+      return `QIMB:${p}`;
+    case "microprice":
+      return `MICRO:${p}`;
     // Kalman-OU sub-indicators — keyed by (field, source, calib, trust)
     // so all five fields against the same parameter tuple stay distinct
     // in the per-zone series cache, while sharing the underlying bundle
@@ -1573,6 +1598,8 @@ const KNOWN_INDICATOR_NAMES = new Set<string>([
   // Tick microstructure.
   "trades_at_bid", "trades_at_ask", "tick_imbalance", "tick_count",
   "mean_trade_size", "large_trade_count", "vwap_tick",
+  // Top-of-book quote indicators (v2 tick CSV).
+  "spread", "bid_size", "ask_size", "quote_imbalance", "microprice",
   // Kalman-filtered Ornstein-Uhlenbeck — exposed as six sibling names,
   // one per output field. The strategy parser rewrites `let kf =
   // KALMAN_OU(close, calib, trust)` + `kf.<field>` references into
@@ -2990,6 +3017,57 @@ export const EXPR_SYMBOLS: ExprSymbol[] = [
     context: "entry",
   },
 
+  // ─── Top-of-book quote (RESTING liquidity, v2 tick CSV only) ────────
+  // These see the order book's INSIDE quote (best bid, best ask) at the
+  // moment of each trade — distinct from the aggressor-side family above
+  // which sees executed flow. Requires a session exported with the v2
+  // tick CSV (header includes best_bid/best_ask columns). On legacy
+  // sessions these return NaN, so guarded strategies degrade cleanly.
+  {
+    name: "spread",
+    kind: "call",
+    signature: "spread(N)",
+    description: "Average bid-ask spread (best_ask − best_bid) at the moment of each trade, over the last N bars. Widening spread = thinning liquidity, often before fast moves. Needs ticks (v2).",
+    context: "entry",
+    examples: [
+      { snippet: "filter.if = spread(20) < 0.5", scenario: "Only enter when liquidity is tight — avoid trading during fast/illiquid moments." },
+    ],
+  },
+  {
+    name: "bid_size",
+    kind: "call",
+    signature: "bid_size(N)",
+    description: "Average resting size at the best bid over the last N bars. Stacked bids → strong buy-side interest. Needs ticks (v2).",
+    context: "entry",
+  },
+  {
+    name: "ask_size",
+    kind: "call",
+    signature: "ask_size(N)",
+    description: "Average resting size at the best ask over the last N bars. Thin offer → little overhead supply → breakouts have less to chew through. Needs ticks (v2).",
+    context: "entry",
+    examples: [
+      { snippet: "signal.long.if = breakout_up and ask_size(10) < 20", scenario: "Only fade-resistant breakouts — thin offers above mean less liquidity to absorb buyers." },
+    ],
+  },
+  {
+    name: "quote_imbalance",
+    kind: "call",
+    signature: "quote_imbalance(N)",
+    description: "Resting-liquidity imbalance (ask_size − bid_size) / (ask_size + bid_size) over the last N bars. Range [−1, +1]. Negative = stacked bids (buyers waiting), positive = stacked offers (sellers waiting). Inverse of `tick_imbalance` which measures aggressors. Needs ticks (v2).",
+    context: "entry",
+  },
+  {
+    name: "microprice",
+    kind: "call",
+    signature: "microprice(N)",
+    description: "Size-weighted mid quote averaged over the last N bars: (bid*ask_size + ask*bid_size) / (bid_size+ask_size). Tilts toward the side with LESS resting size — that side moves next. Often a better short-term fair-value proxy than the simple mid. Needs ticks (v2).",
+    context: "entry",
+    examples: [
+      { snippet: "filter.if = close < microprice(5)", scenario: "Only enter longs when last trade is below the size-weighted fair value — a mild mean-reversion lean." },
+    ],
+  },
+
   // ─── Kalman-filtered Ornstein-Uhlenbeck (strategy-DSL only) ─────────
   // Member access (`kf.x`, `kf.sigma`, …) is implemented by a parse-time
   // rewrite in parseStrategyScript — it only fires for `let X = KALMAN_OU(...)`
@@ -4297,6 +4375,31 @@ export function computeIndicatorSeries(
         ? vwapTickSeries(bars.length, tickCtx, args[0])
         : new Array(bars.length).fill(NaN);
 
+    // Top-of-book quote indicators. Each helper guards internally on
+    // `tickCtx.ticks.hasQuotes` and returns all-NaN for v1 sessions —
+    // we still need the outer `tickCtx` guard for ohlcv/ohlcv_bidask
+    // sessions that have no tick context at all.
+    case "spread":
+      return tickCtx
+        ? meanSpreadSeries(bars.length, tickCtx, args[0])
+        : new Array(bars.length).fill(NaN);
+    case "bid_size":
+      return tickCtx
+        ? bidSizeSeries(bars.length, tickCtx, args[0])
+        : new Array(bars.length).fill(NaN);
+    case "ask_size":
+      return tickCtx
+        ? askSizeSeries(bars.length, tickCtx, args[0])
+        : new Array(bars.length).fill(NaN);
+    case "quote_imbalance":
+      return tickCtx
+        ? quoteImbalanceSeries(bars.length, tickCtx, args[0])
+        : new Array(bars.length).fill(NaN);
+    case "microprice":
+      return tickCtx
+        ? micropriceSeries(bars.length, tickCtx, args[0])
+        : new Array(bars.length).fill(NaN);
+
     // ─── Kalman-filtered Ornstein-Uhlenbeck (5 sibling fields) ──────
     // The cache is shared per-zone so all 5 field accesses on the same
     // (source, calib, trust) tuple run the filter exactly once. Falls
@@ -4534,6 +4637,8 @@ const INDICATOR_CALL_NAMES = new Set<string>([
   "POC", "VAH", "VAL", "VA_width", "dist_to_POC",
   "trades_at_bid", "trades_at_ask", "tick_imbalance",
   "tick_count", "mean_trade_size", "large_trade_count", "vwap_tick",
+  // Top-of-book quote (v2 tick CSV).
+  "spread", "bid_size", "ask_size", "quote_imbalance", "microprice",
 ]);
 
 /** True when the expression references any symbol that only resolves in
