@@ -2832,3 +2832,149 @@ export function pviSeries(bars: IndicatorBar[]): number[] {
   }
   return out;
 }
+
+// ─── Heiken Ashi ───────────────────────────────────────────────────────────
+//
+// Smoothed candle representation that filters minor noise by referencing
+// the *previous Heiken Ashi candle* rather than the previous raw bar. The
+// classic recursion:
+//
+//   ha_close[i] = (open[i] + high[i] + low[i] + close[i]) / 4
+//   ha_open[i]  = (ha_open[i-1] + ha_close[i-1]) / 2
+//   ha_high[i]  = max(high[i], ha_open[i], ha_close[i])
+//   ha_low[i]   = min(low[i],  ha_open[i], ha_close[i])
+//
+// Seed: ha_open[0] = (open[0] + close[0]) / 2 (Chande's standard seed).
+// All four series are produced in lockstep — one pass — and exposed as
+// four sibling DSL calls that share a HeikenAshiCache so a strategy that
+// references all four pays for the recursion exactly once.
+
+/** Bundled HA outputs. Indices align 1-to-1 with `bars`. */
+export interface HeikenAshiBundle {
+  haOpen: number[];
+  haHigh: number[];
+  haLow: number[];
+  haClose: number[];
+}
+
+/** Compute the four Heiken Ashi series in a single recursive pass. The
+ *  recursion is bar-to-bar (ha_open depends on the PRIOR ha_open and
+ *  ha_close), which is why this is a bundle rather than four separate
+ *  loops. */
+export function heikenAshiBundle(bars: IndicatorBar[]): HeikenAshiBundle {
+  const n = bars.length;
+  const haOpen = new Array<number>(n).fill(NaN);
+  const haHigh = new Array<number>(n).fill(NaN);
+  const haLow = new Array<number>(n).fill(NaN);
+  const haClose = new Array<number>(n).fill(NaN);
+  if (n === 0) return { haOpen, haHigh, haLow, haClose };
+
+  // Standard seed: prior HA values don't exist for bar 0, so set
+  // ha_open[0] to the average of raw open and raw close. This is the
+  // convention used by NinjaTrader / TradingView and avoids the
+  // first-bar NaN propagating forward through the recursion.
+  const b0 = bars[0];
+  haOpen[0] = (b0.bar_open + b0.bar_close) / 2;
+  haClose[0] = (b0.bar_open + b0.bar_high + b0.bar_low + b0.bar_close) / 4;
+  haHigh[0] = Math.max(b0.bar_high, haOpen[0], haClose[0]);
+  haLow[0] = Math.min(b0.bar_low, haOpen[0], haClose[0]);
+
+  for (let i = 1; i < n; i++) {
+    const b = bars[i];
+    const hc = (b.bar_open + b.bar_high + b.bar_low + b.bar_close) / 4;
+    const ho = (haOpen[i - 1] + haClose[i - 1]) / 2;
+    haOpen[i] = ho;
+    haClose[i] = hc;
+    haHigh[i] = Math.max(b.bar_high, ho, hc);
+    haLow[i] = Math.min(b.bar_low, ho, hc);
+  }
+  return { haOpen, haHigh, haLow, haClose };
+}
+
+/** Per-zone bundle cache so the four sibling Heiken-Ashi DSL calls share
+ *  one recursive pass. Mirrors `KalmanOuCache` (kalman-ou.ts:363). The
+ *  bundle takes no parameters, so the cache is effectively a single
+ *  lazy slot — but keeping the same shape as the other caches lets the
+ *  precompute pipeline thread it uniformly. */
+export class HeikenAshiCache {
+  private bundle: HeikenAshiBundle | null = null;
+
+  constructor(private readonly bars: IndicatorBar[]) {}
+
+  get(): HeikenAshiBundle {
+    if (this.bundle === null) {
+      this.bundle = heikenAshiBundle(this.bars);
+    }
+    return this.bundle;
+  }
+}
+
+// ─── Squeeze (BB inside Keltner) ───────────────────────────────────────────
+//
+// Classic Carter / TTM-style volatility-compression detector. The
+// Bollinger bands (built from price std-dev) sit INSIDE the Keltner
+// channel (built from ATR) when volatility is compressed — the market
+// has stopped expanding and is coiling. When BB pops back outside KC,
+// the squeeze "fires" and price typically expands sharply in the
+// direction of accumulated pressure.
+//
+// `squeeze_on(N, multBB=2, multKC=1.5)`  → 1 when in compression, else 0
+// `squeeze_fire(N, multBB, multKC)`      → 1 only on the bar where the
+//                                           state transitions 1 → 0
+
+/** 1 when both Bollinger bands sit inside the Keltner channel for the
+ *  given period; 0 when at least one BB band is outside. NaN until both
+ *  band sets have warmed up.
+ *
+ *  Default convention: `multBB=2` (standard 2σ Bollinger) and
+ *  `multKC=1.5` (Carter's "low-compression" Keltner setting). Tighter
+ *  thresholds (e.g. multKC=1.0) detect harder squeezes; looser ones
+ *  catch milder consolidations. */
+export function squeezeOnSeries(
+  bars: IndicatorBar[],
+  period: number,
+  multBB: number,
+  multKC: number,
+): number[] {
+  const out = new Array(bars.length).fill(NaN);
+  if (period <= 0 || bars.length < period) return out;
+  const bbU = bbUpperSeries(bars, period, multBB);
+  const bbL = bbLowerSeries(bars, period, multBB);
+  const kcU = keltnerUpperSeries(bars, period, multKC);
+  const kcL = keltnerLowerSeries(bars, period, multKC);
+  for (let i = 0; i < bars.length; i++) {
+    const u1 = bbU[i], l1 = bbL[i], u2 = kcU[i], l2 = kcL[i];
+    if (
+      !Number.isFinite(u1) || !Number.isFinite(l1) ||
+      !Number.isFinite(u2) || !Number.isFinite(l2)
+    ) {
+      continue;
+    }
+    // BB inside KC = upper-BB below upper-KC AND lower-BB above lower-KC.
+    out[i] = u1 < u2 && l1 > l2 ? 1 : 0;
+  }
+  return out;
+}
+
+/** 1 on the bar where `squeeze_on` transitions 1 → 0 — the "fire" bar
+ *  where compressed volatility releases. 0 otherwise (and on the first
+ *  bar, which has no prior state). Useful as a one-shot entry trigger:
+ *  `signal.long.if = squeeze_fire(20) == 1 and close > EMA20`. */
+export function squeezeFireSeries(
+  bars: IndicatorBar[],
+  period: number,
+  multBB: number,
+  multKC: number,
+): number[] {
+  const on = squeezeOnSeries(bars, period, multBB, multKC);
+  const out = new Array(bars.length).fill(NaN);
+  for (let i = 1; i < bars.length; i++) {
+    const prev = on[i - 1];
+    const cur = on[i];
+    if (!Number.isFinite(prev) || !Number.isFinite(cur)) continue;
+    out[i] = prev === 1 && cur === 0 ? 1 : 0;
+  }
+  // Bar 0 has no prior state — leave as NaN so downstream filters can
+  // distinguish "no signal" from a fresh warmup bar.
+  return out;
+}

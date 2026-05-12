@@ -121,6 +121,9 @@ import {
   emvSeries,
   nviSeries,
   pviSeries,
+  HeikenAshiCache,
+  squeezeOnSeries,
+  squeezeFireSeries,
   type IndicatorBar,
 } from "@/lib/indicators/calculations";
 import {
@@ -142,6 +145,15 @@ import {
   askSizeSeries,
   quoteImbalanceSeries,
   micropriceSeries,
+  nearestHvnSeries,
+  nearestLvnSeries,
+  FootprintCache,
+  stackedImbalanceUpSeries,
+  stackedImbalanceDownSeries,
+  sweepUpSeries,
+  sweepDownSeries,
+  icebergAtAskSeries,
+  icebergAtBidSeries,
   type TickContext,
 } from "@/lib/indicators/tick-indicators";
 import {
@@ -1123,6 +1135,14 @@ export const TICK_REQUIRED_INDICATORS = new Set<string>([
   // sessions return all-NaN via the `hasQuotes` short-circuit inside
   // each series helper).
   "spread", "bid_size", "ask_size", "quote_imbalance", "microprice",
+  // Volume-profile node distances — reuse the same ProfileCache as
+  // POC/VAH/VAL.
+  "dist_to_hvn", "dist_to_lvn",
+  // Footprint imbalance (per-bar per-price bid/ask binning).
+  "stacked_imbalance_up", "stacked_imbalance_down",
+  // Sweep + iceberg composites — require v2 quote data (short-circuit
+  // to NaN on legacy sessions).
+  "sweep_up", "sweep_down", "iceberg_at_ask", "iceberg_at_bid",
 ]);
 
 /** Apply standard defaults for indicators where the user may omit
@@ -1234,6 +1254,37 @@ export function applyArgDefaults(name: string, args: number[]): number[] {
       return args;
     case "large_trade_count":
       return args;
+    // HVN / LVN — mirror POC/VAH/VAL family: (N, area=0.7).
+    case "dist_to_hvn":
+    case "dist_to_lvn":
+      return args.length >= 2 ? args : [args[0], 0.7];
+    // Footprint imbalance — single optional `ratio` arg, default 3.
+    case "stacked_imbalance_up":
+    case "stacked_imbalance_down":
+      return args.length >= 1 ? args : [3];
+    // Sweep — (N, sizeMin=0). sizeMin=0 disables the size floor.
+    case "sweep_up":
+    case "sweep_down":
+      return args.length >= 2 ? args : [args[0], 0];
+    // Iceberg — (N, minRefills=3).
+    case "iceberg_at_ask":
+    case "iceberg_at_bid":
+      return args.length >= 2 ? args : [args[0], 3];
+    // Heiken Ashi — zero-arg calls; nothing to default.
+    case "ha_open":
+    case "ha_high":
+    case "ha_low":
+    case "ha_close":
+      return args;
+    // Squeeze — (N=20, multBB=2, multKC=1.5). Carter's standard
+    // compression thresholds; tighter multKC catches harder squeezes.
+    case "squeeze_on":
+    case "squeeze_fire": {
+      const n = args.length >= 1 ? args[0] : 20;
+      const mBB = args.length >= 2 ? args[1] : 2;
+      const mKC = args.length >= 3 ? args[2] : 1.5;
+      return [n, mBB, mKC];
+    }
     // KALMAN_OU sub-indicators — args are [source, calib, trust] with
     // sensible defaults. `source` defaults to 1 (close); `calib` defaults
     // to 60 bars; `trust` defaults to 0.5. The strategy parser usually
@@ -1545,6 +1596,39 @@ export function indicatorKeyForCall(name: string, args: number[]): string | null
       return `QIMB:${p}`;
     case "microprice":
       return `MICRO:${p}`;
+    // Volume-profile node distances.
+    case "dist_to_hvn":
+      return `DISTHVN:${args[0]}:${args[1]}`;
+    case "dist_to_lvn":
+      return `DISTLVN:${args[0]}:${args[1]}`;
+    // Footprint imbalance — keyed by ratio only (no window arg).
+    case "stacked_imbalance_up":
+      return `STACKUP:${args[0]}`;
+    case "stacked_imbalance_down":
+      return `STACKDN:${args[0]}`;
+    // Sweep + iceberg (v2 quote data).
+    case "sweep_up":
+      return `SWEEPUP:${args[0]}:${args[1]}`;
+    case "sweep_down":
+      return `SWEEPDN:${args[0]}:${args[1]}`;
+    case "iceberg_at_ask":
+      return `ICEASK:${args[0]}:${args[1]}`;
+    case "iceberg_at_bid":
+      return `ICEBID:${args[0]}:${args[1]}`;
+    // Heiken Ashi — zero-arg, one cache key per sibling.
+    case "ha_open":
+      return `HA_O`;
+    case "ha_high":
+      return `HA_H`;
+    case "ha_low":
+      return `HA_L`;
+    case "ha_close":
+      return `HA_C`;
+    // Squeeze — keyed by (period, multBB, multKC).
+    case "squeeze_on":
+      return `SQZON:${args[0]}:${args[1]}:${args[2]}`;
+    case "squeeze_fire":
+      return `SQZFIRE:${args[0]}:${args[1]}:${args[2]}`;
     // Kalman-OU sub-indicators — keyed by (field, source, calib, trust)
     // so all five fields against the same parameter tuple stay distinct
     // in the per-zone series cache, while sharing the underlying bundle
@@ -1600,6 +1684,16 @@ const KNOWN_INDICATOR_NAMES = new Set<string>([
   "mean_trade_size", "large_trade_count", "vwap_tick",
   // Top-of-book quote indicators (v2 tick CSV).
   "spread", "bid_size", "ask_size", "quote_imbalance", "microprice",
+  // Volume-profile node distances.
+  "dist_to_hvn", "dist_to_lvn",
+  // Footprint imbalance.
+  "stacked_imbalance_up", "stacked_imbalance_down",
+  // Sweep + iceberg (v2 quote data).
+  "sweep_up", "sweep_down", "iceberg_at_ask", "iceberg_at_bid",
+  // Heiken Ashi (zero-arg sibling family).
+  "ha_open", "ha_high", "ha_low", "ha_close",
+  // Squeeze (BB inside Keltner).
+  "squeeze_on", "squeeze_fire",
   // Kalman-filtered Ornstein-Uhlenbeck — exposed as six sibling names,
   // one per output field. The strategy parser rewrites `let kf =
   // KALMAN_OU(close, calib, trust)` + `kf.<field>` references into
@@ -3068,6 +3162,134 @@ export const EXPR_SYMBOLS: ExprSymbol[] = [
     ],
   },
 
+  // ─── Volume-profile node distances ──────────────────────────────────
+  {
+    name: "dist_to_hvn",
+    kind: "call",
+    signature: "dist_to_hvn(N, area=0.7)",
+    description: "Signed normalized distance from current close to the nearest high-volume node (local peak in the rolling N-bar volume profile). Positive = node is above price, negative = below. Magnitude is `(nodePrice − close) / close`. HVNs act as magnets and resistance; mean-reversion strategies often fade approaches to one. Needs ticks.",
+    context: "entry",
+    examples: [
+      { snippet: "filter.if = abs(dist_to_hvn(100, 0.7)) < 0.001", scenario: "Only enter when price is within 0.1% of a major high-volume node — likely reaction zone." },
+    ],
+  },
+  {
+    name: "dist_to_lvn",
+    kind: "call",
+    signature: "dist_to_lvn(N, area=0.7)",
+    description: "Signed normalized distance from current close to the nearest low-volume node (liquidity gap / local valley in the volume profile). LVNs are thin areas price tends to traverse quickly. Approaches from outside often break through. Needs ticks.",
+    context: "entry",
+  },
+
+  // ─── Footprint imbalance ────────────────────────────────────────────
+  {
+    name: "stacked_imbalance_up",
+    kind: "call",
+    signature: "stacked_imbalance_up(ratio=3)",
+    description: "Max-consecutive-run-length of CURRENT bar's footprint where ascending price buckets show ask volume ≥ ratio × bid volume. Returns 0 when no stack qualifies. Classic ★★★ footprint signal — sellers being lifted faster than buyers being hit at multiple stacked price levels. Filter with `>= 3` for the standard 3-stacked-imbalance trigger. Needs `tick_bidask`.",
+    context: "entry",
+    examples: [
+      { snippet: "signal.long.if = stacked_imbalance_up(3) >= 3", scenario: "Take longs only when at least 3 consecutive ascending price levels in the current bar show 3× ask-over-bid volume — strong absorption signature." },
+    ],
+  },
+  {
+    name: "stacked_imbalance_down",
+    kind: "call",
+    signature: "stacked_imbalance_down(ratio=3)",
+    description: "Mirror of `stacked_imbalance_up` — max run length of consecutive price buckets in the current bar's footprint where bid volume ≥ ratio × ask volume. Strong selling signature. Needs `tick_bidask`.",
+    context: "entry",
+  },
+
+  // ─── Sweep + Iceberg (v2 quote data) ────────────────────────────────
+  {
+    name: "sweep_up",
+    kind: "call",
+    signature: "sweep_up(N, sizeMin=0)",
+    description: "Count of buy-aggressor ticks in the last N bars whose trade size ate the ENTIRE visible best-ask size at that moment (size ≥ best_ask_size). Optional `sizeMin` filters out small sweeps. Detects level-eating aggression — a single trade lifting the whole offer. Needs ticks (v2).",
+    context: "entry",
+    examples: [
+      { snippet: "signal.long.if = sweep_up(5, 50) >= 2", scenario: "Take longs when at least 2 large (50+ contract) buy sweeps cleaned out the offer in the last 5 bars — momentum continuation setup." },
+    ],
+  },
+  {
+    name: "sweep_down",
+    kind: "call",
+    signature: "sweep_down(N, sizeMin=0)",
+    description: "Sell-aggressor analog of `sweep_up` — count of trades that ate the entire visible best-bid size. Needs ticks (v2).",
+    context: "entry",
+  },
+  {
+    name: "iceberg_at_ask",
+    kind: "call",
+    signature: "iceberg_at_ask(N, minRefills=3)",
+    description: "Count of bars in the last N whose footprint showed an ask-side refill streak ≥ `minRefills`. An iceberg = repeated buy-aggressor prints at the same best-ask price where post-trade size returns to ≥70% of pre-trade size, suggesting hidden depth behind the displayed quote. Counter-trend signal — heavy iceberg defense often caps rallies. Needs ticks (v2).",
+    context: "entry",
+  },
+  {
+    name: "iceberg_at_bid",
+    kind: "call",
+    signature: "iceberg_at_bid(N, minRefills=3)",
+    description: "Bid-side iceberg detector — hidden refills behind the best bid, suggesting absorption of selling pressure. Often a bottom signal in down-moves. Needs ticks (v2).",
+    context: "entry",
+  },
+
+  // ─── Heiken Ashi (bar-level smoothed candles) ───────────────────────
+  // Recursive: ha_open depends on the PRIOR HA bar, not the prior raw
+  // bar. All four siblings share one pass via HeikenAshiCache.
+  {
+    name: "ha_open",
+    kind: "call",
+    signature: "ha_open()",
+    description: "Heiken Ashi open = (prior HA open + prior HA close) / 2. Seeded at bar 0 from raw (open+close)/2. HA candles smooth raw OHLC noise by referencing the previous HA bar rather than the previous raw bar — long unbroken HA color runs signal sustained trend.",
+    context: "entry",
+  },
+  {
+    name: "ha_high",
+    kind: "call",
+    signature: "ha_high()",
+    description: "Heiken Ashi high = max(raw high, ha_open, ha_close).",
+    context: "entry",
+  },
+  {
+    name: "ha_low",
+    kind: "call",
+    signature: "ha_low()",
+    description: "Heiken Ashi low = min(raw low, ha_open, ha_close).",
+    context: "entry",
+  },
+  {
+    name: "ha_close",
+    kind: "call",
+    signature: "ha_close()",
+    description: "Heiken Ashi close = (open + high + low + close) / 4 of the raw bar. `ha_close > ha_open` marks a green HA candle (uptrend); inverse for red. Used as a smoothed trend filter.",
+    context: "entry",
+    examples: [
+      { snippet: "filter.if = ha_close() > ha_open()", scenario: "Only take longs when the current Heiken Ashi candle is green — sustained-trend gate that filters out noise candles." },
+    ],
+  },
+
+  // ─── Squeeze (Bollinger inside Keltner) ─────────────────────────────
+  {
+    name: "squeeze_on",
+    kind: "call",
+    signature: "squeeze_on(N=20, multBB=2, multKC=1.5)",
+    description: "1 when the Bollinger Bands sit INSIDE the Keltner channel for the given period (volatility compression / coiling); 0 when at least one BB band is outside KC. Carter's classic compression detector. Default `multKC=1.5`; tighten to 1.0 for stricter squeezes.",
+    context: "entry",
+    examples: [
+      { snippet: "filter.if = squeeze_on(20) == 1", scenario: "Only consider entries during the compression phase — wait for the squeeze to fire to act." },
+    ],
+  },
+  {
+    name: "squeeze_fire",
+    kind: "call",
+    signature: "squeeze_fire(N=20, multBB=2, multKC=1.5)",
+    description: "1 on the EXACT bar where squeeze_on transitions from 1 to 0 — the release moment. 0 otherwise. Pairs with a directional trigger (close above EMA20, delta positive, etc.) to bias the post-squeeze expansion.",
+    context: "entry",
+    examples: [
+      { snippet: "signal.long.if = squeeze_fire(20) == 1 and close > EMA20", scenario: "Take longs only on the squeeze-release bar when price is also above the trend EMA — directional bias for the compression release." },
+    ],
+  },
+
   // ─── Kalman-filtered Ornstein-Uhlenbeck (strategy-DSL only) ─────────
   // Member access (`kf.x`, `kf.sigma`, …) is implemented by a parse-time
   // rewrite in parseStrategyScript — it only fires for `let X = KALMAN_OU(...)`
@@ -4127,6 +4349,8 @@ export function computeIndicatorSeries(
   tickCtx?: TickContext,
   profileCache?: ProfileCache | null,
   kalmanCache?: KalmanOuCache | null,
+  haCache?: HeikenAshiCache | null,
+  footprintCache?: FootprintCache | null,
 ): number[] | null {
   switch (name) {
     // Existing (single-period).
@@ -4400,6 +4624,77 @@ export function computeIndicatorSeries(
         ? micropriceSeries(bars.length, tickCtx, args[0])
         : new Array(bars.length).fill(NaN);
 
+    // ─── Volume-profile node distances ──────────────────────────────
+    // Share the same ProfileCache as POC/VAH/VAL, so a strategy that
+    // references POC(20) and dist_to_hvn(20) pays for one profile build.
+    case "dist_to_hvn": {
+      if (!tickCtx) return new Array(bars.length).fill(NaN);
+      const cache = profileCache ?? new ProfileCache(bars.length, tickCtx);
+      return nearestHvnSeries(bars, cache, args[0], args[1]);
+    }
+    case "dist_to_lvn": {
+      if (!tickCtx) return new Array(bars.length).fill(NaN);
+      const cache = profileCache ?? new ProfileCache(bars.length, tickCtx);
+      return nearestLvnSeries(bars, cache, args[0], args[1]);
+    }
+
+    // ─── Footprint imbalance (per-bar bid/ask binning) ──────────────
+    // The two siblings share a FootprintCache so their bins are
+    // computed exactly once per bar even when both calls appear.
+    case "stacked_imbalance_up": {
+      if (!tickCtx) return new Array(bars.length).fill(0);
+      const cache = footprintCache ?? new FootprintCache(bars.length, tickCtx);
+      return stackedImbalanceUpSeries(bars.length, tickCtx, cache, args[0]);
+    }
+    case "stacked_imbalance_down": {
+      if (!tickCtx) return new Array(bars.length).fill(0);
+      const cache = footprintCache ?? new FootprintCache(bars.length, tickCtx);
+      return stackedImbalanceDownSeries(bars.length, tickCtx, cache, args[0]);
+    }
+
+    // ─── Sweep + Iceberg (v2 quote data) ────────────────────────────
+    case "sweep_up":
+      return tickCtx
+        ? sweepUpSeries(bars.length, tickCtx, args[0], args[1])
+        : new Array(bars.length).fill(NaN);
+    case "sweep_down":
+      return tickCtx
+        ? sweepDownSeries(bars.length, tickCtx, args[0], args[1])
+        : new Array(bars.length).fill(NaN);
+    case "iceberg_at_ask":
+      return tickCtx
+        ? icebergAtAskSeries(bars.length, tickCtx, args[0], args[1])
+        : new Array(bars.length).fill(NaN);
+    case "iceberg_at_bid":
+      return tickCtx
+        ? icebergAtBidSeries(bars.length, tickCtx, args[0], args[1])
+        : new Array(bars.length).fill(NaN);
+
+    // ─── Heiken Ashi (4 sibling fields, zero-arg) ───────────────────
+    // All four pull from a single shared HeikenAshiCache so the
+    // recursive pass runs exactly once even when all four siblings
+    // appear in the same strategy.
+    case "ha_open":
+    case "ha_high":
+    case "ha_low":
+    case "ha_close": {
+      const cache = haCache ?? new HeikenAshiCache(bars);
+      const bundle = cache.get();
+      switch (name) {
+        case "ha_open":  return bundle.haOpen;
+        case "ha_high":  return bundle.haHigh;
+        case "ha_low":   return bundle.haLow;
+        case "ha_close": return bundle.haClose;
+      }
+      return null;
+    }
+
+    // ─── Squeeze (BB inside Keltner) ────────────────────────────────
+    case "squeeze_on":
+      return squeezeOnSeries(bars, args[0], args[1], args[2]);
+    case "squeeze_fire":
+      return squeezeFireSeries(bars, args[0], args[1], args[2]);
+
     // ─── Kalman-filtered Ornstein-Uhlenbeck (5 sibling fields) ──────
     // The cache is shared per-zone so all 5 field accesses on the same
     // (source, calib, trust) tuple run the filter exactly once. Falls
@@ -4478,6 +4773,15 @@ export function precomputeIndicators(
     // Always created (no tick dependency); the bundle math runs on plain
     // OHLCV bars.
     const kalmanCache = new KalmanOuCache(combined);
+    // Per-zone Heiken Ashi cache — all 4 HA siblings share one recursive
+    // pass. Bar-level (no tick dependency), so always created.
+    const haCache = new HeikenAshiCache(combined);
+    // Per-zone footprint cache — only meaningful with ticks. Falls back
+    // to undefined for plain-OHLCV sessions; the stacked-imbalance
+    // evaluator branches short-circuit before constructing a cache then.
+    const footprintCache = tickCtx
+      ? new FootprintCache(combined.length, tickCtx)
+      : null;
     for (const r of required) {
       const series = computeIndicatorSeries(
         r.name,
@@ -4486,6 +4790,8 @@ export function precomputeIndicators(
         tickCtx,
         profileCache,
         kalmanCache,
+        haCache,
+        footprintCache,
       );
       if (series) perZone.set(r.key, offset > 0 ? series.slice(offset) : series);
     }
@@ -4639,6 +4945,12 @@ const INDICATOR_CALL_NAMES = new Set<string>([
   "tick_count", "mean_trade_size", "large_trade_count", "vwap_tick",
   // Top-of-book quote (v2 tick CSV).
   "spread", "bid_size", "ask_size", "quote_imbalance", "microprice",
+  // Volume-profile node distances.
+  "dist_to_hvn", "dist_to_lvn",
+  // Footprint imbalance.
+  "stacked_imbalance_up", "stacked_imbalance_down",
+  // Sweep + iceberg (v2 quote data).
+  "sweep_up", "sweep_down", "iceberg_at_ask", "iceberg_at_bid",
 ]);
 
 /** True when the expression references any symbol that only resolves in

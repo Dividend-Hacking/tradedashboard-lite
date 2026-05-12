@@ -818,6 +818,91 @@ const INDICATOR_FAMILIES: IndicatorFamily[] = [
     ],
   },
 
+  // ─── Volume-profile nodes (HVN / LVN) ───────────────────────────────
+  {
+    group: G_TICK_MICRO,
+    headline: "Volume-profile node distances",
+    forms: [
+      "dist_to_hvn(N, area=0.7)",
+      "dist_to_lvn(N, area=0.7)",
+    ],
+    description:
+      "Signed normalized distance from current close to the nearest HIGH-volume (HVN) or LOW-volume (LVN) node in the rolling N-bar profile. Positive = node above price, negative = below. HVNs are strong magnets / pivots; LVNs are liquidity gaps price tends to traverse quickly. Mirrors `dist_to_POC` but resolves arbitrary nodes — useful for multi-modal distributions where POC alone is misleading. Needs ticks.",
+    examples: [
+      {
+        snippet: "filter.if = abs(dist_to_hvn(100, 0.7)) < 0.001",
+        scenario: "Only enter when price is within 0.1% of a major high-volume node — likely reaction zone.",
+      },
+      {
+        snippet: "signal.long.if = breakout_up and dist_to_lvn(60, 0.7) > 0",
+        scenario: "Breakout entries only when a low-volume gap sits above price — thin air above = faster move.",
+      },
+    ],
+  },
+
+  // ─── Footprint imbalance ────────────────────────────────────────────
+  {
+    group: G_TICK_MICRO,
+    headline: "Footprint imbalance (stacked diagonals)",
+    forms: [
+      "stacked_imbalance_up(ratio=3)",
+      "stacked_imbalance_down(ratio=3)",
+    ],
+    description:
+      "Max-consecutive-run-length within the CURRENT bar's footprint where K ascending (or descending) price buckets show one side's volume swamping the other by `ratio`. Returns 0 if no stack qualifies. This is the classic 3-stacked-imbalance footprint signal — strong concentrated aggression at multiple price levels. Filter with `>= 3` for the standard trigger. Needs `tick_bidask` granularity for side attribution.",
+    examples: [
+      {
+        snippet: "signal.long.if = stacked_imbalance_up(3) >= 3",
+        scenario: "Long entries only when the current bar's footprint shows at least 3 consecutive ascending price levels with ask volume ≥ 3× bid volume — strong buyers absorbing.",
+      },
+    ],
+  },
+
+  // ─── Sweep + Iceberg (v2 quote data) ────────────────────────────────
+  {
+    group: G_TICK_MICRO,
+    headline: "Sweep + Iceberg detection",
+    forms: [
+      "sweep_up(N, sizeMin=0)", "sweep_down(N, sizeMin=0)",
+      "iceberg_at_ask(N, minRefills=3)", "iceberg_at_bid(N, minRefills=3)",
+    ],
+    description:
+      "`sweep_up` / `sweep_down` count aggressive prints in the last N bars that ate the ENTIRE visible best-ask/bid size at the moment of trade — level-clearing aggression. `iceberg_at_ask` / `iceberg_at_bid` count bars where the same inside-quote price kept getting hit but size kept refilling (≥70% recovery within the bar), suggesting hidden depth behind the displayed quote. Sweeps are continuation signals; icebergs are reversal / absorption signals. All four REQUIRE a v2 tick session (best_bid/best_ask quote columns).",
+    examples: [
+      {
+        snippet: "signal.long.if = sweep_up(5, 50) >= 2 and close > EMA20",
+        scenario: "Two big buy sweeps (50+ contracts each) in the last 5 bars while price is above the trend EMA — momentum continuation.",
+      },
+      {
+        snippet: "signal.short.if = iceberg_at_ask(10, 3) > 0 and ha_close() < ha_open()",
+        scenario: "Heavy iceberg defending the ask AND Heiken Ashi turning red → fade the rally into hidden supply.",
+      },
+    ],
+  },
+
+  // ─── Bar-level smoothing & compression ──────────────────────────────
+  {
+    group: G_TICK_MICRO,
+    headline: "Heiken Ashi & Squeeze",
+    forms: [
+      "ha_open()", "ha_high()", "ha_low()", "ha_close()",
+      "squeeze_on(N=20, multBB=2, multKC=1.5)",
+      "squeeze_fire(N=20, multBB=2, multKC=1.5)",
+    ],
+    description:
+      "Heiken Ashi candles smooth raw OHLC by referencing the PRIOR HA candle (not the prior raw bar) — long unbroken HA color runs signal sustained trend. `squeeze_on` is 1 when Bollinger bands sit INSIDE the Keltner channel (volatility compression); `squeeze_fire` is 1 only on the exact bar where the squeeze releases. Pure OHLC math — works on ANY granularity, no tick data needed.",
+    examples: [
+      {
+        snippet: "filter.if = ha_close() > ha_open()",
+        scenario: "Trend filter — only take longs on green Heiken Ashi bars, no whipsaws from single noisy candles.",
+      },
+      {
+        snippet: "signal.long.if = squeeze_fire(20) == 1 and close > EMA20",
+        scenario: "Take longs only on the squeeze-release bar when price is above the trend EMA — directional bias for the compression release.",
+      },
+    ],
+  },
+
   // ─── Kalman-filtered Ornstein-Uhlenbeck (strategy DSL only) ─────────
   // Member access (`kf.x_pred`, `kf.x`, `kf.sigma`, …) only works
   // inside a strategy script via a `let X = KALMAN_OU(...)` binding —
