@@ -36,9 +36,14 @@ import { downloadScriptReferenceMarkdown } from "@/lib/utils/script-reference-ex
 // The raw EXPR_SYMBOLS / SUMMARY_SYMBOLS arrays are exhaustive — they list
 // every variant the parser accepts (ATR, ATR14, EMA20, EMA50, EMA200, …)
 // because the editor's autocomplete needs the full inventory. For the docs
-// page we collapse those into ONE entry per indicator family, with a
-// `[period]` placeholder in the headline and the shortcut forms listed
-// underneath. Far less scrolling, much clearer mental model.
+// page we collapse the PERIOD VARIANTS of a single indicator into one card
+// (EMA20/EMA50/EMA200 share an EMA[period] card) — but each conceptually
+// distinct indicator gets its OWN card with a tailored description and
+// example. The only multi-name cards are mathematically-inseparable
+// component bundles (BB upper/mid/lower/width/%B, MACD line/signal/hist,
+// Ichimoku tenkan/kijun/senkouA/senkouB/chikou, Heiken Ashi open/high/
+// low/close, Stoch K/D, Keltner upper/mid/lower, Donchian upper/lower/
+// mid) where five near-duplicate cards would just be noise.
 //
 // Adding a new indicator: extend INDICATOR_FAMILIES below AND keep
 // EXPR_SYMBOLS in sync (so autocomplete still surfaces every variant).
@@ -72,10 +77,24 @@ const G_BANDS = "Bands & channels";
 const G_VOLUME = "Volume & money flow";
 const G_STATS = "Statistical";
 const G_BAR_SHAPE = "Bar shape & reference prices";
-const G_LOOKBACK = "Lookback helpers";
 const G_ORDER_FLOW = "Order flow (requires bid/ask data)";
 const G_VOLUME_PROFILE = "Volume profile (requires tick data)";
-const G_TICK_MICRO = "Tick microstructure (requires tick data)";
+// Subgroups inside the former G_TICK_MICRO section. Each maps to a
+// natural sub-family that already existed as a comment block in the old
+// flat list; promoting them to first-class groups gives the renderer a
+// visible divider between them so the ~20+ tick-related cards stay
+// scannable instead of running together as one wall of cards.
+const G_TICK_AGGRESSOR = "Tick aggressor flow (requires tick data)";
+const G_TICK_QUOTE = "Top-of-book quote (requires v2 tick data)";
+const G_TICK_NODES = "Volume-profile nodes — HVN / LVN (requires tick data)";
+const G_TICK_FOOTPRINT = "Footprint imbalance (requires tick bid/ask)";
+const G_TICK_SWEEP = "Sweeps & icebergs (requires v2 tick data)";
+const G_BAR_SMOOTHING = "Bar smoothing & compression";
+// Subgroups inside the former G_LOOKBACK section. Time-series lookback
+// (HHV, close_n, …) is conceptually different from tick/point unit
+// conversion helpers — keep them separated visually.
+const G_LOOKBACK_TS = "Lookback helpers — time series";
+const G_TICK_CONV = "Lookback helpers — tick / point conversion";
 const G_ADVANCED = "Advanced — strategy DSL only";
 
 const INDICATOR_FAMILIES: IndicatorFamily[] = [
@@ -140,14 +159,27 @@ const INDICATOR_FAMILIES: IndicatorFamily[] = [
   },
   {
     group: G_TREND_MA,
-    headline: "DEMA[period] / TEMA[period]",
-    forms: ["DEMA(period)", "TEMA(period)", "DEMA20", "TEMA20"],
+    headline: "DEMA[period]",
+    forms: ["DEMA(period)", "DEMA20"],
     description:
-      "Sped-up versions of EMA. DEMA = double exponential, TEMA = triple. Both react quicker to price changes than a plain EMA at the same period — useful when EMA feels too slow.",
+      "Double Exponential Moving Average — runs an EMA on top of another EMA, then subtracts the second-order lag away. Net effect: tracks price more tightly than a plain EMA of the same period, with less lag during turns. Reach for it when EMA feels a step behind.",
     examples: [
       {
-        snippet: "filter.if = close > TEMA(20)",
-        scenario: "Trade with trend using an EMA that responds extra-quickly.",
+        snippet: "filter.if = close > DEMA(20)",
+        scenario: "Trade with trend using a low-lag EMA variant that turns faster than EMA20.",
+      },
+    ],
+  },
+  {
+    group: G_TREND_MA,
+    headline: "TEMA[period]",
+    forms: ["TEMA(period)", "TEMA20"],
+    description:
+      "Triple Exponential Moving Average — applies DEMA's lag-cancellation one more layer deep. Even more responsive than DEMA at the same period; great as the \"fast\" line in a crossover where you still want some smoothing.",
+    examples: [
+      {
+        snippet: "filter.if = close > TEMA(20) && TEMA(20) > TEMA(50)",
+        scenario: "Take longs only when price is above the fast TEMA AND the fast TEMA is above the slow TEMA.",
       },
     ],
   },
@@ -186,14 +218,27 @@ const INDICATOR_FAMILIES: IndicatorFamily[] = [
   },
   {
     group: G_TREND_DIR,
-    headline: "DIplus / DIminus",
-    forms: ["DIplus(period=14)", "DIminus(period=14)"],
+    headline: "DIplus[period]",
+    forms: ["DIplus(period=14)"],
     description:
-      "The two halves of ADX, separated. DI+ measures upside push, DI- measures downside push. DI+ above DI- = uptrend. Pair with ADX itself for a \"trend AND strength\" filter.",
+      "The upside half of the directional movement system. Measures how much the recent highs have been pushing up vs the prior bars. Bigger DI+ = stronger upside push. Pair with ADX (overall strength) and DIminus (the downside half) for a complete read.",
     examples: [
       {
         snippet: "filter.if = DIplus(14) > DIminus(14) && ADX > 25",
-        scenario: "Only take longs in a strong uptrend (direction + strength both confirmed).",
+        scenario: "Only take longs when bullish push beats bearish push AND there's real trend strength behind it.",
+      },
+    ],
+  },
+  {
+    group: G_TREND_DIR,
+    headline: "DIminus[period]",
+    forms: ["DIminus(period=14)"],
+    description:
+      "The downside half of the directional movement system. Measures how much the recent lows have been dragging down. Bigger DI- = stronger downside push. When DI- crosses above DI+, it usually marks a switch into a downtrend.",
+    examples: [
+      {
+        snippet: "filter.if = DIminus(14) > DIplus(14) && ADX > 25",
+        scenario: "Only take shorts when bearish push beats bullish push AND the trend is strong.",
       },
     ],
   },
@@ -225,35 +270,66 @@ const INDICATOR_FAMILIES: IndicatorFamily[] = [
   },
   {
     group: G_TREND_DIR,
-    headline: "Aroon_up / Aroon_down / Aroon_osc",
-    forms: [
-      "Aroon_up(period=14)",
-      "Aroon_down(period=14)",
-      "Aroon_osc(period=14)",
-    ],
+    headline: "Aroon_up[period]",
+    forms: ["Aroon_up(period=14)"],
     description:
-      "Aroon shows how fresh the recent high or low is, on a 0–100 scale. Up = 100 means \"brand new high just happened\". Down = 100 means \"brand new low just happened\". The oscillator is Up minus Down — positive means uptrend, negative means downtrend.",
+      "How fresh the recent N-bar high is, scored 0 to 100. 100 means \"a new high just printed this bar\". 0 means \"the high was N bars ago and we haven't beaten it since\". High values flag active upside momentum.",
     examples: [
       {
         snippet: "filter.if = Aroon_up(14) > 80",
         scenario: "Only trade longs when a new 14-bar high happened very recently.",
       },
+    ],
+  },
+  {
+    group: G_TREND_DIR,
+    headline: "Aroon_down[period]",
+    forms: ["Aroon_down(period=14)"],
+    description:
+      "How fresh the recent N-bar low is, scored 0 to 100. 100 means \"a new low just printed this bar\". 0 means the low was made N bars ago and hasn't been retested. High values flag active downside momentum.",
+    examples: [
       {
-        snippet: "filter.if = Aroon_osc(14) > 0",
-        scenario: "Only trade in the direction of the current trend per Aroon.",
+        snippet: "filter.if = Aroon_down(14) > 80",
+        scenario: "Only take shorts when a new 14-bar low just printed — fresh downside momentum.",
       },
     ],
   },
   {
     group: G_TREND_DIR,
-    headline: "VortexPlus / VortexMinus",
-    forms: ["VortexPlus(period=14)", "VortexMinus(period=14)"],
+    headline: "Aroon_osc[period]",
+    forms: ["Aroon_osc(period=14)"],
     description:
-      "Two lines that try to spot trend changes. VI+ rising and crossing above VI- = bullish turn. VI- rising and crossing above VI+ = bearish turn. Use whichever line is bigger as the trend direction.",
+      "Aroon_up minus Aroon_down on a single −100 to +100 scale. Positive = the recent high is fresher than the recent low (uptrend bias). Negative = the recent low is fresher (downtrend bias). One-shot trend-direction filter.",
+    examples: [
+      {
+        snippet: "filter.if = Aroon_osc(14) > 0",
+        scenario: "Only trade in the direction of the current Aroon trend bias.",
+      },
+    ],
+  },
+  {
+    group: G_TREND_DIR,
+    headline: "VortexPlus[period]",
+    forms: ["VortexPlus(period=14)"],
+    description:
+      "The bullish half of the Vortex indicator — measures upward price movement between today and the prior bar, normalized by true range. Rising VI+ that crosses above VI- typically marks a fresh bullish turn.",
     examples: [
       {
         snippet: "filter.if = VortexPlus(14) > VortexMinus(14)",
         scenario: "Only take longs when the bullish vortex line is dominant.",
+      },
+    ],
+  },
+  {
+    group: G_TREND_DIR,
+    headline: "VortexMinus[period]",
+    forms: ["VortexMinus(period=14)"],
+    description:
+      "The bearish half of the Vortex indicator — measures downward price movement between today and the prior bar, normalized by true range. Rising VI- that crosses above VI+ typically marks a fresh bearish turn.",
+    examples: [
+      {
+        snippet: "filter.if = VortexMinus(14) > VortexPlus(14)",
+        scenario: "Only take shorts when the bearish vortex line is dominant.",
       },
     ],
   },
@@ -299,15 +375,28 @@ const INDICATOR_FAMILIES: IndicatorFamily[] = [
   },
   {
     group: G_MOMENTUM,
-    headline: "ROC[period] / MOM[period]",
-    forms: ["ROC(period)", "MOM(period)", "ROC10", "MOM10"],
+    headline: "ROC[period]",
+    forms: ["ROC(period)", "ROC10"],
     description:
-      "How much price has changed compared to N bars ago. ROC = the percent change. MOM = the raw point change (positive means up, negative means down). Both tell you momentum direction.",
+      "Rate of Change — how far price has moved over the last N bars, expressed as a percent. Positive = price is higher than N bars ago, negative = lower. Scale-independent, so the same threshold works across instruments at different price levels.",
     examples: [
       {
         snippet: "filter.if = ROC(10) > 0",
         scenario: "Only trade when price is higher than it was 10 bars ago.",
       },
+      {
+        snippet: "filter.if = ROC(20) > 1.0",
+        scenario: "Only take longs when price has gained more than 1% over the last 20 bars — momentum threshold.",
+      },
+    ],
+  },
+  {
+    group: G_MOMENTUM,
+    headline: "MOM[period]",
+    forms: ["MOM(period)", "MOM10"],
+    description:
+      "Momentum — the raw price change in POINTS from N bars ago to now (close minus close_n(N)). Positive means up, negative means down. Useful when you want to size a stop or target against actual price travel.",
+    examples: [
       {
         snippet: "rules.takeProfitPoints = abs(MOM(20)) * 1.5",
         scenario: "Size your target relative to how much price has moved over the last 20 bars.",
@@ -342,15 +431,24 @@ const INDICATOR_FAMILIES: IndicatorFamily[] = [
   },
   {
     group: G_MOMENTUM,
-    headline: "TRIX[period] / MFI[period]",
-    forms: ["TRIX(period)", "MFI(period)", "TRIX14", "MFI14"],
+    headline: "TRIX[period]",
+    forms: ["TRIX(period)", "TRIX14"],
     description:
-      "TRIX = a smoothed-out momentum reading (filtered through three averages so noise gets cut). MFI = like RSI but uses volume too — a 0–100 \"money flow\" score. Above 80 = heavy buying pressure; below 20 = heavy selling.",
+      "A momentum reading run through three layers of EMA smoothing — the rate of change of a triple-smoothed price. Crosses zero from below = bullish momentum building; from above = bearish. Lags more than ROC but is far less twitchy.",
     examples: [
       {
         snippet: "filter.if = TRIX(14) > 0",
         scenario: "Only trade when smoothed momentum is positive (uptrend).",
       },
+    ],
+  },
+  {
+    group: G_MOMENTUM,
+    headline: "MFI[period]",
+    forms: ["MFI(period)", "MFI14"],
+    description:
+      "Money Flow Index — like RSI, but each bar's typical-price move is weighted by its volume before the up/down comparison. 0–100 scale; above 80 = heavy buying pressure, below 20 = heavy selling. Catches divergences RSI misses because price moved without volume.",
+    examples: [
       {
         snippet: "filter.if = MFI(14) < 20",
         scenario: "Trade oversold conditions confirmed by volume.",
@@ -400,22 +498,40 @@ const INDICATOR_FAMILIES: IndicatorFamily[] = [
   },
   {
     group: G_MOMENTUM,
-    headline: "AO / UO / Fisher",
-    forms: [
-      "AO", "AO()",
-      "UO(short=7, mid=14, long=28)",
-      "Fisher(period=10)",
-    ],
+    headline: "AO",
+    forms: ["AO", "AO()"],
     description:
-      "Three momentum gauges. AO (Awesome Oscillator) = a simple difference of two median-price averages. UO (Ultimate Oscillator) = a 0–100 score blending buying pressure across three time windows. Fisher = a transform that makes momentum extremes stick out more clearly.",
+      "Awesome Oscillator — the simple difference between a 5-bar and 34-bar SMA of the bar's median price. Above zero = short-term average is above long-term (bullish bias). Below zero = bearish. Useful as a quick \"which side am I on\" filter.",
     examples: [
       {
         snippet: "filter.if = AO > 0",
         scenario: "Only trade longs when the Awesome Oscillator is positive.",
       },
+    ],
+  },
+  {
+    group: G_MOMENTUM,
+    headline: "UO[short, mid, long]",
+    forms: ["UO(short=7, mid=14, long=28)"],
+    description:
+      "Ultimate Oscillator — a 0–100 score that blends buying pressure across three lookback windows so a single timeframe can't dominate the reading. Above 70 = consistently strong buying across all three; below 30 = consistently weak.",
+    examples: [
       {
         snippet: "filter.if = UO(7, 14, 28) > 70",
         scenario: "Only trade longs in clearly-buying conditions across multiple time windows.",
+      },
+    ],
+  },
+  {
+    group: G_MOMENTUM,
+    headline: "Fisher[period]",
+    forms: ["Fisher(period=10)"],
+    description:
+      "Fisher Transform — runs price's position-in-range through an inverse-hyperbolic-tangent transform that turns a bounded 0–1 input into a sharply-peaked output. Net effect: turning points stick out as clear spikes instead of slow rolls. Especially useful for spotting tops/bottoms.",
+    examples: [
+      {
+        snippet: "filter.if = Fisher(10) > 2",
+        scenario: "Only consider mean-reversion shorts when the Fisher transform spikes into extreme overbought.",
       },
     ],
   },
@@ -442,18 +558,40 @@ const INDICATOR_FAMILIES: IndicatorFamily[] = [
   },
   {
     group: G_VOLATILITY,
-    headline: "TR / NATR[period] / HV[period]",
-    forms: ["TR", "TR()", "NATR(period)", "HV(period)", "NATR14", "HV20"],
+    headline: "TR",
+    forms: ["TR", "TR()"],
     description:
-      "Three ways to measure price wiggle. TR = how big this single bar was (its range, including any gap from the last close). NATR = ATR shown as a percent of price (great for comparing volatility across different instruments). HV = how spread out returns have been recently.",
+      "True Range — how big THIS single bar was, in points. Takes the larger of: today's high-low range, the gap up from yesterday's close, or the gap down from yesterday's close. Captures opening gaps that a plain high-low range would miss.",
+    examples: [
+      {
+        snippet: "rules.stopLossPoints = TR * 1.5",
+        scenario: "Size your stop based on how big the entry bar itself was — wider after a wide entry bar.",
+      },
+    ],
+  },
+  {
+    group: G_VOLATILITY,
+    headline: "NATR[period]",
+    forms: ["NATR(period)", "NATR14"],
+    description:
+      "Normalized ATR — the regular ATR(N) divided by price and expressed as a percent. Great for comparing volatility across instruments at very different price levels (a 5-point ATR is huge on ES but nothing on BTC). Also useful when a strategy needs to work across both quiet and busy regimes.",
     examples: [
       {
         snippet: "filter.if = NATR(14) > 0.5",
         scenario: "Skip days when price wiggle is less than 0.5% of price — too quiet to bother.",
       },
+    ],
+  },
+  {
+    group: G_VOLATILITY,
+    headline: "HV[period]",
+    forms: ["HV(period)", "HV20"],
+    description:
+      "Historical Volatility — the rolling standard deviation of log-returns over the last N bars, annualized to a percent. The same volatility number options traders use to price contracts. Higher HV = recent returns have been more spread out (wilder market).",
+    examples: [
       {
-        snippet: "rules.stopLossPoints = TR * 1.5",
-        scenario: "Size your stop based on how big the entry bar itself was.",
+        snippet: "filter.if = HV(20) > 30",
+        scenario: "Only trade in high-vol regimes (annualized HV above 30%) — skip dead, low-vol periods.",
       },
     ],
   },
@@ -472,14 +610,27 @@ const INDICATOR_FAMILIES: IndicatorFamily[] = [
   },
   {
     group: G_VOLATILITY,
-    headline: "Choppiness / Ulcer",
-    forms: ["Choppiness(period=14)", "Ulcer(period=14)"],
+    headline: "Choppiness[period]",
+    forms: ["Choppiness(period=14)"],
     description:
-      "Choppiness Index = a 0–100 score where high (above ~62) means \"market is going sideways\" and low (below ~38) means \"there's a real trend\". Ulcer Index = a downside-only volatility gauge — measures how deep the recent drawdowns have been.",
+      "A 0–100 score answering \"is the market trending or just going sideways?\". High values (above ~62) mean lots of overlapping bars in a tight zone — sideways chop. Low values (below ~38) mean directional travel — a real trend. Great as a regime filter.",
     examples: [
       {
         snippet: "filter.if = Choppiness(14) < 38",
         scenario: "Only trade in trending conditions; skip sideways chop.",
+      },
+    ],
+  },
+  {
+    group: G_VOLATILITY,
+    headline: "Ulcer[period]",
+    forms: ["Ulcer(period=14)"],
+    description:
+      "Ulcer Index — a downside-only volatility gauge. Measures the depth and duration of drawdowns over the last N bars. Unlike stdev or ATR, it ignores upside swings entirely — only painful pullbacks count. Useful for sizing risk to actual downside experience.",
+    examples: [
+      {
+        snippet: "rules.stopLossPoints = Ulcer(14) * 2",
+        scenario: "Size your stop relative to recent downside pain — wider when the asset has been bleeding, tighter when drawdowns have been shallow.",
       },
     ],
   },
@@ -571,39 +722,49 @@ const INDICATOR_FAMILIES: IndicatorFamily[] = [
   },
   {
     group: G_VOLUME,
-    headline: "OBV / AD / CMF[period]",
-    forms: [
-      "OBV", "OBV()",
-      "AD", "AD()",
-      "CMF(period)", "CMF20",
-    ],
+    headline: "OBV",
+    forms: ["OBV", "OBV()"],
     description:
-      "Volume-flow indicators that try to read whether buyers or sellers are in charge. OBV = running tally of volume, plus on up-days, minus on down-days. AD = similar but factors in where price closed within the bar. CMF = a −1 to 1 score over N bars; positive = buying pressure.",
+      "On-Balance Volume — a running tally that adds the bar's volume on up-closes and subtracts it on down-closes. Cumulative, so absolute values aren't meaningful — what matters is the slope and whether it's confirming or diverging from price.",
     examples: [
       {
-        snippet: "filter.if = CMF(20) > 0.1",
-        scenario: "Only trade longs when the last 20 bars show clear buying pressure.",
-      },
-      {
-        snippet: "filter.if = OBV > OBV()",
-        scenario:
-          "Just illustrative — pair OBV with a moving average for trend confirmation in a real strategy.",
+        snippet: "filter.if = OBV > EMA(20)",
+        scenario: "Take longs only when OBV is above its 20-bar trend — volume flow confirms price strength.",
       },
     ],
   },
   {
     group: G_VOLUME,
-    headline: "VWAP / KVO / ForceIndex / EMV / NVI / PVI",
-    forms: [
-      "VWAP(period)",
-      "KVO(fast=34, slow=55)",
-      "ForceIndex(period=13)",
-      "EMV(period=14)",
-      "NVI", "NVI()",
-      "PVI", "PVI()",
-    ],
+    headline: "AD",
+    forms: ["AD", "AD()"],
     description:
-      "More volume-based readings. VWAP = a fair-value price that accounts for how much volume happened at each price. KVO and ForceIndex = momentum readings that include volume. EMV = Ease of Movement (how easily price moves with low volume). NVI/PVI = running indices that only update on quiet days vs busy days respectively.",
+      "Accumulation/Distribution line — like OBV but instead of all-or-nothing on up/down close, each bar contributes a fraction of its volume based on where it closed inside the bar's range. A bar that closed at the top contributes +volume; mid-range contributes near zero. Cumulative.",
+    examples: [
+      {
+        snippet: "filter.if = AD > AD - 1",
+        scenario: "Take longs only when accumulation pressure is rising — a finer read than OBV's binary up/down rule.",
+      },
+    ],
+  },
+  {
+    group: G_VOLUME,
+    headline: "CMF[period]",
+    forms: ["CMF(period)", "CMF20"],
+    description:
+      "Chaikin Money Flow — the rolling N-bar normalized version of AD. Outputs a −1 to +1 score: positive = N-bar buying pressure, negative = selling. Standard thresholds: above +0.1 = strong buying, below −0.1 = strong selling. Bounded so the same threshold works across instruments and timeframes.",
+    examples: [
+      {
+        snippet: "filter.if = CMF(20) > 0.1",
+        scenario: "Only trade longs when the last 20 bars show clear buying pressure.",
+      },
+    ],
+  },
+  {
+    group: G_VOLUME,
+    headline: "VWAP[period]",
+    forms: ["VWAP(period)"],
+    description:
+      "Volume-Weighted Average Price (rolling N-bar). Sums price×volume across the last N bars and divides by total volume — gives you the \"fair value\" price level where the most contracts have traded. Acts as a magnet: price often reverts toward it intraday.",
     examples: [
       {
         snippet: "filter.if = close > VWAP(50)",
@@ -611,26 +772,135 @@ const INDICATOR_FAMILIES: IndicatorFamily[] = [
       },
     ],
   },
+  {
+    group: G_VOLUME,
+    headline: "KVO[fast, slow]",
+    forms: ["KVO(fast=34, slow=55)"],
+    description:
+      "Klinger Volume Oscillator — a MACD-style indicator computed on volume force (volume signed by accumulation/distribution) instead of price. Crosses zero from below = bullish volume momentum turn; from above = bearish. Useful for catching divergences between price and volume thrust.",
+    examples: [
+      {
+        snippet: "filter.if = KVO(34, 55) > 0",
+        scenario: "Only take longs when the volume-momentum oscillator is positive — buying force dominates.",
+      },
+    ],
+  },
+  {
+    group: G_VOLUME,
+    headline: "ForceIndex[period]",
+    forms: ["ForceIndex(period=13)"],
+    description:
+      "Force Index — combines price change and volume into a single number. (close − close[1]) × volume, smoothed over N bars. Positive and rising = buyers driving the move with size; negative and falling = sellers. Slopes matter more than levels.",
+    examples: [
+      {
+        snippet: "filter.if = ForceIndex(13) > 0",
+        scenario: "Only take longs when buyers are driving recent moves with real volume.",
+      },
+    ],
+  },
+  {
+    group: G_VOLUME,
+    headline: "EMV[period]",
+    forms: ["EMV(period=14)"],
+    description:
+      "Ease of Movement — measures how much price moved per unit of volume. High positive = price marched up on light volume (low resistance to upside). Negative = price fell easily. A way to detect when little volume is producing big moves (low liquidity).",
+    examples: [
+      {
+        snippet: "filter.if = EMV(14) > 0",
+        scenario: "Only take longs when recent up-moves have come with low resistance (light volume needed to move price).",
+      },
+    ],
+  },
+  {
+    group: G_VOLUME,
+    headline: "NVI",
+    forms: ["NVI", "NVI()"],
+    description:
+      "Negative Volume Index — a cumulative index that ONLY updates on bars where volume FELL vs the prior bar. The theory: smart money trades on quiet days, so NVI's trend reflects informed positioning. Compare its slope to a long-term MA of itself.",
+    examples: [
+      {
+        snippet: "filter.if = NVI > NVI - 1",
+        scenario: "Only take longs when the smart-money index is rising — implied informed buying on quiet days.",
+      },
+    ],
+  },
+  {
+    group: G_VOLUME,
+    headline: "PVI",
+    forms: ["PVI", "PVI()"],
+    description:
+      "Positive Volume Index — the complement of NVI. Only updates on bars where volume ROSE vs the prior bar. Reflects what the crowd does on busy/news days. Pairs naturally with NVI as a smart-money-vs-crowd diagnostic.",
+    examples: [
+      {
+        snippet: "filter.if = PVI > NVI",
+        scenario: "Take longs only when the crowd-activity index outpaces the smart-money index — strong consensus buying.",
+      },
+    ],
+  },
 
   // ─── Statistical ─────────────────────────────────────────────────────
   {
     group: G_STATS,
-    headline: "Zscore / LRSlope / LRIntercept / LRValue / R2",
-    forms: [
-      "Zscore(period)",
-      "LRSlope(period)", "LRIntercept(period)",
-      "LRValue(period)", "R2(period)",
-    ],
+    headline: "Zscore[period]",
+    forms: ["Zscore(period)"],
     description:
-      "Statistical readings of the last N closes. Zscore = how many standard deviations price is above/below its average (extreme readings = mean-reversion candidates). LRSlope = the slope of a best-fit line through the closes (positive = uptrend). R2 = how cleanly that line actually fits — closer to 1 means a strong, smooth trend.",
+      "How many standard deviations the current close is above or below its N-bar mean. ±1 is normal noise, ±2 is unusual, ±3 is extreme. Classic mean-reversion entry trigger and the natural scale for the KALMAN_OU innovation.",
     examples: [
       {
         snippet: "filter.if = abs(Zscore(20)) > 2",
         scenario: "Only trade when price is unusually far from its 20-bar average — mean-reversion setup.",
       },
+    ],
+  },
+  {
+    group: G_STATS,
+    headline: "LRSlope[period]",
+    forms: ["LRSlope(period)"],
+    description:
+      "Slope of the linear-regression best-fit line through the last N closes. Positive = uptrend, negative = downtrend. Magnitude tells you how steep the trend is in points-per-bar. Less noisy than \"close > close N bars ago\" because every bar in the window influences the answer.",
+    examples: [
+      {
+        snippet: "filter.if = LRSlope(50) > 0",
+        scenario: "Take longs only when the 50-bar best-fit line is sloping up — clean trend filter.",
+      },
+    ],
+  },
+  {
+    group: G_STATS,
+    headline: "LRIntercept[period]",
+    forms: ["LRIntercept(period)"],
+    description:
+      "The y-intercept of the linear-regression line over the last N closes — i.e. what the best-fit line predicts at bar 0 of the window. Useful when you want to project where the line started vs where it ends; mostly used as input to derived calcs rather than a direct filter.",
+    examples: [
+      {
+        snippet: "rules.takeProfitPoints = abs(close - LRIntercept(20))",
+        scenario: "Target the regression line's starting value — uncommon but useful in regression-residual strategies.",
+      },
+    ],
+  },
+  {
+    group: G_STATS,
+    headline: "LRValue[period]",
+    forms: ["LRValue(period)"],
+    description:
+      "The CURRENT-bar value of the linear-regression line — basically LRSlope×N + LRIntercept. Acts as a smooth \"fair value\" line that lags less than an SMA because it's the best-fit forecast rather than a centered average. Great mean-reversion target.",
+    examples: [
+      {
+        snippet: "rules.takeProfitPoints = abs(close - LRValue(20))",
+        scenario: "Target the linear-regression \"fair value\" line for mean-reversion exits.",
+      },
+    ],
+  },
+  {
+    group: G_STATS,
+    headline: "R2[period]",
+    forms: ["R2(period)"],
+    description:
+      "Coefficient of determination — how cleanly the linear-regression line ACTUALLY fits the last N closes. 1.0 = price is essentially a straight line, 0 = no fit. Pair with LRSlope to demand both \"there's a trend\" AND \"the trend is clean\".",
+    examples: [
       {
         snippet: "filter.if = LRSlope(50) > 0 && R2(50) > 0.7",
-        scenario: "Only trade in clean, well-defined uptrends.",
+        scenario: "Only trade in clean, well-defined uptrends — slope positive AND fit quality above 70%.",
       },
     ],
   },
@@ -638,15 +908,11 @@ const INDICATOR_FAMILIES: IndicatorFamily[] = [
   // ─── Bar shape & reference prices ────────────────────────────────────
   {
     group: G_BAR_SHAPE,
-    headline: "range / body / upper_wick / lower_wick",
-    forms: ["range", "body", "upper_wick", "lower_wick"],
+    headline: "range",
+    forms: ["range"],
     description:
-      "The shape of the current candle. range = how tall it is (high minus low). body = open-to-close size and direction (positive = green, negative = red). upper_wick / lower_wick = how long each tail is.",
+      "The total height of the current candle — high minus low, in points. The full span of price movement during this bar. Great for sizing stops/targets to the actual volatility of the entry bar.",
     examples: [
-      {
-        snippet: "filter.if = body > 0 && lower_wick > body",
-        scenario: "Take longs only on green candles with a long lower tail — buyers rejected lower prices.",
-      },
       {
         snippet: "rules.takeProfitPoints = range * 2",
         scenario: "Set the target at twice the entry candle's full range.",
@@ -655,10 +921,49 @@ const INDICATOR_FAMILIES: IndicatorFamily[] = [
   },
   {
     group: G_BAR_SHAPE,
-    headline: "typical / median_price / weighted_close",
-    forms: ["typical", "median_price", "weighted_close"],
+    headline: "body",
+    forms: ["body"],
     description:
-      "Three different ways to summarize a bar with one number. typical = average of high, low, close. median_price = midpoint of high and low. weighted_close = like typical but counts close more. Used as inputs to other indicators.",
+      "Signed open-to-close size of the current candle. Positive = green/bullish (close above open), negative = red/bearish (close below open). Magnitude = how decisive the bar was. A bar with a tiny body is indecision; a big body is conviction.",
+    examples: [
+      {
+        snippet: "filter.if = body > 0",
+        scenario: "Take longs only when the entry candle is green (close above open).",
+      },
+    ],
+  },
+  {
+    group: G_BAR_SHAPE,
+    headline: "upper_wick",
+    forms: ["upper_wick"],
+    description:
+      "Length of the upper tail of the current candle — the part above the body. Long upper wick = sellers rejected higher prices and pushed back down. Bearish footprint regardless of the candle's color.",
+    examples: [
+      {
+        snippet: "filter.if = body < 0 && upper_wick > abs(body) * 2",
+        scenario: "Take shorts only on red candles with a long upper tail — a clear rejection signature.",
+      },
+    ],
+  },
+  {
+    group: G_BAR_SHAPE,
+    headline: "lower_wick",
+    forms: ["lower_wick"],
+    description:
+      "Length of the lower tail of the current candle — the part below the body. Long lower wick = buyers rejected lower prices and pushed back up. Bullish footprint regardless of color.",
+    examples: [
+      {
+        snippet: "filter.if = body > 0 && lower_wick > body",
+        scenario: "Take longs only on green candles with a long lower tail — buyers rejected lower prices.",
+      },
+    ],
+  },
+  {
+    group: G_BAR_SHAPE,
+    headline: "typical",
+    forms: ["typical"],
+    description:
+      "Average of the current bar's high, low, and close — (H + L + C) / 3. The standard \"summary price\" used by VWAP, CCI, Money Flow, etc. Treats the close as one of three equally-weighted readings rather than the only thing that matters.",
     examples: [
       {
         snippet: "rules.takeProfitPoints = abs(typical - EMA20)",
@@ -666,19 +971,54 @@ const INDICATOR_FAMILIES: IndicatorFamily[] = [
       },
     ],
   },
+  {
+    group: G_BAR_SHAPE,
+    headline: "median_price",
+    forms: ["median_price"],
+    description:
+      "Midpoint of the current bar — (H + L) / 2. Ignores the close entirely. Useful when you want a \"pure range center\" reference that isn't biased by where the bar happened to end. Used internally by Awesome Oscillator and Heiken Ashi.",
+    examples: [
+      {
+        snippet: "filter.if = close > median_price",
+        scenario: "Take longs only when the close is in the upper half of the bar's range — bullish bias within the bar.",
+      },
+    ],
+  },
+  {
+    group: G_BAR_SHAPE,
+    headline: "weighted_close",
+    forms: ["weighted_close"],
+    description:
+      "A summary price that weights the close more heavily — (H + L + 2C) / 4. Halfway between `typical` and just using `close`. Smooths out wild high/low spikes while still letting the close dominate.",
+    examples: [
+      {
+        snippet: "filter.if = weighted_close > EMA20",
+        scenario: "Use a close-weighted summary as the reference for the trend filter — slightly more stable than raw close.",
+      },
+    ],
+  },
 
   // ─── Lookback helpers ────────────────────────────────────────────────
   {
-    group: G_LOOKBACK,
-    headline: "HHV[period] / LLV[period]",
-    forms: ["HHV(period)", "LLV(period)", "HHV20", "LLV20"],
+    group: G_LOOKBACK_TS,
+    headline: "HHV[period]",
+    forms: ["HHV(period)", "HHV20"],
     description:
-      "HHV = the highest high of the last N bars. LLV = the lowest low. Use these for breakout setups (trade when price clears the recent high) or channel stops (set your stop at the recent low).",
+      "Highest High Value — the highest high seen in the last N bars (including the current bar). The classic Donchian/breakout upper edge. Use for new-high breakout entries or as a resistance reference.",
     examples: [
       {
         snippet: "filter.if = close > HHV(20)",
         scenario: "Only take longs that break above the 20-bar high — a fresh new-high entry.",
       },
+    ],
+  },
+  {
+    group: G_LOOKBACK_TS,
+    headline: "LLV[period]",
+    forms: ["LLV(period)", "LLV20"],
+    description:
+      "Lowest Low Value — the lowest low seen in the last N bars (including the current bar). The mirror of HHV. Use for new-low breakdown entries, or to anchor a channel stop at recent support.",
+    examples: [
       {
         snippet: "rules.stopLossPoints = close - LLV(10)",
         scenario: "Set the stop at the lowest low of the last 10 bars.",
@@ -686,18 +1026,64 @@ const INDICATOR_FAMILIES: IndicatorFamily[] = [
     ],
   },
   {
-    group: G_LOOKBACK,
-    headline: "close_n(n) / high_n(n) / low_n(n) / open_n(n) / volume_n(n)",
-    forms: [
-      "close_n(n)", "high_n(n)", "low_n(n)", "open_n(n)", "volume_n(n)",
-    ],
+    group: G_LOOKBACK_TS,
+    headline: "close_n(n)",
+    forms: ["close_n(n)"],
     description:
-      "Look back at price/volume from N bars ago. `close_n(1)` is the previous bar's close, `close_n(5)` is 5 bars back, etc. Use these to compare \"now vs then\" — like \"is this bar higher than the previous one\".",
+      "The close of the bar N bars ago. `close_n(1)` is the previous bar's close, `close_n(5)` is 5 bars back. The standard \"yesterday's close\" lookup used for momentum comparisons, gap detection, and pattern matching.",
     examples: [
       {
         snippet: "filter.if = close > close_n(1)",
         scenario: "Only trade when this bar closed higher than the previous bar.",
       },
+    ],
+  },
+  {
+    group: G_LOOKBACK_TS,
+    headline: "high_n(n)",
+    forms: ["high_n(n)"],
+    description:
+      "The HIGH of the bar N bars ago. `high_n(1)` = previous bar's high. Use to detect breakouts of a prior bar's high or to anchor pattern-based stops.",
+    examples: [
+      {
+        snippet: "filter.if = high > high_n(1)",
+        scenario: "Only trade when this bar's high exceeded the prior bar's high — higher-high pattern.",
+      },
+    ],
+  },
+  {
+    group: G_LOOKBACK_TS,
+    headline: "low_n(n)",
+    forms: ["low_n(n)"],
+    description:
+      "The LOW of the bar N bars ago. `low_n(1)` = previous bar's low. Mirror of high_n — useful for higher-low / lower-low pattern recognition.",
+    examples: [
+      {
+        snippet: "filter.if = low > low_n(1)",
+        scenario: "Only trade longs when this bar's low is above the prior bar's low — higher-low confirmation.",
+      },
+    ],
+  },
+  {
+    group: G_LOOKBACK_TS,
+    headline: "open_n(n)",
+    forms: ["open_n(n)"],
+    description:
+      "The OPEN of the bar N bars ago. Less common than close_n but useful for inside-bar / outside-bar pattern logic and for measuring gaps between sessions.",
+    examples: [
+      {
+        snippet: "filter.if = open > open_n(1) && close > close_n(1)",
+        scenario: "Take longs only when both open AND close are above the prior bar — strong continuation pattern.",
+      },
+    ],
+  },
+  {
+    group: G_LOOKBACK_TS,
+    headline: "volume_n(n)",
+    forms: ["volume_n(n)"],
+    description:
+      "Volume of the bar N bars ago. `volume_n(1)` = previous bar's volume. Use to compare current-bar activity against a specific prior bar (often the entry bar).",
+    examples: [
       {
         snippet: "filter.if = volume > volume_n(1) * 2",
         scenario: "Only trade when this bar's volume was double the previous bar's.",
@@ -705,17 +1091,11 @@ const INDICATOR_FAMILIES: IndicatorFamily[] = [
     ],
   },
   {
-    group: G_LOOKBACK,
-    headline: "ticks(n) / point(n)",
-    forms: [
-      "ticks(n)",
-      "point(n)",
-      "ticksPerPoint",
-      "tickValue",
-      "pointValue",
-    ],
+    group: G_TICK_CONV,
+    headline: "ticks(n)",
+    forms: ["ticks(n)"],
     description:
-      "Helpers that convert between ticks (the smallest price increment for an instrument) and price points. Different futures have different tick sizes — NQ has 4 ticks per point, gold has 10, oil has 100. Using `ticks(n)` keeps your script working across instruments without rewriting numbers.",
+      "Convert N ticks into POINTS for the current instrument. NQ has 4 ticks/point, gold has 10, oil has 100, ES has 4. So `ticks(8)` = 2 points on NQ, 0.8 on gold, 0.08 on oil. The most useful instrument-portable way to specify stop / target distances.",
     examples: [
       {
         snippet: "rules.stopLossPoints = ticks(8)",
@@ -724,6 +1104,58 @@ const INDICATOR_FAMILIES: IndicatorFamily[] = [
       {
         snippet: "rules.stopLossPoints = Optimize.DailyEV.trades(30, ticks(4), 40)",
         scenario: "Optimize the stop, but never let it shrink below 4 ticks — instrument-aware floor.",
+      },
+    ],
+  },
+  {
+    group: G_TICK_CONV,
+    headline: "point(n)",
+    forms: ["point(n)"],
+    description:
+      "Convert N points into TICKS for the current instrument — the inverse of `ticks()`. Rarely needed in stop/target rules (those use points), but useful when you need an integer tick count for tick-level math.",
+    examples: [
+      {
+        snippet: "filter.if = point(1) > 10",
+        scenario: "Gate the strategy to high-tick-density instruments (e.g. crude oil, where 1 point = 100 ticks).",
+      },
+    ],
+  },
+  {
+    group: G_TICK_CONV,
+    headline: "ticksPerPoint",
+    forms: ["ticksPerPoint"],
+    description:
+      "Raw count of how many ticks make up one point for the current instrument. NQ = 4, ES = 4, gold = 10, crude = 100. Same number `ticks(n)` and `point(n)` use internally — exposed when you need the value directly for sizing math.",
+    examples: [
+      {
+        snippet: "rules.takeProfitPoints = stdev(20) * ticksPerPoint",
+        scenario: "Scale a stdev-based target by the instrument's tick density.",
+      },
+    ],
+  },
+  {
+    group: G_TICK_CONV,
+    headline: "tickValue",
+    forms: ["tickValue"],
+    description:
+      "Dollar value of one tick for the current instrument — what each tick is worth in P&L. NQ = $5/tick, ES = $12.50/tick, gold = $10/tick. Use when you want to express stops/targets in dollars rather than points.",
+    examples: [
+      {
+        snippet: "rules.stopLossPoints = 100 / tickValue * ticksPerPoint",
+        scenario: "Build a roughly-$100-risk stop that auto-adjusts to whichever instrument is loaded.",
+      },
+    ],
+  },
+  {
+    group: G_TICK_CONV,
+    headline: "pointValue",
+    forms: ["pointValue"],
+    description:
+      "Dollar value of one point for the current instrument. NQ = $20/point, ES = $50/point, gold = $100/point. The point-level counterpart to `tickValue`. Most useful when sizing risk in dollars across multiple instruments.",
+    examples: [
+      {
+        snippet: "rules.stopLossPoints = 200 / pointValue",
+        scenario: "Build a roughly-$200-risk stop in points — auto-scales across instruments by dollar value.",
       },
     ],
   },
@@ -747,92 +1179,251 @@ const INDICATOR_FAMILIES: IndicatorFamily[] = [
   // ─── Volume profile (rolling N-bar window — REQUIRES tick session) ──
   {
     group: G_VOLUME_PROFILE,
-    headline: "POC / VAH / VAL / VA_width / dist_to_POC (rolling)",
-    forms: [
-      "POC(N, area=0.7)",
-      "VAH(N, area=0.7)",
-      "VAL(N, area=0.7)",
-      "VA_width(N, area=0.7)",
-      "dist_to_POC(N, area=0.7)",
-    ],
+    headline: "POC[N, area]",
+    forms: ["POC(N, area=0.7)"],
     description:
-      "Volume profile shows where, by price level, the most trading happened over the last N bars. POC = the most-traded price (where buyers and sellers found agreement). VAH/VAL = the top and bottom of the price range that holds 70% of trading. Useful for finding fair value zones. NEEDS a tick session — returns nothing on plain OHLCV.",
+      "Point of Control — the single price level that traded the most volume over the rolling N-bar window. Where buyers and sellers found the most agreement. Acts as a magnet: when price strays, it often reverts toward POC. Needs a tick session.",
     examples: [
-      {
-        snippet: "filter.if = close > VAL(20) && close < VAH(20)",
-        scenario: "Only trade when price is inside the recent value zone (fair-value mean reversion).",
-      },
       {
         snippet: "rules.takeProfitPoints = abs(close - POC(20))",
         scenario: "Aim profit at the most-traded price level — a magnet for mean reversion.",
       },
     ],
   },
+  {
+    group: G_VOLUME_PROFILE,
+    headline: "VAH[N, area]",
+    forms: ["VAH(N, area=0.7)"],
+    description:
+      "Value Area High — the TOP edge of the price range that holds `area` (default 70%) of the rolling N-bar volume. Acts as soft resistance: when price pushes above VAH, it's outside the recent fair-value zone. Needs a tick session.",
+    examples: [
+      {
+        snippet: "filter.if = close > VAH(20)",
+        scenario: "Only take longs when price has broken above the upper edge of the value zone — accepted into higher prices.",
+      },
+    ],
+  },
+  {
+    group: G_VOLUME_PROFILE,
+    headline: "VAL[N, area]",
+    forms: ["VAL(N, area=0.7)"],
+    description:
+      "Value Area Low — the BOTTOM edge of the price range that holds `area` (default 70%) of the rolling N-bar volume. Mirror of VAH. Below VAL = price has rejected the recent fair-value zone to the downside. Needs a tick session.",
+    examples: [
+      {
+        snippet: "filter.if = close > VAL(20) && close < VAH(20)",
+        scenario: "Only trade when price is inside the recent value zone — fair-value mean reversion.",
+      },
+    ],
+  },
+  {
+    group: G_VOLUME_PROFILE,
+    headline: "VA_width[N, area]",
+    forms: ["VA_width(N, area=0.7)"],
+    description:
+      "Width of the value area in points — `VAH - VAL`. A narrow value area means recent trading has clustered tightly (consolidation); a wide one means activity has been spread out. Useful regime filter for compression/expansion trades.",
+    examples: [
+      {
+        snippet: "filter.if = VA_width(20, 0.7) < ATR(14)",
+        scenario: "Only trade when the value area is narrower than a typical bar's range — compressed activity, often before a breakout.",
+      },
+    ],
+  },
+  {
+    group: G_VOLUME_PROFILE,
+    headline: "dist_to_POC[N, area]",
+    forms: ["dist_to_POC(N, area=0.7)"],
+    description:
+      "Signed distance from the current close to the rolling POC, in points. Positive = price is above POC, negative = below. The natural \"how stretched are we vs fair value\" reading for mean-reversion entries.",
+    examples: [
+      {
+        snippet: "filter.if = dist_to_POC(20) < -ATR(14)",
+        scenario: "Only take longs when price has stretched more than an ATR below POC — strong mean-reversion setup.",
+      },
+    ],
+  },
 
   // ─── Tick microstructure (REQUIRES tick session) ────────────────────
   {
-    group: G_TICK_MICRO,
-    headline: "Tick microstructure",
-    forms: [
-      "trades_at_bid(N)", "trades_at_ask(N)",
-      "tick_imbalance(N)",
-      "tick_count(N)", "mean_trade_size(N)",
-      "large_trade_count(N, threshold)",
-      "vwap_tick(N)",
-    ],
+    group: G_TICK_AGGRESSOR,
+    headline: "trades_at_bid[N]",
+    forms: ["trades_at_bid(N)"],
     description:
-      "Trade-by-trade metrics over the last N bars. `trades_at_ask` / `trades_at_bid` count how many trades hit each side (buy-aggressor vs sell-aggressor). `tick_imbalance` is a −1 to +1 score of which side is winning. `large_trade_count` finds big block prints. NEEDS a tick session.",
+      "Count of trades over the last N bars that printed at the BID — sell-aggressor flow. High count = sellers were hitting bids aggressively (bearish flow). Compare to `trades_at_ask` to see which side is winning. Needs a tick session.",
+    examples: [
+      {
+        snippet: "filter.if = trades_at_bid(5) > trades_at_ask(5) * 1.5",
+        scenario: "Only take shorts when sell-aggression has been 50%+ heavier than buy-aggression over the last 5 bars.",
+      },
+    ],
+  },
+  {
+    group: G_TICK_AGGRESSOR,
+    headline: "trades_at_ask[N]",
+    forms: ["trades_at_ask(N)"],
+    description:
+      "Count of trades over the last N bars that printed at the ASK — buy-aggressor flow. High count = buyers were lifting offers aggressively (bullish flow). The complement of `trades_at_bid`. Needs a tick session.",
+    examples: [
+      {
+        snippet: "filter.if = trades_at_ask(5) > trades_at_bid(5) * 1.5",
+        scenario: "Only take longs when buy-aggression has been 50%+ heavier than sell-aggression over the last 5 bars.",
+      },
+    ],
+  },
+  {
+    group: G_TICK_AGGRESSOR,
+    headline: "tick_imbalance[N]",
+    forms: ["tick_imbalance(N)"],
+    description:
+      "A bounded −1 to +1 score over the last N bars: (ask_trades − bid_trades) / total_trades. +1 = every trade was a buy-aggressor lift; −1 = every trade hit the bid. The natural one-number summary of recent aggressor flow.",
     examples: [
       {
         snippet: "filter.if = tick_imbalance(5) > 0.3",
         scenario: "Only take longs when buyers have been clearly aggressive over the last 5 bars.",
       },
+    ],
+  },
+  {
+    group: G_TICK_AGGRESSOR,
+    headline: "tick_count[N]",
+    forms: ["tick_count(N)"],
+    description:
+      "Total number of trades over the last N bars (regardless of side). A pure activity meter — high tick_count = busy / active market, low = quiet. Useful for filtering out dead patches when a strategy depends on participation.",
+    examples: [
+      {
+        snippet: "filter.if = tick_count(5) > 100",
+        scenario: "Only trade when at least 100 prints hit in the last 5 bars — skip illiquid lulls.",
+      },
+    ],
+  },
+  {
+    group: G_TICK_AGGRESSOR,
+    headline: "mean_trade_size[N]",
+    forms: ["mean_trade_size(N)"],
+    description:
+      "Average contracts-per-trade over the last N bars. Rising = bigger players are stepping in (institutional flow). Falling = mostly small-lot retail. A regime gauge for who's actually pushing price.",
+    examples: [
+      {
+        snippet: "filter.if = mean_trade_size(10) > 5",
+        scenario: "Only trade when the average lot size is above 5 contracts — implies institutional participation.",
+      },
+    ],
+  },
+  {
+    group: G_TICK_AGGRESSOR,
+    headline: "large_trade_count[N, threshold]",
+    forms: ["large_trade_count(N, threshold)"],
+    description:
+      "Number of trades over the last N bars whose size was ≥ `threshold` contracts. Finds block prints / institutional clips. Pair with directional logic (close direction, aggressor side) to see whether the big traders were buying or selling.",
+    examples: [
       {
         snippet: "filter.if = large_trade_count(5, 50) >= 3",
         scenario: "Only trade after at least 3 big-size prints (50+ contracts) hit in the last 5 bars.",
       },
     ],
   },
+  {
+    group: G_TICK_AGGRESSOR,
+    headline: "vwap_tick[N]",
+    forms: ["vwap_tick(N)"],
+    description:
+      "Volume-Weighted Average Price computed from the raw tick stream over the last N bars — finer-grained than the bar-level VWAP. Each individual print contributes; intrabar moves are reflected. Use when the bar-level VWAP feels too coarse.",
+    examples: [
+      {
+        snippet: "filter.if = close > vwap_tick(20)",
+        scenario: "Only take longs when price is above the tick-level VWAP — confirmation at the highest resolution.",
+      },
+    ],
+  },
 
   // ─── Top-of-book quote (RESTING liquidity, v2 tick session) ─────────
   {
-    group: G_TICK_MICRO,
-    headline: "Top-of-book quote (resting liquidity)",
-    forms: [
-      "spread(N)",
-      "bid_size(N)", "ask_size(N)",
-      "quote_imbalance(N)",
-      "microprice(N)",
-    ],
+    group: G_TICK_QUOTE,
+    headline: "spread[N]",
+    forms: ["spread(N)"],
     description:
-      "What the order book LOOKS LIKE at the inside quote, averaged over the last N bars — distinct from the aggressor family above which sees executed flow. `spread` widens when liquidity thins. `bid_size` / `ask_size` show resting size at the BBO — stacked offers vs thin bids etc. `quote_imbalance` is a −1 to +1 score: positive = sellers waiting, negative = buyers waiting. `microprice` is a size-weighted fair-value mid (tilts toward the side with LESS resting size, since that side moves next). REQUIRES a v2 tick session — one whose CSV includes best_bid/best_ask columns. Legacy 5-column tick blobs return NaN. Backtest-only — not yet supported by the NT8 transpiler.",
+      "Average best_ask − best_bid over the last N bars, in points. Tight spread = liquid, easy fills. Wide spread = thin book, fast moves, slippage risk. Use as a regime filter to avoid trading during illiquid windows. Requires a v2 tick session (best_bid/best_ask columns); legacy tick CSVs return NaN.",
     examples: [
-      {
-        snippet: "filter.if = breakout_up and ask_size(10) < 20",
-        scenario: "Only take breakouts when offers above are thin — less liquidity for sellers to fade into.",
-      },
       {
         snippet: "filter.if = spread(20) < 0.5",
         scenario: "Avoid trading during fast / illiquid moments — only act when the book is tight.",
       },
     ],
   },
+  {
+    group: G_TICK_QUOTE,
+    headline: "bid_size[N]",
+    forms: ["bid_size(N)"],
+    description:
+      "Average size resting at the best bid over the last N bars. Large bid_size = stacked support below price (buyers willing to absorb). Thin bid_size = vulnerable to a flush. Distinct from `trades_at_bid` (executed flow vs displayed depth).",
+    examples: [
+      {
+        snippet: "filter.if = bid_size(10) > 50 && breakout_down",
+        scenario: "Skip short breakouts when bids below are stacked — likely absorption rather than a real flush.",
+      },
+    ],
+  },
+  {
+    group: G_TICK_QUOTE,
+    headline: "ask_size[N]",
+    forms: ["ask_size(N)"],
+    description:
+      "Average size resting at the best ask over the last N bars. Thin ask_size = clear runway for upside (less liquidity for sellers to fade into). Thick ask_size = supply pressing on price. Pair with breakout direction.",
+    examples: [
+      {
+        snippet: "filter.if = breakout_up and ask_size(10) < 20",
+        scenario: "Only take breakouts when offers above are thin — less liquidity for sellers to fade into.",
+      },
+    ],
+  },
+  {
+    group: G_TICK_QUOTE,
+    headline: "quote_imbalance[N]",
+    forms: ["quote_imbalance(N)"],
+    description:
+      "Resting-liquidity imbalance over the last N bars on a −1 to +1 scale: (ask_size − bid_size) / total. Positive = more size waiting on the offer (sellers stacked, possible push down). Negative = more size on the bid (buyers stacked, possible push up). The complement to executed `tick_imbalance`.",
+    examples: [
+      {
+        snippet: "filter.if = quote_imbalance(10) < -0.3",
+        scenario: "Take longs when the book is heavily lopsided with resting bids — implied buyer support.",
+      },
+    ],
+  },
+  {
+    group: G_TICK_QUOTE,
+    headline: "microprice[N]",
+    forms: ["microprice(N)"],
+    description:
+      "Size-weighted fair-value mid over the last N bars: tilts TOWARD the side with LESS resting size (since that side has to move next when contracts hit it). More predictive of next-tick direction than the plain midpoint when the book is lopsided.",
+    examples: [
+      {
+        snippet: "filter.if = close > microprice(20)",
+        scenario: "Take longs when price has pushed above the size-weighted fair-value mid — book pressure favors upside.",
+      },
+    ],
+  },
 
   // ─── Volume-profile nodes (HVN / LVN) ───────────────────────────────
   {
-    group: G_TICK_MICRO,
-    headline: "Volume-profile node distances",
-    forms: [
-      "dist_to_hvn(N, area=0.7)",
-      "dist_to_lvn(N, area=0.7)",
-    ],
+    group: G_TICK_NODES,
+    headline: "dist_to_hvn[N, area]",
+    forms: ["dist_to_hvn(N, area=0.7)"],
     description:
-      "Signed normalized distance from current close to the nearest HIGH-volume (HVN) or LOW-volume (LVN) node in the rolling N-bar profile. Positive = node above price, negative = below. HVNs are strong magnets / pivots; LVNs are liquidity gaps price tends to traverse quickly. Mirrors `dist_to_POC` but resolves arbitrary nodes — useful for multi-modal distributions where POC alone is misleading. Needs ticks.",
+      "Signed normalized distance from the current close to the nearest HIGH-volume node (HVN) in the rolling N-bar profile. Positive = HVN sits above price, negative = below. HVNs are strong magnets / pivots — price tends to react to them. Like `dist_to_POC` but resolves SECONDARY nodes too (useful for multi-modal distributions).",
     examples: [
       {
         snippet: "filter.if = abs(dist_to_hvn(100, 0.7)) < 0.001",
         scenario: "Only enter when price is within 0.1% of a major high-volume node — likely reaction zone.",
       },
+    ],
+  },
+  {
+    group: G_TICK_NODES,
+    headline: "dist_to_lvn[N, area]",
+    forms: ["dist_to_lvn(N, area=0.7)"],
+    description:
+      "Signed normalized distance from the current close to the nearest LOW-volume node (LVN) in the rolling N-bar profile. Positive = LVN above price, negative = below. LVNs are liquidity gaps — price tends to traverse them quickly because there's little resting interest to slow it down. The complement of `dist_to_hvn`.",
+    examples: [
       {
         snippet: "signal.long.if = breakout_up and dist_to_lvn(60, 0.7) > 0",
         scenario: "Breakout entries only when a low-volume gap sits above price — thin air above = faster move.",
@@ -842,14 +1433,11 @@ const INDICATOR_FAMILIES: IndicatorFamily[] = [
 
   // ─── Footprint imbalance ────────────────────────────────────────────
   {
-    group: G_TICK_MICRO,
-    headline: "Footprint imbalance (stacked diagonals)",
-    forms: [
-      "stacked_imbalance_up(ratio=3)",
-      "stacked_imbalance_down(ratio=3)",
-    ],
+    group: G_TICK_FOOTPRINT,
+    headline: "stacked_imbalance_up[ratio]",
+    forms: ["stacked_imbalance_up(ratio=3)"],
     description:
-      "Max-consecutive-run-length within the CURRENT bar's footprint where K ascending (or descending) price buckets show one side's volume swamping the other by `ratio`. Returns 0 if no stack qualifies. This is the classic 3-stacked-imbalance footprint signal — strong concentrated aggression at multiple price levels. Filter with `>= 3` for the standard trigger. Needs `tick_bidask` granularity for side attribution.",
+      "Inside the CURRENT bar's footprint, finds the maximum-length consecutive run of ASCENDING price buckets where ask volume swamps bid volume by `ratio` or more. Returns 0 if no stack qualifies. The classic \"3-stacked-ask-imbalance\" footprint signal — concentrated buying aggression at multiple stacked price levels. Standard trigger: `>= 3`. Needs `tick_bidask` granularity.",
     examples: [
       {
         snippet: "signal.long.if = stacked_imbalance_up(3) >= 3",
@@ -857,45 +1445,112 @@ const INDICATOR_FAMILIES: IndicatorFamily[] = [
       },
     ],
   },
+  {
+    group: G_TICK_FOOTPRINT,
+    headline: "stacked_imbalance_down[ratio]",
+    forms: ["stacked_imbalance_down(ratio=3)"],
+    description:
+      "Mirror of `stacked_imbalance_up` — looks for a consecutive run of DESCENDING price buckets where bid volume swamps ask volume by `ratio` or more. Concentrated selling aggression at multiple stacked levels. Standard trigger: `>= 3`. Needs `tick_bidask` granularity.",
+    examples: [
+      {
+        snippet: "signal.short.if = stacked_imbalance_down(3) >= 3",
+        scenario: "Short entries only when the current bar's footprint shows at least 3 consecutive descending price levels with bid volume ≥ 3× ask volume — strong sellers hammering.",
+      },
+    ],
+  },
 
   // ─── Sweep + Iceberg (v2 quote data) ────────────────────────────────
   {
-    group: G_TICK_MICRO,
-    headline: "Sweep + Iceberg detection",
-    forms: [
-      "sweep_up(N, sizeMin=0)", "sweep_down(N, sizeMin=0)",
-      "iceberg_at_ask(N, minRefills=3)", "iceberg_at_bid(N, minRefills=3)",
-    ],
+    group: G_TICK_SWEEP,
+    headline: "sweep_up[N, sizeMin]",
+    forms: ["sweep_up(N, sizeMin=0)"],
     description:
-      "`sweep_up` / `sweep_down` count aggressive prints in the last N bars that ate the ENTIRE visible best-ask/bid size at the moment of trade — level-clearing aggression. `iceberg_at_ask` / `iceberg_at_bid` count bars where the same inside-quote price kept getting hit but size kept refilling (≥70% recovery within the bar), suggesting hidden depth behind the displayed quote. Sweeps are continuation signals; icebergs are reversal / absorption signals. All four REQUIRE a v2 tick session (best_bid/best_ask quote columns).",
+      "Count of aggressive BUY prints over the last N bars that ate the ENTIRE visible best-ask size at the moment of trade — level-clearing aggression. `sizeMin` filters out small clears. Sweeps are continuation signals: when a buyer is willing to chew through all visible supply, more demand usually follows. Requires a v2 tick session.",
     examples: [
       {
         snippet: "signal.long.if = sweep_up(5, 50) >= 2 and close > EMA20",
         scenario: "Two big buy sweeps (50+ contracts each) in the last 5 bars while price is above the trend EMA — momentum continuation.",
       },
+    ],
+  },
+  {
+    group: G_TICK_SWEEP,
+    headline: "sweep_down[N, sizeMin]",
+    forms: ["sweep_down(N, sizeMin=0)"],
+    description:
+      "Mirror of `sweep_up` — counts aggressive SELL prints over the last N bars that ate the entire visible best-bid size. Indicates sellers willing to chew through resting demand. Continuation signal for shorts. Requires a v2 tick session.",
+    examples: [
+      {
+        snippet: "signal.short.if = sweep_down(5, 50) >= 2 and close < EMA20",
+        scenario: "Two big sell sweeps (50+ contracts each) in the last 5 bars below the trend EMA — momentum continuation for shorts.",
+      },
+    ],
+  },
+  {
+    group: G_TICK_SWEEP,
+    headline: "iceberg_at_ask[N, minRefills]",
+    forms: ["iceberg_at_ask(N, minRefills=3)"],
+    description:
+      "Count of bars over the last N where the SAME inside-quote price kept getting hit at the ask but resting size kept refilling (≥70% recovery within the bar). Implies a hidden supply order behind the displayed quote. Reversal / absorption signal — supply is defending a price level.",
+    examples: [
       {
         snippet: "signal.short.if = iceberg_at_ask(10, 3) > 0 and ha_close() < ha_open()",
         scenario: "Heavy iceberg defending the ask AND Heiken Ashi turning red → fade the rally into hidden supply.",
       },
     ],
   },
+  {
+    group: G_TICK_SWEEP,
+    headline: "iceberg_at_bid[N, minRefills]",
+    forms: ["iceberg_at_bid(N, minRefills=3)"],
+    description:
+      "Mirror of `iceberg_at_ask` — counts bars where hidden DEMAND kept refilling at the bid after being hit. A hidden buyer absorbing supply at a level. Reversal signal for an uptrend setup.",
+    examples: [
+      {
+        snippet: "signal.long.if = iceberg_at_bid(10, 3) > 0 and ha_close() > ha_open()",
+        scenario: "Hidden buyer absorbing at the bid AND Heiken Ashi turning green → fade the dip into hidden demand.",
+      },
+    ],
+  },
 
   // ─── Bar-level smoothing & compression ──────────────────────────────
   {
-    group: G_TICK_MICRO,
-    headline: "Heiken Ashi & Squeeze",
-    forms: [
-      "ha_open()", "ha_high()", "ha_low()", "ha_close()",
-      "squeeze_on(N=20, multBB=2, multKC=1.5)",
-      "squeeze_fire(N=20, multBB=2, multKC=1.5)",
-    ],
+    group: G_BAR_SMOOTHING,
+    headline: "Heiken Ashi candle",
+    forms: ["ha_open()", "ha_high()", "ha_low()", "ha_close()"],
     description:
-      "Heiken Ashi candles smooth raw OHLC by referencing the PRIOR HA candle (not the prior raw bar) — long unbroken HA color runs signal sustained trend. `squeeze_on` is 1 when Bollinger bands sit INSIDE the Keltner channel (volatility compression); `squeeze_fire` is 1 only on the exact bar where the squeeze releases. Pure OHLC math — works on ANY granularity, no tick data needed.",
+      "Heiken Ashi candles smooth raw OHLC by referencing the PRIOR HA candle's open/close (not the prior raw bar) — long unbroken runs of same-color HA bars signal sustained trend. `ha_close > ha_open` = green/bullish HA bar; reverse = red/bearish. Pure OHLC math, works on any granularity. The four functions return the smoothed open, high, low, and close of the current HA candle.",
     examples: [
       {
         snippet: "filter.if = ha_close() > ha_open()",
         scenario: "Trend filter — only take longs on green Heiken Ashi bars, no whipsaws from single noisy candles.",
       },
+      {
+        snippet: "filter.if = ha_close() > ha_open() && ha_low() > ha_open()",
+        scenario: "Strict trend filter — green HA bar AND no lower wick (textbook strong-trend HA pattern).",
+      },
+    ],
+  },
+  {
+    group: G_BAR_SMOOTHING,
+    headline: "squeeze_on[N, multBB, multKC]",
+    forms: ["squeeze_on(N=20, multBB=2, multKC=1.5)"],
+    description:
+      "Returns 1 when the Bollinger Bands sit ENTIRELY INSIDE the Keltner Channel — i.e. volatility has compressed to a level below the Keltner band width. The classic \"coiled spring\" state. Stays 1 for as long as the compression lasts. Pair with directional logic to bias which way the eventual expansion will go.",
+    examples: [
+      {
+        snippet: "filter.if = squeeze_on(20) == 1",
+        scenario: "Only consider trades while volatility is compressed — pre-positioning for the eventual breakout.",
+      },
+    ],
+  },
+  {
+    group: G_BAR_SMOOTHING,
+    headline: "squeeze_fire[N, multBB, multKC]",
+    forms: ["squeeze_fire(N=20, multBB=2, multKC=1.5)"],
+    description:
+      "Returns 1 ONLY on the exact bar where `squeeze_on` flips from 1 to 0 — i.e. the bar where compression releases and volatility expands. Single-bar event signal. Best used to trigger entries timed to the expansion, with a separate filter picking the side.",
+    examples: [
       {
         snippet: "signal.long.if = squeeze_fire(20) == 1 and close > EMA20",
         scenario: "Take longs only on the squeeze-release bar when price is above the trend EMA — directional bias for the compression release.",
