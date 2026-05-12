@@ -904,6 +904,32 @@ const INDICATOR_FAMILIES: IndicatorFamily[] = [
       },
     ],
   },
+  {
+    group: G_STATS,
+    headline: "znorm[expr, period]",
+    forms: ["znorm(expr, period)"],
+    description:
+      "Rolling z-score of ANY expression over the last N bars. Where Zscore is hard-wired to price, znorm normalizes whatever you put inside — `znorm(spread(20), 200)`, `znorm(RSI(14) - 50, 100)`, `znorm(quote_imbalance(20) - tick_imbalance(20), 200)`. Output is unbounded but typically lives in [-3, +3]; 0 means \"average\", ±2 means \"unusually far from its N-bar baseline\". The period MUST be a literal positive integer (the engine bakes it into the precompute cache key). Returns NaN inside the warmup window; returns 0 on a perfectly flat window.",
+    examples: [
+      {
+        snippet: "let qz = znorm(quote_imbalance(20), 200)\nlet sz = znorm(spread(20), 200)\nfilter.if = qz - sz > 1.5",
+        scenario: "Bring two differently-scaled microstructure metrics onto the same z-score scale, then combine them — buyer-side imbalance with a tight book.",
+      },
+    ],
+  },
+  {
+    group: G_STATS,
+    headline: "mmnorm[expr, period]",
+    forms: ["mmnorm(expr, period)"],
+    description:
+      "Rolling min-max normalization of ANY expression over the last N bars — maps the current value to [0, 1] using the window's min and max. 0 = lowest the inner expression has been in N bars, 1 = highest. Bounded sibling to znorm — pair them when you want one metric on a fixed scale and another as a free-floating signed deviation. Period MUST be a literal positive integer. Returns NaN inside warmup; returns 0.5 when min == max.",
+    examples: [
+      {
+        snippet: "filter.if = mmnorm(spread(20), 200) < 0.3",
+        scenario: "Only enter when the current spread sits in the tightest 30% of the last 200 bars — a liquidity-aware gate that adapts to the session's own regime.",
+      },
+    ],
+  },
 
   // ─── Bar shape & reference prices ────────────────────────────────────
   {
