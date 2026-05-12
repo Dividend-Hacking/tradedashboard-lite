@@ -896,14 +896,63 @@ export function evaluate(expr: Expr, ctx: EvalCtx): number {
       return c !== 0 ? evaluate(expr.then, ctx) : evaluate(expr.else, ctx);
     }
     case "index":
-      // The single-shot expression evaluator has no concept of "series"
-      // or per-bar lookback — that's the strategy evaluator's job. From
-      // this evaluator's perspective `expr[N]` is a not-applicable node;
-      // returning NaN is the same null-as-fail discipline used elsewhere.
-      // Callers using this evaluator (rules/filters) shouldn't write
-      // `[N]` — if they do, they get a clean NaN that propagates.
-      return NaN;
+      // Per-bar lookback: `<base>[k]` evaluates `<base>` at the bar
+      // that's `k` positions back from the current evaluation bar. The
+      // historical NaN-fallback here was correct when this evaluator
+      // had no bar array — entry-time filter.if / numericOverrides
+      // contexts only see a single entry bar. The chart-overlay memo
+      // (`chartDataResult` in backtest-dashboard.tsx) now supplies
+      // `ctx.bars`, which makes the shifted-bar re-evaluation pattern
+      // (mirrored from strategy-evaluator.ts:1476) work transparently
+      // for bare OHLCV idents (`close[5]`), indicator series
+      // (`EMA20[2]`), and arbitrary scalar exprs (`(close - open)[3]`).
+      //
+      // Without `ctx.bars` (the legacy entry-time call sites)
+      // we keep the NaN fallback — those callers shouldn't be writing
+      // `[N]` anyway, and NaN propagates cleanly through downstream
+      // comparisons. Summary context also stays NaN.
+      if (ctx.kind !== "entry") return NaN;
+      return evalIndexEntry(expr.base, expr.offset, ctx);
   }
+}
+
+/** Evaluate `<base>[k]` against a per-bar entry context. Returns NaN
+ *  if (a) `ctx.bars` isn't populated (legacy callers), (b) `k` isn't a
+ *  finite non-negative integer, or (c) the shifted bar would land
+ *  before the start of the bar array. Otherwise builds a shallow ctx
+ *  clone with `bar` and `barIndex` shifted back by `k` and recursively
+ *  evaluates `base` there — indicators look themselves up at the
+ *  shifted index in `indicatorByKey`, bare OHLCV idents read the
+ *  shifted bar's fields. The strategy-evaluator equivalent is at
+ *  strategy-evaluator.ts:1476; we don't share the implementation
+ *  because that version threads a per-bar letCache + SeriesHandle
+ *  values that this evaluator doesn't have. */
+function evalIndexEntry(
+  base: Expr,
+  offset: Expr,
+  ctx: EntryEvalCtx & { kind: "entry" },
+): number {
+  const k = Math.round(evaluate(offset, ctx));
+  if (!Number.isFinite(k) || k < 0) return NaN;
+  if (k === 0) return evaluate(base, ctx);
+  // Bars array required for the shift. Absent on entry-time callers
+  // (filter.if, numericOverrides) — they shouldn't be using `[N]`
+  // syntax anyway, so NaN-as-fail is the right discipline.
+  if (!ctx.bars) return NaN;
+  const shiftedIdx = ctx.barIndex - k;
+  if (shiftedIdx < 0 || shiftedIdx >= ctx.bars.length) return NaN;
+  const shiftedBar = ctx.bars[shiftedIdx];
+  if (!shiftedBar) return NaN;
+  // Shallow clone — share the indicatorByKey + zone + tickConfig refs
+  // since they're already index-aligned to the bars array (the shifted
+  // indicator-series lookup happens in resolveIdent via the new
+  // barIndex). Only bar + barIndex change.
+  const shiftedCtx: EntryEvalCtx & { kind: "entry" } = {
+    ...ctx,
+    bar: shiftedBar,
+    barIndex: shiftedIdx,
+  };
+  return evaluate(base, shiftedCtx);
 }
 
 /** Evaluate an expression as a boolean verdict: true iff the result is
@@ -1031,6 +1080,37 @@ function resolveIdent(name: string, ctx: EvalCtx): number {
       return ctx.tradeResult?.eff_be ?? NaN;
     case "entry_price":
       return ctx.tradeResult?.entry_price ?? NaN;
+    // ── Per-bar trade-context analytics ─────────────────────────────
+    // Populated on per-bar `TradeZoneBar` clones by the chart-overlay
+    // memo (`chartDataResult` in backtest-dashboard.tsx) for every
+    // bar sitting inside a surviving trade's zone. Outside any trade
+    // the field is null/undefined and we return NaN — the chart line
+    // then renders as a gap during non-trade bars, which is the
+    // intended UX. Same null-as-NaN discipline used everywhere else
+    // in this evaluator.
+    //
+    // These aren't gated on `ctx.tradeResult` because trade-summary
+    // outcomes (which is what tradeResult carries) are different from
+    // per-bar walking stats (which is what these idents represent).
+    // E.g. `peak_mfe` is the trade's eventual max favorable excursion
+    // — known only after the exit. `mfe_from_start` at bar i is the
+    // running max favorable as of bar i — meaningful mid-trade.
+    case "bars_since_entry":
+      return bar.bars_since_entry ?? NaN;
+    case "mfe_from_start":
+      return bar.mfe_from_start ?? NaN;
+    case "mae_from_start":
+      return bar.mae_from_start ?? NaN;
+    case "drawdown_from_entry":
+      return bar.drawdown_from_entry ?? NaN;
+    case "runup_from_entry":
+      return bar.runup_from_entry ?? NaN;
+    case "close_vs_entry":
+      return bar.close_vs_entry ?? NaN;
+    case "high_since_entry":
+      return bar.high_since_entry ?? NaN;
+    case "retrace_from_peak":
+      return bar.retrace_from_peak ?? NaN;
     // Exit-reason named constants — let users compare against
     // `exit_reason` without remembering the numeric codes.
     // `EXIT_TARGET` / `EXIT_STOP` are friendly aliases for the
@@ -1467,14 +1547,27 @@ export function indicatorKeyForCall(name: string, args: number[]): string | null
     case "BB_mid":
       return `BBMID:${p}`;
     case "close_n":
+    // `close(N)` is the natural-language form of `close_n(N)` — the
+    // N-bars-ago close. Aliased here so a chart expression like
+    // `chart = close(5)` doesn't return NaN. (Bare `close` without
+    // args remains the current-bar close field; see resolveIdent.)
+    case "close":
       return `CLOSEN:${p}`;
     case "high_n":
+    case "high":
       return `HIGHN:${p}`;
     case "low_n":
+    case "low":
       return `LOWN:${p}`;
     case "open_n":
+    case "open":
       return `OPENN:${p}`;
     case "volume_n":
+      // Intentionally NOT aliasing bare `volume(N)` here: `volume(N)`
+      // and `trailVol(N)` already mean the N-period volume MA (`VOL:N`),
+      // and shadowing that with the lookback semantics would silently
+      // change strategy behavior. Users wanting "volume N bars ago"
+      // write `volume_n(N)` explicitly.
       return `VOLN:${p}`;
     // Multi-arg families — every literal arg participates in the key.
     case "MACD_line":
@@ -4442,13 +4535,23 @@ export function computeIndicatorSeries(
       return hhvSeries(bars, args[0]);
     case "LLV":
       return llvSeries(bars, args[0]);
+    // Bare OHLC names with a numeric arg are aliased to their `_n`
+    // lookback siblings — `close(5)` ≡ `close_n(5)`. The bare-name
+    // form (no parens) still resolves to the current bar's field
+    // via resolveIdent; only the call form routes here. `volume(N)`
+    // is intentionally NOT aliased (it means volume MA, not lookback)
+    // — see indicatorKeyForCall for the same rationale.
     case "close_n":
+    case "close":
       return closeNSeries(bars, args[0]);
     case "high_n":
+    case "high":
       return highNSeries(bars, args[0]);
     case "low_n":
+    case "low":
       return lowNSeries(bars, args[0]);
     case "open_n":
+    case "open":
       return openNSeries(bars, args[0]);
     case "volume_n":
       return volumeNSeries(bars, args[0]);

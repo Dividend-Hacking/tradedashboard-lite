@@ -88,6 +88,12 @@ export interface TradeZoneBar {
   close_vs_entry: number | null; // This bar's P&L vs entry (direction-aware, signed)
   high_since_entry: number | null; // Running best favorable price reached
   retrace_from_peak: number | null; // How much given back from the peak
+  // Bars elapsed since entry — only populated by the chart-overlay
+  // memo (`chartDataResult` in backtest-dashboard.tsx) when this bar
+  // sits inside a surviving trade's zone. The zone simulator itself
+  // doesn't write this field; per-zone bars in `syntheticBarsByZoneId`
+  // leave it null/undefined.
+  bars_since_entry?: number | null;
   created_at: string;
   // ─── Order-flow split (optional) ──────────────────────────────────────
   // Populated only when the source data carries bid/ask attribution

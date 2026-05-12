@@ -71,6 +71,7 @@ import {
   computeSimSummary,
   simulateAllZones,
   resolveTickConfig,
+  tradeResultBindings,
 } from "@/lib/utils/zone-simulator";
 import type { TradeZone, TradeZoneBar } from "@/types/trade-zone";
 import {
@@ -4807,22 +4808,29 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
   //   1. Evaluation walks EVERY bar of the stitched session (not just
   //      surviving-trade entry bars), so the user sees a continuous
   //      line across the whole chart.
-  //   2. Indicator series are computed over the stitched bar array via
-  //      `precomputeIndicatorsForBars` (one flat per-key map) instead
-  //      of the per-zone `precomputeIndicators` used by graphs.
-  //   3. Output shape is `{ title, color, points: {time, value}[] }` —
+  //   2. Indicators are computed PER SESSION (each with its own tick
+  //      context) and stitched into a flat per-key map keyed by stitched
+  //      bar index. This (a) lets tick-based indicators (POC, VAH, VAL,
+  //      footprint, sweep, iceberg, top-of-book quotes, etc.) work
+  //      against each session's tick blob, and (b) prevents cross-
+  //      session indicator-warmup bleed (an SMA(200) at the start of
+  //      session 2 only sees session 2's prior bars).
+  //   3. When a bar sits inside a surviving trade's zone, per-bar
+  //      trade-context fields (`bars_since_entry`, `mfe_from_start`,
+  //      `drawdown_from_entry`, etc.) are computed on a shallow bar
+  //      clone, and `ctx.zone` / `ctx.tradeResult` are populated from
+  //      the active trade. Outside any trade those idents resolve to
+  //      NaN (gap in the line — the desired UX). On overlap, the
+  //      most-recently-entered surviving trade wins.
+  //   4. `ctx.bars` is the stitched bar array, which makes the
+  //      shifted-bar lookback path in evalIndex (script-expr.ts) work
+  //      — so `close[5]`, `EMA20[2]`, `cross_up(close, EMA50)`, etc.
+  //      all resolve correctly across the chart.
+  //   5. Output shape is `{ title, color, points: {time, value}[] }` —
   //      lightweight-charts-ready, with `time` already converted to
   //      UTC seconds via `rawTimestampToUnix`. Non-finite values are
-  //      dropped, which renders as gaps in the line (warmup window).
-  //
-  // Tick context is intentionally NOT threaded in v1: the chart memo
-  // operates on the stitched session bar array, but the engine's
-  // per-session `syntheticTickCtxByZoneId` is keyed by synthetic
-  // zone id (and tick data isn't aligned to the chart's stitched
-  // index space). Tick-required indicators (POC/VAH/VAL, footprint,
-  // CVD) therefore degrade to NaN — same fallback they hit in
-  // plain-OHLCV sessions. Adding stitched tick context is a v1.1
-  // follow-up if users need volume-profile overlays on the chart.
+  //      dropped, which renders as gaps in the line (warmup window
+  //      and out-of-trade bars).
   const chartDataResult = useMemo<
     Array<{
       title: string;
@@ -4831,88 +4839,259 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
     }>
   >(() => {
     const directives = runResult.chartDirectives;
-    const bars = scriptChartInputs.bars;
-    if (!directives || directives.length === 0 || bars.length === 0) {
+    const stitchedBars = scriptChartInputs.bars;
+    if (!directives || directives.length === 0 || stitchedBars.length === 0) {
       return [];
     }
+    const exprs = directives.map((d) => d.expr);
+
     // Instrument is unique by virtue of scriptChartInputs' multi-
     // instrument guard above. Pull it from the first selected
     // session's metadata. Falls back to "" (then resolveTickConfig
     // returns the default tick config) if for some reason the
-    // session lookup misses — non-fatal, just slightly wrong dollar
-    // math for the rare `point(n)` / `ticks(n)` reference inside a
-    // chart expression.
-    let instrument = "";
-    for (const id of selectedSessionIds) {
-      const sess = sessions.find((s) => s.id === id);
-      if (sess) {
-        instrument = sess.instrument;
-        break;
-      }
-    }
+    // session lookup misses.
+    const orderedSessions: ReplaySession[] = Array.from(selectedSessionIds)
+      .map((id) => sessions.find((s) => s.id === id))
+      .filter((s): s is ReplaySession => !!s)
+      .sort((a, b) => a.start_time.localeCompare(b.start_time));
+    const instrument = orderedSessions[0]?.instrument ?? "";
     const tickCfg = resolveTickConfig(instrument, rules);
 
-    // ReplayBar is structurally compatible with IndicatorBar (same
-    // OHLCV + bar_time + optional bid/ask volume fields), so the
-    // stitched bar array goes in directly with a cast at the call site.
-    const indicatorByKey = precomputeIndicatorsForBars(
-      bars as unknown as import("@/lib/indicators/calculations").IndicatorBar[],
-      directives.map((d) => d.expr),
-    );
+    // ── Per-session indicator compute + stitch into one flat map ───
+    // Each entry in `indicatorByKey` is a `number[]` of length
+    // `stitchedBars.length`, initialized to NaN and filled in by
+    // writing each session's per-bar values at the stitched index
+    // looked up via `barTime → stitchedIdx`. Sessions are processed
+    // in date order; if two sessions happen to share a bar_time
+    // (which the dedupe in scriptChartInputs collapses to one
+    // stitched row), the later session's value wins. Acceptable —
+    // overlap is rare and either source is a valid per-session
+    // indicator value for that bar.
+    const barTimeToStitchedIdx = new Map<string, number>();
+    for (let i = 0; i < stitchedBars.length; i++) {
+      barTimeToStitchedIdx.set(stitchedBars[i].bar_time, i);
+    }
+    const indicatorByKey = new Map<string, number[]>();
+    for (const sess of orderedSessions) {
+      const sessionBars = barsBySessionId.get(sess.id) ?? [];
+      if (sessionBars.length === 0) continue;
+      // Build the session's tick context from the same refs the
+      // engine read at Run time. When the session has no ticks
+      // attached, sessionTickCtx stays undefined and tick-required
+      // indicators degrade to all-NaN inside
+      // `precomputeIndicatorsForBars`.
+      const sessionTicks = ticksBySessionIdRef.current.get(sess.id);
+      const sessionTickRanges = tickRangesBySessionIdRef.current.get(sess.id);
+      const sessionTickCtx: TickContext | undefined =
+        sessionTicks && sessionTickRanges
+          ? { ticks: sessionTicks, barTickRanges: sessionTickRanges }
+          : undefined;
+      const perSession = precomputeIndicatorsForBars(
+        sessionBars as unknown as import("@/lib/indicators/calculations").IndicatorBar[],
+        exprs,
+        sessionTickCtx,
+      );
+      for (const [key, series] of perSession) {
+        let flat = indicatorByKey.get(key);
+        if (!flat) {
+          flat = new Array(stitchedBars.length).fill(NaN);
+          indicatorByKey.set(key, flat);
+        }
+        // Merge rule: prefer the first session that contributes a
+        // finite value at any given stitched slot. If session A
+        // (processed earlier) already has SMA(200) warmed up at a
+        // shared bar, don't let session B's warmup-NaN clobber it.
+        // Equivalent to "earliest session with enough history wins."
+        for (let j = 0; j < sessionBars.length; j++) {
+          const stIdx = barTimeToStitchedIdx.get(sessionBars[j].bar_time);
+          if (stIdx === undefined) continue;
+          if (Number.isFinite(flat[stIdx])) continue;
+          flat[stIdx] = series[j];
+        }
+      }
+    }
 
-    // Synthetic zone — `EntryEvalCtx.zone` is required by the type but
-    // chart expressions don't have a trade context. We supply a stub
-    // with direction=Long (so any stray `direction` reference resolves
-    // to a finite +1 instead of NaN) and the first bar as the entry
-    // anchor. Zone-only ident lookups (`bars_since_entry`, `entry_price`,
-    // etc.) evaluate against this stub and return whatever the
-    // evaluator's fallbacks produce — usually NaN, which translates to
-    // a gap in the rendered line.
-    const syntheticZone = {
+    // ── Active-trade snapshots per stitched bar ────────────────────
+    // For each surviving trade, locate its entry/exit in the stitched
+    // array via bar_time match and walk forward maintaining direction-
+    // aware MFE/MAE/drawdown/runup/retrace stats. Per-bar snapshots
+    // populate the trade-context fields on a `TradeZoneBar` clone at
+    // eval time. Overlap rule: index by stitched entry idx; for each
+    // bar, the active trade is the most-recently-entered trade whose
+    // exit hasn't passed. Built in O(N + trades × tradeLen).
+    type Snap = {
+      trade: SimZoneResult;
+      zone: TradeZone | null;
+      barsSinceEntry: number;
+      closeVsEntry: number;
+      mfe: number;        // running max favorable (signed-positive)
+      mae: number;        // running max adverse (signed-positive)
+      highSinceEntry: number; // direction-aware best favorable price
+      retraceFromPeak: number;
+    };
+    const zoneById = new Map<number, TradeZone>();
+    for (const z of runResult.syntheticZones) zoneById.set(z.id, z);
+    const snapByStitchedIdx: Array<Snap | null> = new Array(
+      stitchedBars.length,
+    ).fill(null);
+    // Sort trades by entry stitched index so later iterations naturally
+    // overwrite earlier ones on overlap — the most-recently-entered
+    // trade ends up as the snapshot at any shared bar.
+    const tradesSorted = [...trades].sort((a, b) =>
+      a.startTime.localeCompare(b.startTime),
+    );
+    for (const t of tradesSorted) {
+      const entryIdx = barTimeToStitchedIdx.get(t.startTime);
+      const exitIdx = barTimeToStitchedIdx.get(t.exitTime);
+      if (entryIdx === undefined || exitIdx === undefined) continue;
+      if (exitIdx < entryIdx) continue;
+      const zone = zoneById.get(t.zoneId) ?? null;
+      const entryPrice = zone?.start_price ?? stitchedBars[entryIdx].bar_close;
+      const isLong = t.direction === "Long";
+      // Walk forward from entry to exit. high_since_entry is direction-
+      // aware: for a long it's the running max(bar_high), for a short
+      // it's the running min(bar_low). The "favorable" / "adverse"
+      // magnitudes are always reported as positive points so the user
+      // sees consistent numbers regardless of trade direction (matches
+      // the simulator's peak_mfe / max_drawdown convention).
+      let bestFavorablePrice = isLong
+        ? stitchedBars[entryIdx].bar_high
+        : stitchedBars[entryIdx].bar_low;
+      let mfe = 0;
+      let mae = 0;
+      for (let i = entryIdx; i <= exitIdx && i < stitchedBars.length; i++) {
+        const bar = stitchedBars[i];
+        if (isLong) {
+          if (bar.bar_high > bestFavorablePrice) {
+            bestFavorablePrice = bar.bar_high;
+          }
+          const favorable = Math.max(0, bar.bar_high - entryPrice);
+          const adverse = Math.max(0, entryPrice - bar.bar_low);
+          if (favorable > mfe) mfe = favorable;
+          if (adverse > mae) mae = adverse;
+        } else {
+          if (bar.bar_low < bestFavorablePrice) {
+            bestFavorablePrice = bar.bar_low;
+          }
+          const favorable = Math.max(0, entryPrice - bar.bar_low);
+          const adverse = Math.max(0, bar.bar_high - entryPrice);
+          if (favorable > mfe) mfe = favorable;
+          if (adverse > mae) mae = adverse;
+        }
+        const closeVsEntry = isLong
+          ? bar.bar_close - entryPrice
+          : entryPrice - bar.bar_close;
+        const retraceFromPeak = isLong
+          ? bestFavorablePrice - bar.bar_close
+          : bar.bar_close - bestFavorablePrice;
+        snapByStitchedIdx[i] = {
+          trade: t,
+          zone,
+          barsSinceEntry: i - entryIdx,
+          closeVsEntry,
+          mfe,
+          mae,
+          highSinceEntry: bestFavorablePrice,
+          retraceFromPeak,
+        };
+      }
+    }
+
+    // Default synthetic zone for bars outside any trade — same v1
+    // behavior. direction=Long so a stray `direction` reference at
+    // a no-trade bar resolves to +1 rather than NaN; everything else
+    // is irrelevant because no trade-context ident will hit a
+    // populated bar field outside a trade.
+    const defaultZone = {
       id: -1,
       instrument,
       direction: "Long",
-      start_time: bars[0].bar_time,
-      start_price: bars[0].bar_close,
+      start_time: stitchedBars[0].bar_time,
+      start_price: stitchedBars[0].bar_close,
     } as unknown as TradeZone;
 
-    return directives.map((d) => {
-      const points: Array<{ time: number; value: number }> = [];
-      for (let i = 0; i < bars.length; i++) {
-        const bar = bars[i];
-        const ctx: EntryEvalCtx = {
-          bar: bar as unknown as TradeZoneBar,
-          // Use the stitched-array index, not bar.bar_index — the
-          // indicator series above is aligned to the stitched array,
-          // so any other index would mis-look-up.
-          barIndex: i,
-          indicatorByKey,
-          zone: syntheticZone,
-          tickConfig: {
-            ticksPerPoint: tickCfg.ticksPerPoint,
-            tickValue: tickCfg.tickValue,
-            pointValue: tickCfg.pointValue,
-          },
+    // Cast the bars array once — the evaluator only reads OHLCV +
+    // bar_time + (now, on clones) the optional trade-context fields,
+    // which ReplayBar covers structurally aside from the cast. The
+    // `bars` field on the EvalCtx is what makes evalIndex's shifted-
+    // bar lookback path work.
+    const ctxBars = stitchedBars as unknown as TradeZoneBar[];
+
+    // Outer loop over bars (build ctx once), inner loop over
+    // directives — saves M-1 ctx allocations per bar at typical
+    // directive counts (4–8).
+    const results = directives.map((d) => ({
+      title: d.title,
+      color: d.color,
+      points: [] as Array<{ time: number; value: number }>,
+    }));
+    for (let i = 0; i < stitchedBars.length; i++) {
+      const bar = stitchedBars[i];
+      const snap = snapByStitchedIdx[i];
+      let ctxBar: TradeZoneBar;
+      let ctxZone: TradeZone;
+      let ctxTradeResult: ReturnType<typeof tradeResultBindings> | undefined;
+      if (snap) {
+        // Shallow-clone the bar with per-bar trade-context fields
+        // populated. The fields already exist on the TradeZoneBar
+        // type as nullable (see src/types/trade-zone.ts:83–90),
+        // plus the new `bars_since_entry` slot we added in this
+        // change. resolveIdent reads them via `bar.<field> ?? NaN`.
+        ctxBar = {
+          ...(bar as unknown as TradeZoneBar),
+          bars_since_entry: snap.barsSinceEntry,
+          close_vs_entry: snap.closeVsEntry,
+          mfe_from_start: snap.mfe,
+          mae_from_start: snap.mae,
+          drawdown_from_entry: snap.mae,
+          runup_from_entry: snap.mfe,
+          high_since_entry: snap.highSinceEntry,
+          retrace_from_peak: snap.retraceFromPeak,
         };
-        const v = evaluate(d.expr, { kind: "entry", ...ctx });
+        ctxZone = snap.zone ?? defaultZone;
+        // entry_price for the synthetic tradeResult comes from the
+        // real zone's start_price when available; falls back to the
+        // current bar's close (matches the snapshot's entryPrice
+        // default above) to keep `entry_price` finite within the
+        // trade even on legacy zones missing start_price.
+        const entryPrice =
+          snap.zone?.start_price ?? bar.bar_close;
+        ctxTradeResult = tradeResultBindings(snap.trade, entryPrice);
+      } else {
+        ctxBar = bar as unknown as TradeZoneBar;
+        ctxZone = defaultZone;
+        ctxTradeResult = undefined;
+      }
+      const ctx: EntryEvalCtx = {
+        bar: ctxBar,
+        barIndex: i,
+        indicatorByKey,
+        zone: ctxZone,
+        bars: ctxBars,
+        tickConfig: {
+          ticksPerPoint: tickCfg.ticksPerPoint,
+          tickValue: tickCfg.tickValue,
+          pointValue: tickCfg.pointValue,
+        },
+        tradeResult: ctxTradeResult,
+      };
+      const time = Math.floor(rawTimestampToUnix(bar.bar_time));
+      for (let d = 0; d < directives.length; d++) {
+        const v = evaluate(directives[d].expr, { kind: "entry", ...ctx });
         if (Number.isFinite(v)) {
-          // lightweight-charts uses UTCTimestamp (unix seconds, int).
-          // Match how BacktestScriptChart already converts marker times
-          // so the overlay points land on the same x-axis slots as the
-          // candles. Math.floor matches the marker-time convention.
-          points.push({
-            time: Math.floor(rawTimestampToUnix(bar.bar_time)),
-            value: v,
-          });
+          results[d].points.push({ time, value: v });
         }
       }
-      return { title: d.title, color: d.color, points };
-    });
+    }
+    return results;
   }, [
     runResult.chartDirectives,
+    runResult.syntheticZones,
     scriptChartInputs.bars,
     selectedSessionIds,
     sessions,
+    barsBySessionId,
+    trades,
     rules,
   ]);
 
