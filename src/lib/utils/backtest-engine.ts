@@ -1666,6 +1666,17 @@ export interface BacktestRunResult {
    *  result. Undefined / empty when the script has no `graph` lines or
    *  when the strategy-DSL signal block is absent. */
   graphDirectives?: Array<{ title: string; expr: Expr; source: string }>;
+  /** `chart = <expr>` (and `chart["Title"[, "#hexcolor"]] = <expr>`)
+   *  directives declared in the strategy DSL. Same lifecycle as
+   *  `graphDirectives`: strategy-level (one set per multi-day run),
+   *  let/Kalman rewrites already applied, the dashboard runs each
+   *  expression at EVERY bar of the stitched session and hands the
+   *  resulting time/value series to BacktestScriptChart as a line
+   *  overlay on the price-chart pane. `color` is the user's
+   *  `chart["…", "#hex"] = …` color when explicitly supplied, else
+   *  null (renderer auto-cycles a palette by directive index).
+   *  Undefined / empty when the script has no `chart` lines. */
+  chartDirectives?: Array<{ title: string; color: string | null; expr: Expr; source: string }>;
 }
 
 /** Convert one ReplayBar to a TradeZoneBar with the supplied zone_id and
@@ -1959,6 +1970,10 @@ export function runBacktestForSession(args: {
   // the first session's result since every session in a run sees the
   // same parsed strategy script and therefore the same directive list.
   const stratGraphs = stratEvalResult.graphs;
+  // `chart = <expr>` directives — same strategy-level lifecycle as
+  // graphs above; the dashboard plots them as LineSeries overlays on
+  // the price chart instead of histograms in the segment-analysis grid.
+  const stratCharts = stratEvalResult.charts;
 
   // Rebase signal indices back to session-local space so downstream zone
   // construction (which reads `bars[sig.barIndex]`) stays unchanged. The
@@ -2259,6 +2274,10 @@ export function runBacktestForSession(args: {
     // returned for every session in a multi-day run; the multi-session
     // aggregator copies from the first non-empty result.
     graphDirectives: stratGraphs.length > 0 ? stratGraphs : undefined,
+    // `chart = <expr>` directives — identical strategy-level lifecycle as
+    // graphDirectives. Renderer (BacktestScriptChart) plots them as line
+    // overlays on the price chart instead of histograms.
+    chartDirectives: stratCharts.length > 0 ? stratCharts : undefined,
   };
 }
 
@@ -2314,6 +2333,9 @@ export function runBacktestAcrossSessions(args: {
   // short-circuit and don't run the evaluator). Stays undefined when no
   // session in the run had a populated directive array.
   let graphDirectives: BacktestRunResult["graphDirectives"];
+  // Same logic for chartDirectives — strategy-level, copy from the
+  // first non-empty session result.
+  let chartDirectives: BacktestRunResult["chartDirectives"];
 
   for (const sess of sessions) {
     const r = runBacktestForSession({
@@ -2343,6 +2365,9 @@ export function runBacktestAcrossSessions(args: {
     if (!graphDirectives && r.graphDirectives && r.graphDirectives.length > 0) {
       graphDirectives = r.graphDirectives;
     }
+    if (!chartDirectives && r.chartDirectives && r.chartDirectives.length > 0) {
+      chartDirectives = r.chartDirectives;
+    }
   }
 
   // Sort trades chronologically so the equity curve / per-day chart render in
@@ -2361,6 +2386,7 @@ export function runBacktestAcrossSessions(args: {
     syntheticTickCtxByZoneId: allTickCtx,
     totalSignals,
     graphDirectives,
+    chartDirectives,
   };
 }
 

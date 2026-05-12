@@ -87,7 +87,44 @@ interface BacktestScriptChartProps {
    *  itself is left blank. Used for "no sessions selected" / "mixed
    *  instruments" / etc. — see scriptChartInputs in backtest-dashboard.tsx. */
   warning?: string | null;
+  /** `chart = <expr>` directives evaluated at every stitched-session
+   *  bar by the dashboard memo. Each entry becomes one LineSeries on
+   *  the chart:
+   *
+   *   - Series whose value range fits inside the price envelope
+   *     (price min/max widened by ±20%) render on the price pane.
+   *   - Series outside that envelope (RSI 0-100, ATR, oscillators)
+   *     each get their own sub-pane below the candles.
+   *
+   *  `color` is the user-specified hex string (`chart["...", "#hex"]
+   *  = …`) or null to auto-cycle from a built-in palette by directive
+   *  index. `points` are already converted to UTCTimestamp (unix
+   *  seconds) and pre-filtered to finite values, so they go straight
+   *  into `series.setData(...)` without further preprocessing. Empty /
+   *  omitted when the script declares no `chart` directives. */
+  chartOverlays?: Array<{
+    title: string;
+    color: string | null;
+    points: Array<{ time: number; value: number }>;
+  }>;
 }
+
+/** Auto-cycle palette for `chart = <expr>` directives that didn't get
+ *  an explicit color. Chosen to read well on the chart's dark background
+ *  (`#111118`) and avoid colliding with the existing marker colors
+ *  (blue/purple/orange/green/red are all already taken by signals + trade
+ *  markers, so we lead with a teal that nothing else uses, then cycle
+ *  through warm/cool to maximize contrast between adjacent series). */
+const CHART_OVERLAY_PALETTE = [
+  "#22d3ee", // cyan-400 — distinctive vs every existing marker color
+  "#fbbf24", // amber-400
+  "#a78bfa", // violet-400
+  "#34d399", // emerald-400
+  "#f472b6", // pink-400
+  "#facc15", // yellow-400
+  "#60a5fa", // blue-400
+  "#fb923c", // orange-400
+];
 
 // ─── Helpers ──────────────────────────────────────────────────────────────
 
@@ -115,6 +152,7 @@ export default function BacktestScriptChart({
   onToggleSignals,
   onToggleTrades,
   warning,
+  chartOverlays,
 }: BacktestScriptChartProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const chartRef = useRef<IChartApi | null>(null);
@@ -126,6 +164,16 @@ export default function BacktestScriptChart({
    *  typical trade counts) and avoid stale segments piling up after
    *  the user toggles layers or applies a new script. */
   const tradeLineSeriesRef = useRef<ISeriesApi<"Line">[]>([]);
+  /** One LineSeries per `chart = <expr>` directive — overlays the
+   *  candles (or sits in its own sub-pane below them, for series
+   *  outside the price range). Same lifecycle as `tradeLineSeriesRef`:
+   *  wiped + recreated on every render of the overlay effect, so the
+   *  set always matches the current `chartOverlays` prop exactly.
+   *  Also tracks the resolved color per series so the legend swatches
+   *  rendered in the toolbar stay in sync with the on-chart line
+   *  colors (the resolution happens inside the effect — color may
+   *  come from the directive's explicit hex or from the palette). */
+  const overlaySeriesRef = useRef<ISeriesApi<"Line">[]>([]);
 
   // ─── Chart creation (once on mount) ────────────────────────────────────
   // Mirrors replay-chart.tsx:178-244 — same dark theme + grid colors so the
@@ -204,6 +252,10 @@ export default function BacktestScriptChart({
       // stale series objects that throw "Value is undefined" when
       // `chart.removeSeries(ls)` runs against the freshly recreated chart.
       tradeLineSeriesRef.current = [];
+      // Same rationale for the chart-overlay series — chart.remove()
+      // disposed them, so the refs must be cleared before the overlay
+      // effect runs again against the recreated chart.
+      overlaySeriesRef.current = [];
     };
   }, []);
 
@@ -399,6 +451,147 @@ export default function BacktestScriptChart({
     }
   }, [trades, signalZones, showTrades, bars]);
 
+  // ─── Chart overlay LineSeries ───────────────────────────────────────────
+  // Renders the dashboard's `chart = <expr>` directives. One LineSeries per
+  // directive, with two placement rules:
+  //
+  //   1. PRICE PANE — if the directive's value range fits inside the price
+  //      envelope (min/max of bar close, widened ±20%), the line lives on
+  //      paneIndex 0 alongside the candles. This is what the user wants
+  //      for SMA/EMA/VWAP/Bollinger-style overlays.
+  //
+  //   2. SUB-PANE — if the value range is out-of-bounds (RSI 0-100, ATR
+  //      small absolutes, MACD around zero), the line gets its own pane
+  //      below the candles. Each out-of-range overlay gets a fresh
+  //      paneIndex, so multiple oscillators don't crammed onto one scale.
+  //
+  // Rebuilds every render (same brute-force pattern as the trade lines —
+  // typical directive counts are <5 so removeSeries + addSeries is fine).
+  // The price-pane stretchFactor is bumped up so the candles stay
+  // dominant even when 1–3 sub-panes are present.
+  useEffect(() => {
+    const chart = chartRef.current;
+    if (!chart) return;
+
+    // Wipe prior overlay series, same pattern as the trade-line effect.
+    // try/catch handles the strict-mode double-mount case where a stale
+    // series ref points at a disposed object.
+    for (const ls of overlaySeriesRef.current) {
+      try {
+        chart.removeSeries(ls);
+      } catch {
+        // Series already detached.
+      }
+    }
+    overlaySeriesRef.current = [];
+
+    if (!chartOverlays || chartOverlays.length === 0 || bars.length === 0) {
+      // No overlays — also reset the price pane's stretch factor so a
+      // chart that used to have sub-panes doesn't keep a tall price pane
+      // after the user removes their `chart = ...` lines.
+      try {
+        const panes = chart.panes();
+        if (panes.length > 0) panes[0].setStretchFactor(1);
+      } catch {
+        // panes() API only exists in lightweight-charts v5; older
+        // versions throw. The catch keeps the component working in
+        // either case — we just lose the auto-resize polish.
+      }
+      return;
+    }
+
+    // Price envelope — used to decide which overlays fit on the price
+    // pane vs need their own sub-pane. ±20% padding keeps near-the-money
+    // moving averages (e.g. an SMA that occasionally pokes outside the
+    // visible candle range) on the price pane rather than getting
+    // unexpectedly punted to a sub-pane.
+    let minPrice = Infinity;
+    let maxPrice = -Infinity;
+    for (const b of bars) {
+      if (b.bar_low < minPrice) minPrice = b.bar_low;
+      if (b.bar_high > maxPrice) maxPrice = b.bar_high;
+    }
+    const priceRange = maxPrice - minPrice;
+    const envelopeLo = minPrice - priceRange * 0.2;
+    const envelopeHi = maxPrice + priceRange * 0.2;
+
+    // Allocate paneIndex per overlay. paneIndex 0 = price pane. Each
+    // out-of-range overlay gets the next available index — they don't
+    // share (could group by similar value range in v1.1).
+    let nextSubPane = 1;
+    const paneAssignments: number[] = chartOverlays.map((ov) => {
+      if (ov.points.length === 0) return 0; // empty series — pane choice doesn't matter
+      let lo = Infinity;
+      let hi = -Infinity;
+      for (const p of ov.points) {
+        if (p.value < lo) lo = p.value;
+        if (p.value > hi) hi = p.value;
+      }
+      // Fits in the price envelope → price pane. Otherwise dedicated
+      // sub-pane (and bump the counter so the next out-of-range overlay
+      // doesn't collide).
+      if (lo >= envelopeLo && hi <= envelopeHi) return 0;
+      return nextSubPane++;
+    });
+
+    // Pane stretch factors — keep the price pane dominant. Default v5
+    // behavior is to give every pane equal weight; with 2 sub-panes that
+    // shrinks candles to 1/3 of the chart height, which is awful UX.
+    // We set price=3 and each sub-pane=1, so the price pane takes ~60%
+    // with one sub-pane, ~50% with two, ~43% with three. Wrapped in
+    // try/catch for the same reason as the wipe block above.
+    try {
+      const subPaneCount = nextSubPane - 1;
+      const panes = chart.panes();
+      if (panes.length > 0) {
+        panes[0].setStretchFactor(subPaneCount > 0 ? 3 : 1);
+      }
+    } catch {
+      // panes() API not available — drop the polish, keep working.
+    }
+
+    // Create each overlay series. setData runs after addSeries so the
+    // newly-created series's data is already populated by the time
+    // lightweight-charts triggers its first paint pass.
+    chartOverlays.forEach((ov, i) => {
+      const color =
+        ov.color ?? CHART_OVERLAY_PALETTE[i % CHART_OVERLAY_PALETTE.length];
+      const paneIndex = paneAssignments[i];
+      const lineSeries = chart.addSeries(
+        LineSeries,
+        {
+          color,
+          lineWidth: 2,
+          lineStyle: 0, // Solid — overlays are continuous indicator values.
+          // Keep the right-axis tag visible on indicator lines — useful
+          // for "what's the current SMA value" at a glance — but drop
+          // the price-line clutter and the crosshair marker (which
+          // would otherwise add a dot at the current bar that competes
+          // visually with the candle's body).
+          priceLineVisible: false,
+          lastValueVisible: true,
+          crosshairMarkerVisible: false,
+          // Title shows up in lightweight-charts' built-in legend hover;
+          // we don't enable that legend (we render our own swatch row
+          // in the toolbar), but the title still surfaces in
+          // accessibility tooltips and any future hover popup.
+          title: ov.title,
+        },
+        paneIndex,
+      );
+      // Points are already pre-sorted by time (the dashboard memo walks
+      // bars in stitched order) and filtered to finite values, so
+      // setData accepts them verbatim. lightweight-charts treats a
+      // single-point gap (i.e. an absent timestamp) as a line break,
+      // so warmup NaNs that we dropped upstream render as expected
+      // "no line yet" at the start of the session.
+      lineSeries.setData(
+        ov.points.map((p) => ({ time: p.time as Time, value: p.value })),
+      );
+      overlaySeriesRef.current.push(lineSeries);
+    });
+  }, [chartOverlays, bars]);
+
   // ─── Render ─────────────────────────────────────────────────────────────
   // Layout: a sticky panel that mirrors the right-rail's sticky behavior so
   // the chart stays visible while the user scrolls the page (e.g. to read
@@ -464,6 +657,35 @@ export default function BacktestScriptChart({
           <span className="text-foreground">Trades</span>
           <span className="text-muted-foreground">({tradeCount})</span>
         </label>
+        {/* Chart overlay legend — one swatch + title per `chart = <expr>`
+            directive. Colors mirror exactly what the overlay effect uses
+            (explicit hex from the directive, else the next palette
+            entry by index) so the toolbar reads as a legend. No
+            checkbox: overlays don't have a runtime toggle in v1; the
+            user adds or removes them by editing the script. */}
+        {chartOverlays && chartOverlays.length > 0 && (
+          <>
+            <span className="text-xs text-muted-foreground">|</span>
+            {chartOverlays.map((ov, i) => {
+              const color =
+                ov.color ?? CHART_OVERLAY_PALETTE[i % CHART_OVERLAY_PALETTE.length];
+              return (
+                <div
+                  key={`overlay-${i}-${ov.title}`}
+                  className="flex items-center gap-1.5 text-xs"
+                  title={ov.title}
+                >
+                  <span
+                    className="inline-block w-2 h-2 rounded-full"
+                    style={{ backgroundColor: color }}
+                    aria-hidden
+                  />
+                  <span className="text-foreground">{ov.title}</span>
+                </div>
+              );
+            })}
+          </>
+        )}
       </div>
 
       {/* Warning banner — non-null when the chart can't render meaningfully

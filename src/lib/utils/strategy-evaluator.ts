@@ -94,7 +94,19 @@ export type Stmt =
   // via the same <PnlByCategory> component the built-in dimensions
   // already use. `title` defaults to a trimmed slice of the RHS source
   // when no explicit `["..."]` label is supplied.
-  | { kind: "graph"; title: string; expr: Expr; line: number; source: string };
+  | { kind: "graph"; title: string; expr: Expr; line: number; source: string }
+  // `chart = <expr>` or `chart["Title"[, "#hexcolor"]] = <expr>` —
+  // declares a per-bar overlay line that BacktestScriptChart draws on
+  // the candlestick view. The expr is evaluated at EVERY bar in the
+  // stitched session (not just at trade-entry bars, the way `graph`
+  // is) and rendered as a TradingView LineSeries. Series whose value
+  // range fits inside the price envelope render on the price pane;
+  // out-of-range series (RSI, ATR, ...) get their own sub-pane below.
+  // `color` is `null` when the user omitted the explicit hex string —
+  // the renderer then picks from an auto-cycle palette by directive
+  // index. `title` defaults to a trimmed slice of the RHS source when
+  // no explicit `["..."]` label is supplied.
+  | { kind: "chart"; title: string; color: string | null; expr: Expr; line: number; source: string };
 
 export interface ParseError {
   line: number;
@@ -324,6 +336,59 @@ export function parseStrategyScript(text: string): ParsedStrategyScript {
       stmts.push({
         kind: "graph",
         title,
+        expr: c.expr,
+        line: ll.line,
+        source: rhs,
+      });
+      continue;
+    }
+
+    // `chart = <expr>` or `chart["Title"[, "#hexcolor"]] = <expr>` —
+    // declares a per-bar overlay line on the price chart. Mirrors the
+    // `graph` block above (same liftRhs + compile pipeline, so let-
+    // bound idents / inline Optimize / indicator calls all work) but
+    // captures an optional explicit color alongside the title. Must
+    // match BEFORE the generic `path = expr` fallback for the same
+    // reason `graph` does — otherwise `chart = …` would be routed to
+    // the line-based DSL machinery and silently dropped.
+    //
+    // Color syntax: `chart["Title", "#3b82f6"] = …`. The hex string is
+    // accepted in 3/4/6/8 hex-digit forms (`#rgb`, `#rgba`, `#rrggbb`,
+    // `#rrggbbaa`) so the user can drop in a Tailwind palette code or
+    // a fully-specified rgba. When color is omitted the renderer
+    // auto-cycles from a built-in palette by directive index.
+    const chartTitledMatch = trimmed.match(
+      /^chart\s*\[\s*"([^"]+)"(?:\s*,\s*"(#[0-9a-fA-F]{3,8})")?\s*\]\s*=\s*([\s\S]+)$/
+    );
+    const chartPlainMatch = chartTitledMatch
+      ? null
+      : trimmed.match(/^chart\s*=\s*([\s\S]+)$/);
+    if (chartTitledMatch || chartPlainMatch) {
+      const explicitTitle = chartTitledMatch ? chartTitledMatch[1] : null;
+      const explicitColor = chartTitledMatch ? (chartTitledMatch[2] ?? null) : null;
+      const rhs = (chartTitledMatch ? chartTitledMatch[3] : chartPlainMatch![1]).trim();
+      if (rhs === "") {
+        errors.push({
+          line: ll.line,
+          message: `chart: missing expression on the right of '='`,
+          severity: "error",
+        });
+        continue;
+      }
+      const lifted = liftRhs(rhs, ll.line, "chart");
+      if (!lifted.ok) continue;
+      const c = compile(lifted.text);
+      if (!c.ok) {
+        errors.push({ line: ll.line, message: `chart: ${c.error}`, severity: "error" });
+        continue;
+      }
+      // Default title is the trimmed RHS source, capped so the legend
+      // doesn't wrap. Explicit title via `chart["..."]` always wins.
+      const title = explicitTitle ?? (rhs.length > 40 ? `${rhs.slice(0, 39)}…` : rhs);
+      stmts.push({
+        kind: "chart",
+        title,
+        color: explicitColor,
         expr: c.expr,
         line: ll.line,
         source: rhs,
@@ -856,6 +921,17 @@ export interface EvaluateResult {
    *  it without further preprocessing. Empty when the script has no
    *  graph directives. */
   graphs: Array<{ title: string; expr: Expr; source: string }>;
+  /** `chart = <expr>` (and `chart["Title"[, "#hexcolor"]] = <expr>`)
+   *  directives declared in the strategy script. The dashboard
+   *  evaluates each expression at EVERY bar in the stitched session
+   *  (vs `graphs`, which evaluates only at trade-entry bars) and
+   *  passes the resulting time/value series to BacktestScriptChart as
+   *  a LineSeries overlay. Each entry's `expr` has had let/Kalman
+   *  rewrites applied upstream — same as `graphs`. `color` is the
+   *  user-specified hex string (`#3b82f6`) or `null` to auto-cycle
+   *  from the renderer's palette. Empty when the script has no chart
+   *  directives. */
+  charts: Array<{ title: string; color: string | null; expr: Expr; source: string }>;
 }
 
 /** Build the resolved-let-bindings map for a parsed strategy script.
@@ -895,6 +971,11 @@ export function evaluateStrategyScript(opts: EvaluateOptions): EvaluateResult {
   // these exprs are ready for the entry-context evaluator without any
   // additional preprocessing.
   const graphs: Array<{ title: string; expr: Expr; source: string }> = [];
+  // `chart = <expr>` directives — collected alongside graphs. The
+  // dashboard hands these to BacktestScriptChart for per-bar overlay
+  // rendering on the price-chart pane (with auto sub-pane fallback for
+  // out-of-range value ranges).
+  const charts: Array<{ title: string; color: string | null; expr: Expr; source: string }> = [];
 
   for (const s of stmts) {
     if (s.kind === "let") {
@@ -904,6 +985,8 @@ export function evaluateStrategyScript(opts: EvaluateOptions): EvaluateResult {
       else signalShort = s.expr;
     } else if (s.kind === "graph") {
       graphs.push({ title: s.title, expr: s.expr, source: s.source });
+    } else if (s.kind === "chart") {
+      charts.push({ title: s.title, color: s.color, expr: s.expr, source: s.source });
     } else {
       assigns.push({ path: s.path, expr: s.expr, source: s.source });
     }
@@ -912,7 +995,7 @@ export function evaluateStrategyScript(opts: EvaluateOptions): EvaluateResult {
   const letBindings = buildLetBindings(stmts);
 
   if (!signalLong && !signalShort) {
-    return { signals: [], assigns, letBindings, graphs };
+    return { signals: [], assigns, letBindings, graphs, charts };
   }
 
   // Build the per-run shared state. Preserve bid/ask volumes so any
@@ -1038,7 +1121,7 @@ export function evaluateStrategyScript(opts: EvaluateOptions): EvaluateResult {
     }
   }
 
-  return { signals, assigns, letBindings, graphs };
+  return { signals, assigns, letBindings, graphs, charts };
 }
 
 /** Read the per-bar diag-dump config from localStorage. Used by the

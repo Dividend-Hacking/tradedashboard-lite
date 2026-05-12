@@ -4740,6 +4740,61 @@ export function computeIndicatorSeries(
  *  without it, looking up an indicator at bar_index 0 always lands inside
  *  the warmup window and returns NaN (which the per-trade prints table
  *  renders as "–"). */
+/** Single-bar-array sibling to `precomputeIndicators`. Used by the
+ *  `chart = <expr>` directive's dashboard memo, which evaluates each
+ *  directive at EVERY bar of the stitched session (not just at trade
+ *  entries) and so wants one flat per-key series rather than a per-zone
+ *  map. Shares the inner machinery — `gatherRequiredSeries` dedup,
+ *  `computeIndicatorSeries` dispatch, and the same set of per-series
+ *  caches (volume profile / Kalman / Heiken Ashi / footprint) — so any
+ *  indicator that works in entry-context just works here too.
+ *
+ *  Returns a Map<key, number[]> aligned 1-to-1 with the input bars:
+ *  series[i] is the indicator value at bars[i]. NaN inside each
+ *  indicator's warmup window. Keys are the same shape as the entry-
+ *  context map ("ATR:14", "EMA:200", "OBV", etc.) so an `EntryEvalCtx`
+ *  built around this map resolves bare-name / function-call indicator
+ *  lookups identically to the per-trade evaluator.
+ *
+ *  Caches are created fresh per call — appropriate for the dashboard
+ *  memo, which only re-runs when the bar array or directive set
+ *  changes. */
+export function precomputeIndicatorsForBars(
+  bars: IndicatorBar[],
+  exprs: Iterable<Expr>,
+  tickCtx?: TickContext,
+): Map<string, number[]> {
+  const out = new Map<string, number[]>();
+  if (bars.length === 0) return out;
+  const required = gatherRequiredSeries(exprs);
+  // Per-series caches mirror the per-zone setup inside
+  // precomputeIndicators — POC/VAH/VAL over the same window share one
+  // VolumeProfile build, KALMAN_OU siblings share one filter pass, the
+  // 4 Heiken Ashi siblings share one recursive pass, footprint reads
+  // share one tick-aggregation. ProfileCache + FootprintCache are
+  // tick-only so they stay null when ticks aren't attached; the
+  // tick-required indicators then emit all-NaN inside
+  // computeIndicatorSeries.
+  const profileCache = tickCtx ? new ProfileCache(bars.length, tickCtx) : null;
+  const kalmanCache = new KalmanOuCache(bars);
+  const haCache = new HeikenAshiCache(bars);
+  const footprintCache = tickCtx ? new FootprintCache(bars.length, tickCtx) : null;
+  for (const r of required) {
+    const series = computeIndicatorSeries(
+      r.name,
+      r.args,
+      bars,
+      tickCtx,
+      profileCache,
+      kalmanCache,
+      haCache,
+      footprintCache,
+    );
+    if (series) out.set(r.key, series);
+  }
+  return out;
+}
+
 export function precomputeIndicators(
   zones: TradeZone[],
   barsByZoneId: Map<number, TradeZoneBar[]>,

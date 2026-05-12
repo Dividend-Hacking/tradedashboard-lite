@@ -63,7 +63,7 @@ import {
 } from "@/lib/utils/tick-aggregation";
 import { fetchAndParseTicks } from "@/lib/utils/tick-blob-loader";
 import { useMode } from "@/components/mode-provider";
-import { formatDate, parseRawTimestamp } from "@/lib/utils/format";
+import { formatDate, parseRawTimestamp, rawTimestampToUnix } from "@/lib/utils/format";
 import {
   SimRules,
   SimZoneResult,
@@ -155,6 +155,7 @@ import {
   evaluateSummaryPrintsWithEntries,
   expressionReferencesEntryContext,
   precomputeIndicators,
+  precomputeIndicatorsForBars,
   type Expr as ScriptExpr,
   type EntryEvalCtx,
   type TickContext,
@@ -2943,14 +2944,19 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
       const hasSignals = parsedStrategy.stmts.some((s) => s.kind === "signal");
       if (hasSignals && parsedStrategy.errors.every((e) => e.severity !== "error")) {
         // Keep `let` bindings (referenced by signal expressions),
-        // signal stmts, and `graph = <expr>` directives (the engine
-        // surfaces them as runResult.graphDirectives so the dashboard
-        // can render P&L histograms in Trade Segment Analysis). Drop
-        // generic `assign` stmts — those route through the existing
-        // line-based DSL machinery (rules.X = …, filters.X = …) and
-        // shouldn't double-apply.
+        // signal stmts, `graph = <expr>` directives (engine surfaces
+        // them as runResult.graphDirectives → segment-analysis
+        // histograms), and `chart = <expr>` directives (engine
+        // surfaces them as runResult.chartDirectives → price-chart
+        // line overlays). Drop generic `assign` stmts — those route
+        // through the existing line-based DSL machinery
+        // (rules.X = …, filters.X = …) and shouldn't double-apply.
         const stmts = parsedStrategy.stmts.filter(
-          (s) => s.kind === "let" || s.kind === "signal" || s.kind === "graph"
+          (s) =>
+            s.kind === "let" ||
+            s.kind === "signal" ||
+            s.kind === "graph" ||
+            s.kind === "chart"
         );
         const paramOverrides: Record<string, number> = { ...params };
         for (const ref of parsedStrategy.paramRefs) {
@@ -2996,11 +3002,22 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
         // explicitly so a future change to the encoding (e.g. trust
         // default) invalidates the cache without needing source edits.
         strategyOverrideKey = JSON.stringify({
-          sources: stmts.map((s) =>
-            s.kind === "signal"
-              ? `sig.${s.side}:${s.source}`
-              : `let.${s.name}:${s.source}`
-          ),
+          sources: stmts.map((s) => {
+            // Each branch picks a tag + the identity fields that
+            // uniquely distinguish two stmts of the same kind so a
+            // typo in (say) one graph's title doesn't reuse a cached
+            // run that was built with the prior title. `source` is
+            // the user-typed RHS string — already the canonical
+            // identifier for the let/signal cases; for graph/chart
+            // we additionally key off the title (and color, for
+            // chart) so cosmetic changes also bust the cache.
+            if (s.kind === "signal") return `sig.${s.side}:${s.source}`;
+            if (s.kind === "graph") return `graph["${s.title}"]:${s.source}`;
+            if (s.kind === "chart") {
+              return `chart["${s.title}","${s.color ?? ""}"]:${s.source}`;
+            }
+            return `let.${s.name}:${s.source}`;
+          }),
           paramOverrides,
           kalman: Array.from(parsedStrategy.kalmanArgsByLet.entries()).map(
             ([name, args]) => [
@@ -3192,6 +3209,10 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
     // `graphDataResult` memo evaluates each directive's expr at every
     // surviving trade's entry bar.
     let allGraphDirectives: BacktestRunResult["graphDirectives"];
+    // `chart = <expr>` directives — same lifecycle as graph directives
+    // (strategy-level, first non-empty wins). Consumed by the
+    // `chartDataResult` memo below.
+    let allChartDirectives: BacktestRunResult["chartDirectives"];
 
     const cache = backtestCacheRef.current;
     // Engine requires a strategyOverride (built-in template fallback was
@@ -3352,6 +3373,13 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
       ) {
         allGraphDirectives = result.graphDirectives;
       }
+      if (
+        !allChartDirectives &&
+        result.chartDirectives &&
+        result.chartDirectives.length > 0
+      ) {
+        allChartDirectives = result.chartDirectives;
+      }
 
       // Per-session progress update — the banner shows
       //   "Simulating · 2026-04-08 · NQ · 7 / 22"
@@ -3493,6 +3521,7 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
       optimizationWarnings:
         allOptimizationWarnings.length > 0 ? allOptimizationWarnings : undefined,
       graphDirectives: allGraphDirectives,
+      chartDirectives: allChartDirectives,
     });
     setScriptRunProgress(null);
     setSimRunStartedAt(null);
@@ -4770,6 +4799,120 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
     runResult.syntheticIndicatorPreEntryBarsByZoneId,
     runResult.syntheticTickCtxByZoneId,
     trades,
+    rules,
+  ]);
+
+  // ── `chart = <expr>` directives ─────────────────────────────────────
+  // Sister to `graphDataResult` above. Differences:
+  //   1. Evaluation walks EVERY bar of the stitched session (not just
+  //      surviving-trade entry bars), so the user sees a continuous
+  //      line across the whole chart.
+  //   2. Indicator series are computed over the stitched bar array via
+  //      `precomputeIndicatorsForBars` (one flat per-key map) instead
+  //      of the per-zone `precomputeIndicators` used by graphs.
+  //   3. Output shape is `{ title, color, points: {time, value}[] }` —
+  //      lightweight-charts-ready, with `time` already converted to
+  //      UTC seconds via `rawTimestampToUnix`. Non-finite values are
+  //      dropped, which renders as gaps in the line (warmup window).
+  //
+  // Tick context is intentionally NOT threaded in v1: the chart memo
+  // operates on the stitched session bar array, but the engine's
+  // per-session `syntheticTickCtxByZoneId` is keyed by synthetic
+  // zone id (and tick data isn't aligned to the chart's stitched
+  // index space). Tick-required indicators (POC/VAH/VAL, footprint,
+  // CVD) therefore degrade to NaN — same fallback they hit in
+  // plain-OHLCV sessions. Adding stitched tick context is a v1.1
+  // follow-up if users need volume-profile overlays on the chart.
+  const chartDataResult = useMemo<
+    Array<{
+      title: string;
+      color: string | null;
+      points: Array<{ time: number; value: number }>;
+    }>
+  >(() => {
+    const directives = runResult.chartDirectives;
+    const bars = scriptChartInputs.bars;
+    if (!directives || directives.length === 0 || bars.length === 0) {
+      return [];
+    }
+    // Instrument is unique by virtue of scriptChartInputs' multi-
+    // instrument guard above. Pull it from the first selected
+    // session's metadata. Falls back to "" (then resolveTickConfig
+    // returns the default tick config) if for some reason the
+    // session lookup misses — non-fatal, just slightly wrong dollar
+    // math for the rare `point(n)` / `ticks(n)` reference inside a
+    // chart expression.
+    let instrument = "";
+    for (const id of selectedSessionIds) {
+      const sess = sessions.find((s) => s.id === id);
+      if (sess) {
+        instrument = sess.instrument;
+        break;
+      }
+    }
+    const tickCfg = resolveTickConfig(instrument, rules);
+
+    // ReplayBar is structurally compatible with IndicatorBar (same
+    // OHLCV + bar_time + optional bid/ask volume fields), so the
+    // stitched bar array goes in directly with a cast at the call site.
+    const indicatorByKey = precomputeIndicatorsForBars(
+      bars as unknown as import("@/lib/indicators/calculations").IndicatorBar[],
+      directives.map((d) => d.expr),
+    );
+
+    // Synthetic zone — `EntryEvalCtx.zone` is required by the type but
+    // chart expressions don't have a trade context. We supply a stub
+    // with direction=Long (so any stray `direction` reference resolves
+    // to a finite +1 instead of NaN) and the first bar as the entry
+    // anchor. Zone-only ident lookups (`bars_since_entry`, `entry_price`,
+    // etc.) evaluate against this stub and return whatever the
+    // evaluator's fallbacks produce — usually NaN, which translates to
+    // a gap in the rendered line.
+    const syntheticZone = {
+      id: -1,
+      instrument,
+      direction: "Long",
+      start_time: bars[0].bar_time,
+      start_price: bars[0].bar_close,
+    } as unknown as TradeZone;
+
+    return directives.map((d) => {
+      const points: Array<{ time: number; value: number }> = [];
+      for (let i = 0; i < bars.length; i++) {
+        const bar = bars[i];
+        const ctx: EntryEvalCtx = {
+          bar: bar as unknown as TradeZoneBar,
+          // Use the stitched-array index, not bar.bar_index — the
+          // indicator series above is aligned to the stitched array,
+          // so any other index would mis-look-up.
+          barIndex: i,
+          indicatorByKey,
+          zone: syntheticZone,
+          tickConfig: {
+            ticksPerPoint: tickCfg.ticksPerPoint,
+            tickValue: tickCfg.tickValue,
+            pointValue: tickCfg.pointValue,
+          },
+        };
+        const v = evaluate(d.expr, { kind: "entry", ...ctx });
+        if (Number.isFinite(v)) {
+          // lightweight-charts uses UTCTimestamp (unix seconds, int).
+          // Match how BacktestScriptChart already converts marker times
+          // so the overlay points land on the same x-axis slots as the
+          // candles. Math.floor matches the marker-time convention.
+          points.push({
+            time: Math.floor(rawTimestampToUnix(bar.bar_time)),
+            value: v,
+          });
+        }
+      }
+      return { title: d.title, color: d.color, points };
+    });
+  }, [
+    runResult.chartDirectives,
+    scriptChartInputs.bars,
+    selectedSessionIds,
+    sessions,
     rules,
   ]);
 
@@ -6212,6 +6355,7 @@ export function BacktestDashboard({ sessions }: BacktestDashboardProps) {
           onToggleSignals={setShowSignalsLayer}
           onToggleTrades={setShowTradesLayer}
           warning={scriptChartInputs.warning}
+          chartOverlays={chartDataResult}
         />
       )}
 
