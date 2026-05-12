@@ -204,6 +204,43 @@ export type Expr =
   // against per-bar SeriesHandle values.
   | { kind: "index"; base: Expr; offset: Expr };
 
+/** Stable canonical string form of an AST. Used to build deterministic
+ *  cache keys for any indicator whose first argument is an arbitrary
+ *  expression rather than a literal — `znorm(expr, N)` / `mmnorm(expr, N)`
+ *  need this so two different scripts referencing the same inner expr
+ *  share a single precomputed series. Pure (no whitespace, no source
+ *  text), so two ASTs that differ only in formatting hash identically. */
+export function serializeExpr(e: Expr): string {
+  switch (e.kind) {
+    case "num":
+      return String(e.value);
+    case "ident":
+      return e.name;
+    case "call":
+      return `${e.name}(${e.args.map(serializeExpr).join(",")})`;
+    case "unary":
+      return `${e.op}${serializeExpr(e.arg)}`;
+    case "binop":
+      return `(${serializeExpr(e.lhs)}${e.op}${serializeExpr(e.rhs)})`;
+    case "if":
+      return `if(${serializeExpr(e.cond)},${serializeExpr(e.then)},${serializeExpr(e.else)})`;
+    case "index":
+      return `${serializeExpr(e.base)}[${serializeExpr(e.offset)}]`;
+  }
+}
+
+/** Build the indicator-cache key for a normalizer call. The inner expr
+ *  is serialized via `serializeExpr` so two structurally identical
+ *  expressions share one precomputed series across the run. */
+export function normalizerKey(
+  kind: "znorm" | "mmnorm",
+  period: number,
+  innerExpr: Expr,
+): string {
+  const prefix = kind === "znorm" ? "ZNORM" : "MMNORM";
+  return `${prefix}:${period}:${serializeExpr(innerExpr)}`;
+}
+
 /** Result of compiling a single expression source string. */
 export type CompileResult =
   | { ok: true; expr: Expr; source: string }
@@ -1440,6 +1477,21 @@ function evalCallEntry(name: string, args: Expr[], ctx: EntryEvalCtx & { kind: "
     const tpp = ctx.tickConfig?.ticksPerPoint;
     if (!tpp || tpp <= 0 || !Number.isFinite(n)) return NaN;
     return n * tpp;
+  }
+  // Normalizer wrappers — the first arg is an arbitrary Expr (NOT
+  // evaluated here; the precompute walker baked it into the cache key
+  // via `serializeExpr`). We rebuild the same key from the AST and look
+  // up the precomputed series. The period arg must be a literal positive
+  // integer to match what the precompute path keyed on.
+  if ((name === "znorm" || name === "mmnorm") && args.length === 2) {
+    if (args[1].kind !== "num") return NaN;
+    const period = Math.round(args[1].value);
+    if (!Number.isFinite(period) || period <= 0) return NaN;
+    const key = normalizerKey(name, period, args[0]);
+    const series = ctx.indicatorByKey.get(key);
+    if (!series || ctx.barIndex < 0 || ctx.barIndex >= series.length) return NaN;
+    const v = series[ctx.barIndex];
+    return typeof v === "number" ? v : NaN;
   }
   // Math passthroughs.
   const mfn = MATH_FNS[name];
@@ -3008,6 +3060,26 @@ export const EXPR_SYMBOLS: ExprSymbol[] = [
     ],
   },
   {
+    name: "znorm",
+    kind: "call",
+    signature: "znorm(expr, N)",
+    description: "Rolling z-score of ANY expression over the last N bars. `Zscore` only normalizes price; `znorm` works on any indicator or arithmetic combination — `znorm(spread(20), 200)`, `znorm(RSI(14) - 50, 100)`, etc. Period N must be a literal positive integer (the engine bakes it into the precompute cache key). Returns NaN inside the warmup window; returns 0 on a flat window (stdev = 0).",
+    context: "entry",
+    examples: [
+      { snippet: "let qz = znorm(quote_imbalance(20), 200)\nlet sz = znorm(spread(20), 200)\nfilter.if = qz - sz > 1.5", scenario: "Combine two differently-scaled microstructure metrics on a common z-score scale." },
+    ],
+  },
+  {
+    name: "mmnorm",
+    kind: "call",
+    signature: "mmnorm(expr, N)",
+    description: "Rolling min-max normalization of ANY expression over the last N bars — maps the current value to [0, 1] using the window's min and max. Pair with `znorm` when you want a bounded mix-and-match. Period N must be a literal positive integer. Returns NaN inside warmup; returns 0.5 when min == max.",
+    context: "entry",
+    examples: [
+      { snippet: "filter.if = mmnorm(spread(20), 200) < 0.3", scenario: "Only enter when the current spread is in the tightest 30% of the last 200 bars." },
+    ],
+  },
+  {
     name: "LRSlope",
     kind: "call",
     signature: "LRSlope(period)",
@@ -4288,16 +4360,90 @@ const BARE_PREFIX_TO_CALL: Record<string, string> = {
   LLV: "LLV",
 };
 
+/** One entry in the precompute plan. Regular indicators carry only
+ *  numeric `args`; normalizer calls (`znorm` / `mmnorm`) additionally
+ *  carry the inner `Expr` they wrap so the precompute pass can evaluate
+ *  it bar-by-bar against the already-warmed regular-indicator map. */
+export type RequiredSeries = {
+  name: string;
+  args: number[];
+  key: string;
+  /** Set only for znorm/mmnorm entries — the AST of the wrapped value
+   *  expression. When present, the precompute path branches into the
+   *  normalizer phase instead of `computeIndicatorSeries`. */
+  innerExpr?: Expr;
+};
+
+/** Walk an Expr tree and collect every `znorm(...)` / `mmnorm(...)` call
+ *  whose period (second arg) is a literal positive integer. Recurses
+ *  into all children so nested normalizers (`znorm(mmnorm(x, 20), 50)`)
+ *  are both registered — the dependency order is handled later by the
+ *  precompute scheduler (each normalizer's inner expr only references
+ *  indicators that have already been computed in the prior phase).
+ *
+ *  Calls whose period is dynamic (a let-binding, a param ref, etc.) are
+ *  skipped — there's no stable cache key for them. Such a call evaluates
+ *  to NaN at runtime, matching the "dynamic-arg indicator → NaN" rule
+ *  used elsewhere in this file. */
+function gatherNormalizers(
+  expr: Expr,
+): Array<{ name: "znorm" | "mmnorm"; period: number; innerExpr: Expr; key: string }> {
+  const out: Array<{ name: "znorm" | "mmnorm"; period: number; innerExpr: Expr; key: string }> = [];
+  function walk(e: Expr): void {
+    if (e.kind === "call" && (e.name === "znorm" || e.name === "mmnorm")) {
+      if (e.args.length === 2 && e.args[1].kind === "num") {
+        const period = Math.round(e.args[1].value);
+        if (Number.isFinite(period) && period > 0) {
+          const innerExpr = e.args[0];
+          out.push({
+            name: e.name,
+            period,
+            innerExpr,
+            key: normalizerKey(e.name, period, innerExpr),
+          });
+        }
+      }
+    }
+    switch (e.kind) {
+      case "call":
+        for (const a of e.args) walk(a);
+        return;
+      case "unary":
+        walk(e.arg);
+        return;
+      case "binop":
+        walk(e.lhs);
+        walk(e.rhs);
+        return;
+      case "if":
+        walk(e.cond);
+        walk(e.then);
+        walk(e.else);
+        return;
+      case "index":
+        walk(e.base);
+        walk(e.offset);
+        return;
+      default:
+        return;
+    }
+  }
+  walk(expr);
+  return out;
+}
+
 /** Walk every expression in the overlay and return a deduplicated list of
  *  (indicator-name, args, key) tuples that need to be precomputed per
  *  zone. Bare-name idents like ATR, EMA20, ADX14, OBV are expanded to
  *  their canonical (call-form) representation so the precompute covers
- *  them too. */
+ *  them too. Normalizer calls (`znorm` / `mmnorm`) are appended with
+ *  their `innerExpr` so the per-zone precompute can compute them in a
+ *  second pass once the regular indicators are warm. */
 export function gatherRequiredSeries(
   exprs: Iterable<Expr>
-): Array<{ name: string; args: number[]; key: string }> {
+): RequiredSeries[] {
   const seen = new Set<string>();
-  const out: Array<{ name: string; args: number[]; key: string }> = [];
+  const out: RequiredSeries[] = [];
 
   function add(name: string, args: number[]): void {
     const withDefaults = applyArgDefaults(name, args);
@@ -4339,6 +4485,21 @@ export function gatherRequiredSeries(
       const callName = BARE_PREFIX_TO_CALL[n];
       if (!callName) continue;
       add(callName, [p]);
+    }
+    // Normalizer calls — emitted as their own pseudo-series. The inner
+    // expr's nested indicators are already covered by the recursion above
+    // (referencedSymbols walks into args), so by the time the precompute
+    // reaches the normalizer phase, every indicator the inner expr can
+    // reference is already populated in the per-zone map.
+    for (const n of gatherNormalizers(expr)) {
+      if (seen.has(n.key)) continue;
+      seen.add(n.key);
+      out.push({
+        name: n.name,
+        args: [n.period],
+        key: n.key,
+        innerExpr: n.innerExpr,
+      });
     }
   }
   return out;
@@ -4413,10 +4574,76 @@ export function maxIndicatorPeriod(exprs: Iterable<Expr>): number {
     ) {
       effPeriod = Number.isFinite(r.args[1]) ? r.args[1] : 60;
     }
+    // znorm / mmnorm need their own period of warmup PLUS the inner
+    // expression's own warmup — the rolling window won't produce a
+    // finite value until every bar in it has a finite inner value, and
+    // the inner expr's nested indicators are NaN inside their own
+    // warmup. Recursing into the inner Expr gives the right total.
+    if ((r.name === "znorm" || r.name === "mmnorm") && r.innerExpr) {
+      const innerMax = maxIndicatorPeriod([r.innerExpr]);
+      const needed = effPeriod + innerMax;
+      if (needed > max) max = needed;
+      continue;
+    }
     const needed = WILDER_FAMILY.has(r.name) ? effPeriod * 2 : effPeriod;
     if (needed > max) max = needed;
   }
   return max;
+}
+
+/** Rolling z-score / min-max normalizer over a pre-built input series.
+ *  Used by the `znorm(expr, N)` and `mmnorm(expr, N)` DSL helpers, both
+ *  of which take an arbitrary expression as their first arg — the caller
+ *  evaluates that expression bar-by-bar against the already-warmed
+ *  indicator map and feeds the resulting array here.
+ *
+ *  Indices 0..period-2 are NaN (warmup). For each index i ≥ period-1 we
+ *  read the window `input[i - period + 1 .. i]`:
+ *    - "znorm": z-score of the current value against the window's
+ *      mean/stdev (population stdev — same convention as `zscoreSeries`).
+ *      Returns 0 when stdev is 0 (flat window) — matches the convention
+ *      that a degenerate signal contributes nothing.
+ *    - "mmnorm": (current − min) / (max − min) over the window, mapping
+ *      to [0, 1]. Returns 0.5 when min == max (flat window).
+ *
+ *  Any NaN inside the window short-circuits to NaN at that index — the
+ *  inner expression hasn't warmed up yet, so we can't trust the
+ *  normalized value either. Same null-as-fail discipline as the rest of
+ *  the engine. */
+export function rollingNormalize(
+  kind: "znorm" | "mmnorm",
+  input: number[],
+  period: number,
+): number[] {
+  const out = new Array(input.length).fill(NaN);
+  if (period <= 0 || input.length === 0) return out;
+  for (let i = period - 1; i < input.length; i++) {
+    let sum = 0;
+    let lo = Infinity;
+    let hi = -Infinity;
+    let bad = false;
+    for (let j = i - period + 1; j <= i; j++) {
+      const v = input[j];
+      if (!Number.isFinite(v)) { bad = true; break; }
+      sum += v;
+      if (v < lo) lo = v;
+      if (v > hi) hi = v;
+    }
+    if (bad) continue;
+    if (kind === "mmnorm") {
+      out[i] = hi > lo ? (input[i] - lo) / (hi - lo) : 0.5;
+      continue;
+    }
+    const mean = sum / period;
+    let sq = 0;
+    for (let j = i - period + 1; j <= i; j++) {
+      const d = input[j] - mean;
+      sq += d * d;
+    }
+    const sd = Math.sqrt(sq / period);
+    out[i] = sd > 0 ? (input[i] - mean) / sd : 0;
+  }
+  return out;
 }
 
 /** Compute a single indicator series by name. Centralized so the
@@ -4882,7 +5109,10 @@ export function precomputeIndicatorsForBars(
   const kalmanCache = new KalmanOuCache(bars);
   const haCache = new HeikenAshiCache(bars);
   const footprintCache = tickCtx ? new FootprintCache(bars.length, tickCtx) : null;
+  // Two-phase: regular indicators first so the normalizer phase can
+  // evaluate its inner Expr against an already-warm map.
   for (const r of required) {
+    if (r.innerExpr) continue;
     const series = computeIndicatorSeries(
       r.name,
       r.args,
@@ -4894,6 +5124,30 @@ export function precomputeIndicatorsForBars(
       footprintCache,
     );
     if (series) out.set(r.key, series);
+  }
+  // Normalizer phase — evaluate the inner expression at every bar via a
+  // synthetic EntryEvalCtx that reuses the freshly-built indicator map,
+  // then run the rolling z-score / min-max. The chart-directive callers
+  // don't have a zone object; we pass a stub with direction=Long so the
+  // bare `direction` ident resolves to 1 if the inner expr ever uses it.
+  const stubZone: TradeZone = { direction: "Long" } as TradeZone;
+  for (const r of required) {
+    if (!r.innerExpr) continue;
+    if (r.name !== "znorm" && r.name !== "mmnorm") continue;
+    const period = r.args[0];
+    const inner = new Array<number>(bars.length).fill(NaN);
+    for (let i = 0; i < bars.length; i++) {
+      const ctx: EvalCtx = {
+        kind: "entry",
+        bar: bars[i] as unknown as TradeZoneBar,
+        barIndex: i,
+        indicatorByKey: out,
+        zone: stubZone,
+        bars: bars as unknown as TradeZoneBar[],
+      };
+      inner[i] = evaluate(r.innerExpr, ctx);
+    }
+    out.set(r.key, rollingNormalize(r.name as "znorm" | "mmnorm", inner, period));
   }
   return out;
 }
@@ -4940,7 +5194,14 @@ export function precomputeIndicators(
     const footprintCache = tickCtx
       ? new FootprintCache(combined.length, tickCtx)
       : null;
+    // Two-phase: first compute every regular indicator over the
+    // FULL combined range (pre-entry + post-entry), pre-slice, in a
+    // separate map so the normalizer phase can read warmup values.
+    // Then evaluate normalizers against that map, then slice everything
+    // down to post-entry alignment at the very end.
+    const fullByKey = new Map<string, number[]>();
     for (const r of required) {
+      if (r.innerExpr) continue;
       const series = computeIndicatorSeries(
         r.name,
         r.args,
@@ -4951,7 +5212,28 @@ export function precomputeIndicators(
         haCache,
         footprintCache,
       );
-      if (series) perZone.set(r.key, offset > 0 ? series.slice(offset) : series);
+      if (series) fullByKey.set(r.key, series);
+    }
+    for (const r of required) {
+      if (!r.innerExpr) continue;
+      if (r.name !== "znorm" && r.name !== "mmnorm") continue;
+      const period = r.args[0];
+      const inner = new Array<number>(combined.length).fill(NaN);
+      for (let i = 0; i < combined.length; i++) {
+        const ctx: EvalCtx = {
+          kind: "entry",
+          bar: combined[i],
+          barIndex: i,
+          indicatorByKey: fullByKey,
+          zone,
+          bars: combined,
+        };
+        inner[i] = evaluate(r.innerExpr, ctx);
+      }
+      fullByKey.set(r.key, rollingNormalize(r.name as "znorm" | "mmnorm", inner, period));
+    }
+    for (const [k, v] of fullByKey) {
+      perZone.set(k, offset > 0 ? v.slice(offset) : v);
     }
     out.set(zone.id, perZone);
   }
@@ -5095,6 +5377,8 @@ const INDICATOR_CALL_NAMES = new Set<string>([
   "Choppiness", "Ulcer",
   // Statistical.
   "Zscore", "LRSlope", "LRIntercept", "LRValue", "R2",
+  // Generic normalizers over arbitrary expressions.
+  "znorm", "mmnorm",
   // Volume (extended).
   "VWAP", "KVO", "ForceIndex", "EMV", "NVI", "PVI",
   // Tick-resolution.

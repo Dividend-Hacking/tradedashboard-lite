@@ -69,6 +69,8 @@ import {
   parseOptimizeSpec,
   scanInlineOptimize,
   type OptimizeSpec,
+  normalizerKey,
+  rollingNormalize,
 } from "./script-expr";
 import { ProfileCache } from "@/lib/indicators/tick-indicators";
 import type { IndicatorBar } from "@/lib/indicators/calculations";
@@ -1458,6 +1460,40 @@ function evalCall(name: string, args: Expr[], ctx: BarEvalCtx): number | SeriesH
   // script-expr.ts (lines 1100-1118).
   if (ZERO_ARG_INDICATORS.has(name)) {
     return getIndicatorAt(name, [], ctx);
+  }
+  // znorm(expr, N) / mmnorm(expr, N) — rolling normalizer over an
+  // arbitrary inner expression. The inner expr is NOT eagerly evaluated
+  // here; we build a lazy series the first time the call is referenced,
+  // evaluating the inner expr at every bar with a cleared letCache so
+  // any bindings inside the expr re-evaluate per bar. Subsequent
+  // references at later bars just index into the cached series.
+  // Special-cased BEFORE the isKnownIndicator branch so we don't fall
+  // into the eager-arg-eval indicator path (which would treat args[0] as
+  // a number and reject it as non-positive).
+  if ((name === "znorm" || name === "mmnorm") && args.length === 2) {
+    if (args[1].kind !== "num") return NaN;
+    const period = Math.round(args[1].value);
+    if (!Number.isFinite(period) || period <= 0) return NaN;
+    const innerExpr = args[0];
+    const key = normalizerKey(name, period, innerExpr);
+    let series = ctx.indicatorCache.get(key);
+    if (!series) {
+      const inner = new Array<number>(ctx.bars.length).fill(NaN);
+      for (let i = 0; i < ctx.bars.length; i++) {
+        const innerCtx: BarEvalCtx = {
+          ...ctx,
+          barIndex: i,
+          letCache: new Map(),
+        };
+        const v = evalNumber(innerExpr, innerCtx);
+        inner[i] = Number.isFinite(v) ? v : NaN;
+      }
+      series = rollingNormalize(name, inner, period);
+      ctx.indicatorCache.set(key, series);
+    }
+    if (ctx.barIndex < 0 || ctx.barIndex >= series.length) return NaN;
+    const v = series[ctx.barIndex];
+    return Number.isFinite(v) ? v : NaN;
   }
   if (isKnownIndicator(name)) {
     const allowFractional = FRACTIONAL_ARG_INDICATORS.has(name);
